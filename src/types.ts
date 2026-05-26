@@ -1,0 +1,54 @@
+import type {
+  ReplayBatchEnvelope,
+  ReplayPrivacyConfig,
+  ReplaySdkDescriptor,
+} from "./schema";
+import type { IdentifyPayload } from "./transport";
+
+export interface WebReplayConfig extends ReplayPrivacyConfig {
+  apiKey: string;
+  apiHost: string;
+  projectId?: string;
+  distinctId?: string;
+  sessionId?: string;
+  flushIntervalMs?: number;
+  maxBufferSize?: number;
+  liveMode?: boolean;
+  captureConsole?: boolean;
+  captureNetwork?: boolean;
+  captureErrors?: boolean;
+  captureHeaders?: boolean;
+  maxBodyBytes?: number;
+  sdk?: Partial<ReplaySdkDescriptor>;
+  beforeSend?: (event: WebReplayEventContext) => WebReplayEventContext | null;
+  fetchImpl?: typeof fetch;
+}
+
+export interface WebReplayEventContext {
+  envelope: ReplayBatchEnvelope;
+}
+
+export interface ReplayController {
+  sessionId: string;
+  stop: () => Promise<void>;
+  flush: () => Promise<void>;
+  identify: (
+    distinctIdOrPayload: string | IdentifyPayload,
+    props?: Omit<IdentifyPayload, "distinctId">,
+  ) => void;
+  /**
+   * Fire a custom event. Drives the "Event" step kind in funnels and
+   * any future event-based filters. `properties` is optional metadata
+   * — small enough to ride along in the next batch.
+   *
+   * Example:
+   *   replay.track("checkout_started");
+   *   replay.track("plan_upgraded", { from: "free", to: "pro" });
+   *
+   * Event names should be stable identifiers (snake_case or
+   * camelCase, no spaces) so they're searchable in funnels.
+   */
+  track: (name: string, properties?: Record<string, unknown>) => void;
+}
+
+export type { IdentifyPayload };
