@@ -234,47 +234,125 @@ export function createRageDeadClickCapture(onEvent: RageDeadEmit): StopHandle {
 }
 
 /**
- * Web performance capture — emits one shared "performance" stream from the
- * Performance Observer family, plus a periodic memory snapshot.
+ * Web performance capture.
  *
- * The four signals we collect:
- *   • LCP   (Largest Contentful Paint) — the slowest paint of the largest
- *           above-the-fold element. Reported once per page when the load
- *           settles. Good proxy for "feels fast".
- *   • CLS   (Cumulative Layout Shift) — accumulated unexpected layout
- *           shifts. We aggregate buffered entries and re-emit a final
- *           value on pagehide so we get the lifecycle-correct number.
- *   • FID   (First Input Delay) — delay between the user's first
- *           interaction and the handler running. Fires once at most.
- *   • Long  tasks ≥ 50 ms — JS that blocked the main thread long enough
- *           to drop a frame. We emit each one with its duration.
- *   • Mem   (heap snapshot) — `performance.memory.usedJSHeapSize` every
- *           ~10 s. Chrome/Edge only; silently no-op elsewhere.
+ * We delegate the Core Web Vitals math to Google's `web-vitals`
+ * library (the same code Lighthouse + PageSpeed Insights use), so the
+ * numbers we report are canonical:
  *
- * All five are emitted as a single `kind: "perf"` custom event shape with
- * a discriminator `metric`. The persistence service can pick them apart
- * later without growing the ProjectionRow schema.
+ *   • LCP   (Largest Contentful Paint, ms)   — `onLCP`
+ *   • CLS   (Cumulative Layout Shift, score) — `onCLS`, with the
+ *            official session-window aggregation (1s gap / 5s cap)
+ *            instead of the monotonic sum we used to do
+ *   • INP   (Interaction to Next Paint, ms)  — `onINP`. Replaces FID
+ *            (Google deprecated FID in March 2024; CrUX no longer
+ *            reports it)
+ *   • FCP   (First Contentful Paint, ms)     — `onFCP`
+ *   • TTFB  (Time to First Byte, ms)         — `onTTFB`
+ *
+ * We still own:
+ *   • Long tasks ≥ 50ms — emitted per occurrence
+ *   • Memory snapshots — periodic `performance.memory` poll
+ *
+ * `reportAllChanges: true` means we get every high-water-mark update
+ * as the user interacts, not just the final value on pagehide. Our
+ * persistence path takes the max across batches, which is exactly
+ * the right merge for LCP/INP/CLS (they only grow). Web-vitals also
+ * handles bfcache restoration so a back/forward navigation resets
+ * the metric cleanly.
  */
 type PerfEmit = (data: {
   kind: "perf";
-  metric: "lcp" | "cls" | "fid" | "long_task" | "memory";
+  metric: "lcp" | "cls" | "fid" | "inp" | "fcp" | "ttfb" | "long_task" | "memory";
   value: number;
   /** Unit hint for the UI. e.g. "ms", "bytes", "score". */
   unit?: "ms" | "bytes" | "score";
+  /** web.dev rating bucket — surfaced unchanged so the dashboard
+   *  doesn't have to re-derive it. Only present for Core Vitals. */
+  rating?: "good" | "needs-improvement" | "poor";
   /** Absolute timestamp in ms — useful for memory series rendering. */
   ts?: number;
 }) => void;
 
+// Lazy-require web-vitals so SSR / non-browser environments that
+// happen to import this module don't crash at module-eval time.
+// We re-import inside the function body when window exists.
 export function createPerformanceCapture(onEvent: PerfEmit): StopHandle {
   if (typeof window === "undefined") return () => {};
   const observers: PerformanceObserver[] = [];
   const timers: number[] = [];
 
+  // Web-vitals subscribes to the underlying PerformanceObserver entries
+  // for us and handles all the canonical-aggregation logic. Each `onX`
+  // callback fires with `{ name, value, delta, rating, ... }`. We
+  // forward each one through our `perf` event channel.
+  //
+  // `reportAllChanges` is set so we report incremental updates (each
+  // new max) rather than waiting for pagehide. That gives the
+  // dashboard a near-live picture if the user is sitting on a session.
+  void import("web-vitals").then(({ onLCP, onCLS, onINP, onFCP, onTTFB }) => {
+    onLCP(
+      (m) =>
+        onEvent({
+          kind: "perf",
+          metric: "lcp",
+          value: Math.round(m.value),
+          unit: "ms",
+          rating: m.rating,
+        }),
+      { reportAllChanges: true },
+    );
+    onCLS(
+      (m) =>
+        onEvent({
+          kind: "perf",
+          metric: "cls",
+          // CLS is a small fractional score (typically 0.0–1.0). We
+          // round to 4dp here; the backend stores it scaled ×1000 to
+          // fit in an indexable Int. The session-window logic is done
+          // by web-vitals internally; we just forward the result.
+          value: Number(m.value.toFixed(4)),
+          unit: "score",
+          rating: m.rating,
+        }),
+      { reportAllChanges: true },
+    );
+    onINP(
+      (m) =>
+        onEvent({
+          kind: "perf",
+          metric: "inp",
+          value: Math.round(m.value),
+          unit: "ms",
+          rating: m.rating,
+        }),
+      { reportAllChanges: true },
+    );
+    onFCP((m) =>
+      onEvent({
+        kind: "perf",
+        metric: "fcp",
+        value: Math.round(m.value),
+        unit: "ms",
+        rating: m.rating,
+      }),
+    );
+    onTTFB((m) =>
+      onEvent({
+        kind: "perf",
+        metric: "ttfb",
+        value: Math.round(m.value),
+        unit: "ms",
+        rating: m.rating,
+      }),
+    );
+  }).catch(() => {
+    /* web-vitals not available — fail silently rather than break the SDK */
+  });
+
   /**
    * Defensive observer creator. Browsers throw if a type is unknown
-   * (Firefox lacks `largest-contentful-paint` and `first-input` for
-   * example), so we wrap each one — a missing metric should never break
-   * the SDK or the host page.
+   * (Firefox lacks `longtask` for example), so we wrap it.
    */
   const safeObserve = (
     type: string,
@@ -290,44 +368,9 @@ export function createPerformanceCapture(onEvent: PerfEmit): StopHandle {
     }
   };
 
-  // LCP — keep the largest value seen. Final value is emitted on
-  // pagehide, but we also emit each new high-water mark live so the
-  // dashboard can show "current best paint" before the page unloads.
-  let lcpValue = 0;
-  safeObserve("largest-contentful-paint", (list) => {
-    for (const entry of list.getEntries()) {
-      const value = (entry as PerformanceEntry & { renderTime?: number; loadTime?: number }).renderTime
-        ?? (entry as PerformanceEntry & { loadTime?: number }).loadTime
-        ?? entry.startTime;
-      if (value > lcpValue) {
-        lcpValue = value;
-        onEvent({ kind: "perf", metric: "lcp", value: Math.round(value), unit: "ms" });
-      }
-    }
-  });
-
-  // CLS — accumulate all `hadRecentInput: false` shifts.
-  let clsValue = 0;
-  safeObserve("layout-shift", (list) => {
-    for (const entry of list.getEntries() as Array<PerformanceEntry & { value?: number; hadRecentInput?: boolean }>) {
-      if (!entry.hadRecentInput) clsValue += entry.value ?? 0;
-    }
-    onEvent({ kind: "perf", metric: "cls", value: Number(clsValue.toFixed(4)), unit: "score" });
-  });
-
-  // FID — first user-input delay. Fires once.
-  let fidEmitted = false;
-  safeObserve("first-input", (list) => {
-    if (fidEmitted) return;
-    const first = list.getEntries()[0] as PerformanceEntry & { processingStart?: number };
-    if (!first) return;
-    const delay = (first.processingStart ?? first.startTime) - first.startTime;
-    fidEmitted = true;
-    onEvent({ kind: "perf", metric: "fid", value: Math.round(delay), unit: "ms" });
-  });
-
   // Long tasks — emit each one with its duration. Useful for spotting
-  // jank correlated with a frame the user was looking at.
+  // jank correlated with a frame the user was looking at. web-vitals
+  // doesn't surface long tasks as a Core Vital so we keep this one.
   safeObserve("longtask", (list) => {
     for (const entry of list.getEntries()) {
       onEvent({
@@ -340,7 +383,7 @@ export function createPerformanceCapture(onEvent: PerfEmit): StopHandle {
     }
   });
 
-  // Memory — Chrome/Edge only. Sampled every 10 s + once at startup.
+  // Memory — Chrome/Edge only. Sampled every 10s + once at startup.
   // The API isn't standardised so we feature-detect carefully.
   type PerfMemoryLike = { usedJSHeapSize?: number };
   const perfMem = (performance as Performance & { memory?: PerfMemoryLike }).memory;
@@ -356,20 +399,14 @@ export function createPerformanceCapture(onEvent: PerfEmit): StopHandle {
     timers.push(id);
   }
 
-  // On pagehide, re-emit the final CLS value so the dashboard reflects
-  // the lifecycle-correct number even if no further shifts happen after
-  // the last batch flush.
-  const onPageHide = () => {
-    onEvent({ kind: "perf", metric: "cls", value: Number(clsValue.toFixed(4)), unit: "score" });
-  };
-  window.addEventListener("pagehide", onPageHide, { once: true });
-
   return () => {
     for (const obs of observers) {
       try { obs.disconnect(); } catch { /* already disconnected */ }
     }
     for (const id of timers) window.clearInterval(id);
-    window.removeEventListener("pagehide", onPageHide);
+    // web-vitals doesn't expose an unsubscribe (the observers it
+    // installs live for the page lifetime, which matches our session
+    // lifetime). No cleanup needed.
   };
 }
 

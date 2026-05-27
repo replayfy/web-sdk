@@ -20,7 +20,8 @@
     "build": "tsc -p tsconfig.json"
   },
   "dependencies": {
-    "rrweb": "^2.0.0-alpha.18"
+    "rrweb": "^2.0.0-alpha.18",
+    "web-vitals": "^5.2.0"
   },
   "devDependencies": {
     "typescript": "^5.4.5"
