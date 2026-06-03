@@ -40,6 +40,9 @@ export interface ReplaySdkDescriptor {
   name: string;
   version: string;
   platform: ReplayPlatform;
+  /** Web build / revision id (ReplayConfig.revId) — scopes funnels +
+   *  session search to a specific deployed build. */
+  revId?: string;
 }
 
 export interface ReplayPageContext {

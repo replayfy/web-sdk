@@ -10,6 +10,9 @@ export interface WebReplayConfig extends ReplayPrivacyConfig {
   apiHost: string;
   projectId?: string;
   distinctId?: string;
+  /** Build / revision id of the deployed app, surfaced as a funnel +
+   *  session-search filter so you can scope analysis to one release. */
+  revId?: string;
   sessionId?: string;
   flushIntervalMs?: number;
   maxBufferSize?: number;
