@@ -67,6 +67,7 @@ export function createSessionRuntime(config: WebReplayConfig): SessionRuntime {
     name: config.sdk?.name ?? "@replay/web-sdk",
     version: config.sdk?.version ?? "0.1.0",
     platform: config.sdk?.platform ?? "web",
+    ...(config.revId ? { revId: config.revId } : {}),
   };
 
   return {
