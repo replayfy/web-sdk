@@ -78,6 +78,53 @@ export function toHeaderRecord(headers: Headers): Record<string, string> {
   return record;
 }
 
+/**
+ * Header names whose *values* are masked before any network event
+ * leaves the browser. Case-insensitive. Covers cookies, auth tokens,
+ * and the common API-key / CSRF header conventions — matching the
+ * reference tracker's default ignore-list, extended with the API-key
+ * variants we see most.
+ */
+export const DEFAULT_SENSITIVE_HEADERS = [
+  "cookie",
+  "set-cookie",
+  "authorization",
+  "proxy-authorization",
+  "www-authenticate",
+  "x-api-key",
+  "api-key",
+  "x-auth-token",
+  "x-access-token",
+  "x-csrf-token",
+  "x-xsrf-token",
+  "x-amz-security-token",
+];
+
+const REDACTED_HEADER = "[redacted]";
+
+/**
+ * Return a copy of `headers` with sensitive values masked. We keep the
+ * key (so you can still see that an Authorization header WAS sent) but
+ * never ship its value. The built-in deny-list is always applied;
+ * `extra` lets a workspace add its own header names on top. Redaction
+ * is ON by default — there is no opt-out that ships raw credentials.
+ */
+export function redactHeaders(
+  headers: Record<string, string>,
+  extra?: string[],
+): Record<string, string> {
+  const deny = new Set(
+    [...DEFAULT_SENSITIVE_HEADERS, ...(extra ?? [])].map((h) =>
+      h.toLowerCase(),
+    ),
+  );
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(headers)) {
+    out[k] = deny.has(k.toLowerCase()) ? REDACTED_HEADER : v;
+  }
+  return out;
+}
+
 export function withRedactedUrl(
   url: string,
   patterns: Array<string | RegExp> | undefined,

@@ -21,7 +21,18 @@ export interface WebReplayConfig extends ReplayPrivacyConfig {
   captureNetwork?: boolean;
   captureErrors?: boolean;
   captureHeaders?: boolean;
+  /** Extra header names (beyond the always-on built-in deny-list) whose
+   *  values are masked before events leave the browser. */
+  redactHeaderNames?: string[];
   maxBodyBytes?: number;
+  /** Capture per-resource timing (images, scripts, css, fonts) via the
+   *  Resource Timing API. Default on. This is the highest-volume perf
+   *  channel — raise `resourceMinDurationMs` to trim it at scale. */
+  captureResourceTimings?: boolean;
+  /** Skip resource-timing entries faster than this many ms. Default 0
+   *  (capture all, matching the reference). Set e.g. 50 to record only
+   *  resources slow enough to matter and cut event volume sharply. */
+  resourceMinDurationMs?: number;
   sdk?: Partial<ReplaySdkDescriptor>;
   beforeSend?: (event: WebReplayEventContext) => WebReplayEventContext | null;
   fetchImpl?: typeof fetch;
