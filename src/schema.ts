@@ -113,9 +113,34 @@ export interface NetworkEventData {
   connectionEffectiveType?: string;
 }
 
+/**
+ * One parsed stack frame. Produced by `error-stack-parser-es` from the
+ * raw `Error.stack` string, normalised to a platform-neutral shape (the
+ * native SDKs emit the same fields from their own symbolicated traces).
+ *
+ * `frames[0]` (the throw site) is the primary input to Sentry-style
+ * Issue fingerprinting — grouping on structured frames is far more
+ * stable than hashing the raw stack string, which drifts with source
+ * maps, minified names, and line-number churn.
+ */
+export interface StackFrame {
+  functionName?: string;
+  fileName?: string;
+  lineNumber?: number;
+  columnNumber?: number;
+}
+
 export interface ErrorEventData {
+  /** Error class/type — "TypeError", "ReferenceError", or the value's
+   *  constructor name. Primary Issue-grouping key. */
+  name?: string;
   message: string;
+  /** Raw stack string — kept for replay display and as a fallback when
+   *  structured parsing fails. */
   stack?: string;
+  /** Structured stack frames parsed from `stack`. Top frame drives the
+   *  fingerprint. Empty when the throw carried no usable stack. */
+  frames?: StackFrame[];
   kind: "error" | "unhandledrejection";
 }
 
@@ -183,8 +208,9 @@ export interface TapEventData {
 /**
  * View-tree snapshot emitted on screen transition or after a 500ms
  * idle. NOT every frame — the dashboard renders interpolated playback
- * from `tap` events plus these sparse snapshots, the same way UXCam
- * does (orders of magnitude smaller than rrweb's frame-diff stream).
+ * from `tap` events plus these sparse snapshots — the standard native
+ * session-replay approach (orders of magnitude smaller than rrweb's
+ * frame-diff stream).
  *
  * `nodes` is the rendered view tree, depth-first. Image-heavy nodes
  * carry an `imageRef` (hash); the actual bytes are uploaded
@@ -256,7 +282,8 @@ export interface NativeViewNode {
  * Performance metrics — web and native both ship as `performance`
  * events. Metric NAMES differ by platform; the envelope is identical.
  *
- * Web metrics: lcp, cls, inp, fcp, ttfb, longtask, memory
+ * Web metrics: lcp, cls, inp, fcp, ttfb, long_task,
+ *   long_animation_frame, page_load, resource, memory
  * Native metrics: cold_start_ms, time_to_first_meaningful_render_ms,
  *   tap_response_ms, first_network_ttfb_ms, frozen_frame_count,
  *   memory_rss_mb, anr_count, frame_drop_pct, thermal_state,
@@ -277,6 +304,11 @@ export interface PerformanceEventData {
   rating?: "good" | "needs-improvement" | "poor";
   // Optional secondary tag — e.g. for ANR, which event triggered it.
   kind?: string;
+  // Structured payload for multi-field metrics whose story doesn't fit
+  // one scalar: long_animation_frame (blocking time + top-script
+  // attribution), page_load (navigation milestones), resource
+  // (per-asset timing). Scalar Core Vitals leave this undefined.
+  detail?: Record<string, number | string | undefined>;
 }
 
 export interface ViewportEventData {

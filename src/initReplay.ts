@@ -10,7 +10,7 @@ import {
   type SnapshotEventData,
   type ViewportEventData,
 } from "./schema";
-import { record } from "rrweb";
+import { record, addCustomEvent } from "rrweb";
 import type { eventWithTime } from "rrweb";
 import { createBatchSender, type IdentifyPayload } from "./transport";
 import { createSessionRuntime } from "./runtime";
@@ -72,6 +72,25 @@ export function initReplay(config: WebReplayConfig): ReplayController {
       source: session.sdk.platform,
       ...event,
     });
+  };
+
+  // Console sink. One capture, two destinations:
+  //   1. our `type: "console"` event → the queryable session_events
+  //      store the AI reads (full serialized args live here).
+  //   2. a compact marker teed into the rrweb stream via addCustomEvent
+  //      so the player can render console frame-aligned with the DOM.
+  // We ship only level+message into rrweb (not the heavy args) to avoid
+  // duplicating the full payload, and only while rrweb is recording —
+  // addCustomEvent throws if no recording is active.
+  const emitConsole = (d: ConsoleEventData) => {
+    emit({ ts: Date.now(), type: "console", data: d });
+    if (captures.rrweb) {
+      try {
+        addCustomEvent("console", { level: d.level, message: d.message });
+      } catch {
+        /* rrweb not recording / plugin unavailable — skip the tee */
+      }
+    }
   };
 
   const emitSessionStart = () => {
@@ -216,9 +235,7 @@ export function initReplay(config: WebReplayConfig): ReplayController {
     if (effective.skipRrweb) {
       // Bypass rrweb install; install the non-rrweb captures only.
       syncCapture("console", effective.console, () =>
-        createConsoleCapture((d: ConsoleEventData) =>
-          emit({ ts: Date.now(), type: "console", data: d }),
-        ),
+        createConsoleCapture(emitConsole),
       );
       syncCapture("network", effective.network, () =>
         createNetworkCapture(
@@ -258,8 +275,13 @@ export function initReplay(config: WebReplayConfig): ReplayController {
       // initial paint window. Each metric becomes a `kind: "perf"`
       // custom event; the backend extracts them later.
       syncCapture("performance", effective.performance !== false, () =>
-        createPerformanceCapture((d) =>
-          emit({ ts: d.ts ?? Date.now(), type: "performance", data: d }),
+        createPerformanceCapture(
+          (d) => emit({ ts: d.ts ?? Date.now(), type: "performance", data: d }),
+          {
+            apiHost: config.apiHost,
+            captureResourceTimings: config.captureResourceTimings,
+            resourceMinDurationMs: config.resourceMinDurationMs,
+          },
         ),
       );
       return;

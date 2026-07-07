@@ -1,12 +1,15 @@
+import { parse } from "error-stack-parser-es";
 import type {
   ConsoleEventData,
   ErrorEventData,
   NavigationEventData,
   NetworkEventData,
+  StackFrame,
 } from "./schema";
 import type { WebReplayConfig } from "./types";
 import {
   formatConsoleArg,
+  redactHeaders,
   serializeConsoleArg,
   toHeaderRecord,
   withRedactedUrl,
@@ -56,22 +59,103 @@ export function createConsoleCapture(
   };
 }
 
+/**
+ * Parse an Error's stack into normalised frames. Wrapped because
+ * `parse()` throws on malformed / empty stacks (cross-origin "Script
+ * error.", synthetic errors) — we degrade to no frames rather than
+ * losing the whole error.
+ */
+function framesFromError(error: Error): StackFrame[] {
+  try {
+    return parse(error).map((f) => ({
+      functionName: f.functionName,
+      fileName: f.fileName,
+      lineNumber: f.lineNumber,
+      columnNumber: f.columnNumber,
+    }));
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Split a stackless error string like "TypeError: x is undefined" into
+ * {name, message}. Only treats the prefix as an error name when it
+ * genuinely looks like one (single identifier, or *Error suffix) — so a
+ * message that merely contains a URL ("failed: https://…") isn't
+ * mis-split. This is deliberately stricter than the reference, which
+ * naively splits on the first ":" and mangles such messages.
+ */
+function splitErrorName(raw: string): { name: string; message: string } {
+  const idx = raw.indexOf(":");
+  if (idx > 0) {
+    const prefix = raw.slice(0, idx).trim();
+    const looksLikeName =
+      /Error$/.test(prefix) ||
+      (/^[A-Za-z_$][\w$]*$/.test(prefix) && !prefix.includes("/"));
+    if (looksLikeName) {
+      return { name: prefix, message: raw.slice(idx + 1).trim() };
+    }
+  }
+  return { name: "Error", message: raw };
+}
+
 export function createErrorCapture(
   onEvent: (data: ErrorEventData) => void,
 ): StopHandle {
   const onError = (event: ErrorEvent) => {
-    onEvent({
-      kind: "error",
-      message: event.message,
-      stack: event.error instanceof Error ? event.error.stack : undefined,
-    });
+    // Preferred path: a real Error object with a parseable stack.
+    if (event.error instanceof Error) {
+      const err = event.error;
+      onEvent({
+        kind: "error",
+        name: err.name || "Error",
+        message: err.message || event.message,
+        stack: err.stack,
+        frames: framesFromError(err),
+      });
+      return;
+    }
+    // Fallback: no Error object (thrown non-Error, or a cross-origin
+    // "Script error." with details stripped). Synthesize one frame from
+    // the event's filename/line/column so the throw site is still known.
+    const { name, message } = splitErrorName(event.message || "");
+    const frames: StackFrame[] = [];
+    if (event.filename || event.lineno || event.colno) {
+      frames.push({
+        fileName: event.filename || undefined,
+        lineNumber: event.lineno || undefined,
+        columnNumber: event.colno || undefined,
+      });
+    }
+    onEvent({ kind: "error", name, message, frames });
   };
 
   const onRejection = (event: PromiseRejectionEvent) => {
+    const reason = event.reason;
+    if (reason instanceof Error) {
+      onEvent({
+        kind: "unhandledrejection",
+        name: reason.name || "UnhandledRejection",
+        message: reason.message,
+        stack: reason.stack,
+        frames: framesFromError(reason),
+      });
+      return;
+    }
+    // Non-Error rejection value — serialise it best-effort for the
+    // message; there is no stack to parse.
+    let message: string;
+    try {
+      message = typeof reason === "string" ? reason : JSON.stringify(reason);
+    } catch {
+      message = String(reason);
+    }
     onEvent({
       kind: "unhandledrejection",
-      message: String(event.reason),
-      stack: event.reason instanceof Error ? event.reason.stack : undefined,
+      name: "UnhandledRejection",
+      message: message || String(reason),
+      frames: [],
     });
   };
 
@@ -251,7 +335,14 @@ export function createRageDeadClickCapture(onEvent: RageDeadEmit): StopHandle {
  *   • TTFB  (Time to First Byte, ms)         — `onTTFB`
  *
  * We still own:
- *   • Long tasks ≥ 50ms — emitted per occurrence
+ *   • Long Animation Frames (LoAF) — richer than the old Long Tasks
+ *     API: carries blocking time + attribution to the specific script
+ *     that caused the jank. Falls back to Long Tasks where LoAF is
+ *     unsupported (Firefox/Safari).
+ *   • Page-load timings — navigation milestones (TTFB, DOM interactive,
+ *     DCL, load, first paint / FCP) from the Navigation Timing API.
+ *   • Resource timings — per-asset load breakdown (DNS/TCP/TTFB/download)
+ *     from the Resource Timing API.
  *   • Memory snapshots — periodic `performance.memory` poll
  *
  * `reportAllChanges: true` means we get every high-water-mark update
@@ -261,9 +352,22 @@ export function createRageDeadClickCapture(onEvent: RageDeadEmit): StopHandle {
  * handles bfcache restoration so a back/forward navigation resets
  * the metric cleanly.
  */
+type PerfMetric =
+  | "lcp"
+  | "cls"
+  | "fid"
+  | "inp"
+  | "fcp"
+  | "ttfb"
+  | "long_task"
+  | "long_animation_frame"
+  | "page_load"
+  | "resource"
+  | "memory";
+
 type PerfEmit = (data: {
   kind: "perf";
-  metric: "lcp" | "cls" | "fid" | "inp" | "fcp" | "ttfb" | "long_task" | "memory";
+  metric: PerfMetric;
   value: number;
   /** Unit hint for the UI. e.g. "ms", "bytes", "score". */
   unit?: "ms" | "bytes" | "score";
@@ -272,15 +376,50 @@ type PerfEmit = (data: {
   rating?: "good" | "needs-improvement" | "poor";
   /** Absolute timestamp in ms — useful for memory series rendering. */
   ts?: number;
+  /** Structured payload for multi-field metrics (LoAF script
+   *  attribution, page-load milestones, per-resource timing). */
+  detail?: Record<string, number | string | undefined>;
 }) => void;
+
+/** Options for the performance capture — the ingest host (so we don't
+ *  record our own batch calls as resources) and the resource-timing
+ *  knobs from config. */
+export interface PerfCaptureOptions {
+  apiHost?: string;
+  captureResourceTimings?: boolean;
+  resourceMinDurationMs?: number;
+}
+
+/** One script's attribution inside a Long Animation Frame entry. The
+ *  DOM lib in our TS version predates LoAF, so we type it ourselves. */
+interface LoAFScript {
+  name?: string;
+  duration?: number;
+  invoker?: string;
+  invokerType?: string;
+  sourceURL?: string;
+  sourceFunctionName?: string;
+}
+interface LoAFEntry extends PerformanceEntry {
+  duration: number;
+  blockingDuration?: number;
+  scripts?: LoAFScript[];
+}
 
 // Lazy-require web-vitals so SSR / non-browser environments that
 // happen to import this module don't crash at module-eval time.
 // We re-import inside the function body when window exists.
-export function createPerformanceCapture(onEvent: PerfEmit): StopHandle {
+export function createPerformanceCapture(
+  onEvent: PerfEmit,
+  options: PerfCaptureOptions = {},
+): StopHandle {
   if (typeof window === "undefined") return () => {};
   const observers: PerformanceObserver[] = [];
   const timers: number[] = [];
+  const supportsEntry = (t: string) =>
+    typeof PerformanceObserver !== "undefined" &&
+    Array.isArray(PerformanceObserver.supportedEntryTypes) &&
+    PerformanceObserver.supportedEntryTypes.includes(t);
 
   // Web-vitals subscribes to the underlying PerformanceObserver entries
   // for us and handles all the canonical-aggregation logic. Each `onX`
@@ -368,20 +507,158 @@ export function createPerformanceCapture(onEvent: PerfEmit): StopHandle {
     }
   };
 
-  // Long tasks — emit each one with its duration. Useful for spotting
-  // jank correlated with a frame the user was looking at. web-vitals
-  // doesn't surface long tasks as a Core Vital so we keep this one.
-  safeObserve("longtask", (list) => {
-    for (const entry of list.getEntries()) {
-      onEvent({
-        kind: "perf",
-        metric: "long_task",
-        value: Math.round(entry.duration),
-        unit: "ms",
-        ts: Date.now(),
-      });
-    }
-  });
+  // Jank — prefer the modern Long Animation Frames API, which attributes
+  // the slow frame to the specific script (source URL + function) that
+  // blocked the main thread. That attribution is what lets the AI say
+  // "checkout froze because analytics.js ran 240ms", not just "a frame
+  // was slow". Fall back to the older Long Tasks API where LoAF is
+  // unsupported (Firefox/Safari) — coarser, no attribution.
+  if (supportsEntry("long-animation-frame")) {
+    safeObserve("long-animation-frame", (list) => {
+      for (const e of list.getEntries()) {
+        const entry = e as LoAFEntry;
+        // Attribute to the single longest script in the frame — that's
+        // the culprit; shipping the whole scripts[] array would bloat
+        // every jank event for little extra signal.
+        let top: LoAFScript | undefined;
+        for (const s of entry.scripts ?? []) {
+          if (!top || (s.duration ?? 0) > (top.duration ?? 0)) top = s;
+        }
+        onEvent({
+          kind: "perf",
+          metric: "long_animation_frame",
+          value: Math.round(entry.duration),
+          unit: "ms",
+          ts: Date.now(),
+          detail: {
+            blockingDuration: Math.round(entry.blockingDuration ?? 0),
+            scriptDuration:
+              top && typeof top.duration === "number"
+                ? Math.round(top.duration)
+                : undefined,
+            scriptSource: top?.sourceURL || undefined,
+            scriptFunction: top?.sourceFunctionName || undefined,
+            scriptInvoker: top?.invoker || undefined,
+          },
+        });
+      }
+    });
+  } else {
+    safeObserve("longtask", (list) => {
+      for (const entry of list.getEntries()) {
+        onEvent({
+          kind: "perf",
+          metric: "long_task",
+          value: Math.round(entry.duration),
+          unit: "ms",
+          ts: Date.now(),
+        });
+      }
+    });
+  }
+
+  // Page-load milestones — one shot per navigation, read from the
+  // Navigation Timing API (PerformanceNavigationTiming, the non-
+  // deprecated successor to `performance.timing`). Values are ms from
+  // navigation start. Paired with the paint entries for FP/FCP.
+  let pageLoadSent = false;
+  const emitPageLoad = () => {
+    if (pageLoadSent) return;
+    const nav = performance.getEntriesByType("navigation")[0] as
+      | PerformanceNavigationTiming
+      | undefined;
+    // loadEventEnd is 0 until the load event fully settles — wait for it.
+    if (!nav || nav.loadEventEnd === 0) return;
+    pageLoadSent = true;
+    const paints = performance.getEntriesByType("paint");
+    const fp = paints.find((p) => p.name === "first-paint")?.startTime;
+    const fcp = paints.find(
+      (p) => p.name === "first-contentful-paint",
+    )?.startTime;
+    onEvent({
+      kind: "perf",
+      metric: "page_load",
+      value: Math.round(nav.loadEventEnd),
+      unit: "ms",
+      ts: Date.now(),
+      detail: {
+        ttfb: Math.round(nav.responseStart),
+        responseEnd: Math.round(nav.responseEnd),
+        domInteractive: Math.round(nav.domInteractive),
+        domContentLoaded: Math.round(nav.domContentLoadedEventEnd),
+        load: Math.round(nav.loadEventEnd),
+        firstPaint: fp !== undefined ? Math.round(fp) : undefined,
+        firstContentfulPaint:
+          fcp !== undefined ? Math.round(fcp) : undefined,
+        transferSize: nav.transferSize,
+        navigationType: nav.type,
+      },
+    });
+  };
+  if (document.readyState === "complete") {
+    // load already fired — loadEventEnd is set a tick later, so defer.
+    timers.push(window.setTimeout(emitPageLoad, 0));
+  } else {
+    window.addEventListener(
+      "load",
+      () => timers.push(window.setTimeout(emitPageLoad, 0)),
+      { once: true },
+    );
+  }
+
+  // Resource timings — per-asset load breakdown. Highest-volume perf
+  // channel, so we skip our own ingest calls and data: URIs, and honour
+  // the `resourceMinDurationMs` floor from config to trim volume.
+  const captureResources = options.captureResourceTimings !== false;
+  const minResourceMs = options.resourceMinDurationMs ?? 0;
+  let ownHost: string | undefined;
+  try {
+    ownHost = options.apiHost ? new URL(options.apiHost).host : undefined;
+  } catch {
+    ownHost = undefined;
+  }
+  if (captureResources) {
+    safeObserve("resource", (list) => {
+      for (const e of list.getEntries()) {
+        const entry = e as PerformanceResourceTiming;
+        if (entry.duration < minResourceMs) continue;
+        const url = entry.name;
+        if (url.startsWith("data:")) continue;
+        // Never record the SDK's own batch/config/presence traffic.
+        if (ownHost && url.includes(ownHost)) continue;
+        onEvent({
+          kind: "perf",
+          metric: "resource",
+          value: Math.round(entry.duration),
+          unit: "ms",
+          ts: Math.round(entry.startTime + performance.timeOrigin),
+          detail: {
+            name: url.slice(0, 512),
+            initiatorType: entry.initiatorType,
+            ttfb: Math.round(
+              Math.max(0, entry.responseStart - entry.requestStart),
+            ),
+            dnsLookup: Math.round(
+              Math.max(0, entry.domainLookupEnd - entry.domainLookupStart),
+            ),
+            tcp: Math.round(
+              Math.max(0, entry.connectEnd - entry.connectStart),
+            ),
+            contentDownload: Math.round(
+              Math.max(0, entry.responseEnd - entry.responseStart),
+            ),
+            transferSize: entry.transferSize,
+            encodedBodySize: entry.encodedBodySize,
+            decodedBodySize: entry.decodedBodySize,
+            // Heuristic: served from cache when nothing came over the
+            // wire but the body decoded to something.
+            cached:
+              entry.transferSize === 0 && entry.decodedBodySize > 0 ? 1 : 0,
+          },
+        });
+      }
+    });
+  }
 
   // Memory — Chrome/Edge only. Sampled every 10s + once at startup.
   // The API isn't standardised so we feature-detect carefully.
@@ -494,10 +771,16 @@ export function createNetworkCapture(
         statusCode: response.status,
         ok: response.ok,
         requestHeaders: config.captureHeaders
-          ? toHeaderRecord(request.headers)
+          ? redactHeaders(
+              toHeaderRecord(request.headers),
+              config.redactHeaderNames,
+            )
           : undefined,
         responseHeaders: config.captureHeaders
-          ? toHeaderRecord(response.headers)
+          ? redactHeaders(
+              toHeaderRecord(response.headers),
+              config.redactHeaderNames,
+            )
           : undefined,
         requestBody,
         responseBody,
@@ -625,8 +908,12 @@ export function createNetworkCapture(
           durationMs: Date.now() - meta.startedAt,
           statusCode: this.status,
           ok: this.status >= 200 && this.status < 400,
-          requestHeaders: config.captureHeaders ? meta.headers : undefined,
-          responseHeaders: config.captureHeaders ? responseHeaders : undefined,
+          requestHeaders: config.captureHeaders
+            ? redactHeaders(meta.headers, config.redactHeaderNames)
+            : undefined,
+          responseHeaders: config.captureHeaders
+            ? redactHeaders(responseHeaders, config.redactHeaderNames)
+            : undefined,
           responseBody,
           connectionRtt: conn.rtt,
           connectionEffectiveType: conn.effectiveType,
