@@ -50,6 +50,11 @@ export function initReplay(config: WebReplayConfig): ReplayController {
     rrweb: null,
   };
   let sampled = true;
+  // The workspace has spent its plan's session allowance (remote shouldNotRecord).
+  // A HARD gate, separate from `sampled`, because the always-record overrides
+  // below flip `sampled` back on for errors/identified users — and a maxed plan
+  // must not record even those. Nothing flips this back within a page load.
+  let blocked = false;
 
   if (config.distinctId)
     sendBatch.setIdentify({ distinctId: config.distinctId });
@@ -124,7 +129,7 @@ export function initReplay(config: WebReplayConfig): ReplayController {
   };
 
   const flush = async () => {
-    if (!sampled) {
+    if (!sampled || blocked) {
       session.drain();
       return;
     }
@@ -250,7 +255,7 @@ export function initReplay(config: WebReplayConfig): ReplayController {
       );
       syncCapture("errors", effective.errors, () =>
         createErrorCapture((d: ErrorEventData) => {
-          if (!sampled && sampleOverrides?.alwaysRecordErrors) sampled = true;
+          if (!blocked && !sampled && sampleOverrides?.alwaysRecordErrors) sampled = true;
           emit({ ts: Date.now(), type: "error", data: d });
         }),
       );
@@ -384,7 +389,7 @@ export function initReplay(config: WebReplayConfig): ReplayController {
         // says "always record errors", flip sampled back on the moment an
         // error fires. The current event + any in the buffer will ship
         // on the next flush.
-        if (!sampled && sampleOverrides?.alwaysRecordErrors) {
+        if (!blocked && !sampled && sampleOverrides?.alwaysRecordErrors) {
           sampled = true;
         }
         emit({ ts: Date.now(), type: "error", data: d });
@@ -478,6 +483,19 @@ export function initReplay(config: WebReplayConfig): ReplayController {
   function applyRemoteConfig(
     remote: NonNullable<Awaited<ReturnType<typeof fetchRemoteConfig>>>,
   ) {
+    // ---- Hard cap gate ----------------------------------------------
+    // The workspace has spent its plan's session allowance. Record NOTHING and
+    // ship NOTHING — this beats every "always record" override below (a maxed
+    // plan doesn't record errors or identified users either). The server also
+    // rejects any batch that slips through, but honouring the flag here is what
+    // saves the upload: the device does no work at all.
+    if (remote.shouldNotRecord) {
+      blocked = true;
+      sampled = false;
+      presence?.stop();
+      return;
+    }
+
     // ---- Sampling decision ------------------------------------------
     // Start by rolling the sample rate. The "always record" overrides
     // below can flip the decision back on for this particular session.
@@ -588,6 +606,7 @@ export function initReplay(config: WebReplayConfig): ReplayController {
     // customer calls identify(). Saves an "I had this user but no
     // session" support ticket.
     if (
+      !blocked &&
       !sampled &&
       sampleOverrides?.alwaysRecordIdentified &&
       payload.distinctId

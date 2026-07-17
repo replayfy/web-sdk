@@ -6,6 +6,9 @@ import type { WebReplayConfig } from "./types";
  */
 export interface SdkRemoteConfig {
   workspaceId: number;
+  /** The workspace has spent its plan's session allowance — do not record or
+   *  upload anything. A hard gate that beats every "always record" override. */
+  shouldNotRecord?: boolean;
   capture: {
     console: boolean;
     network: boolean;
