@@ -16,7 +16,6 @@ export interface WebReplayConfig extends ReplayPrivacyConfig {
   sessionId?: string;
   flushIntervalMs?: number;
   maxBufferSize?: number;
-  liveMode?: boolean;
   captureConsole?: boolean;
   captureNetwork?: boolean;
   captureErrors?: boolean;
