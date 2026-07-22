@@ -23,7 +23,6 @@ import {
   createRageDeadClickCapture,
   createViewportCapture,
 } from "./signals";
-import { startPresence, type PresenceHandle } from "./presence";
 import { fetchRemoteConfig } from "./remote-config";
 import { getBrowserFingerprint } from "./fingerprint";
 import type { ReplayController, WebReplayConfig } from "./types";
@@ -59,21 +58,19 @@ export function initReplay(config: WebReplayConfig): ReplayController {
   if (config.distinctId)
     sendBatch.setIdentify({ distinctId: config.distinctId });
 
-  let presence: PresenceHandle | null = null;
-  if (config.liveMode !== false)
-    presence = startPresence(
-      config,
-      session.sessionId,
-      config.distinctId,
-      fingerprint,
-    );
 
   const emit = <TData>(
     event: Omit<ReplayEvent<TData>, "id" | "offsetMs" | "source">,
   ) => {
     session.push({
       id: session.makeEventId(),
-      offsetMs: event.ts - session.startedAt,
+      // Clamp to >= 0. Some events timestamp themselves off performance
+      // timeOrigin (paint timing, web vitals via PerformanceObserver), which
+      // can predate session.startedAt when the SDK initialises after the page
+      // has already loaded — yielding a negative offset. The server's
+      // offset_ms column is an unsigned int, so a single negative offset
+      // rejects the whole batch insert and silently drops those events.
+      offsetMs: Math.max(0, event.ts - session.startedAt),
       source: session.sdk.platform,
       ...event,
     });
@@ -492,7 +489,6 @@ export function initReplay(config: WebReplayConfig): ReplayController {
     if (remote.shouldNotRecord) {
       blocked = true;
       sampled = false;
-      presence?.stop();
       return;
     }
 
@@ -508,7 +504,6 @@ export function initReplay(config: WebReplayConfig): ReplayController {
     const sampledIn = urlForced || Math.random() <= remote.sampling.rate;
     sampled = sampledIn && triggerAllowsRecord;
     if (!sampled) {
-      presence?.stop();
       // Still install the rest of the captures so identify() can flip
       // sampling on later. We just won't ship the batches.
     }
@@ -600,7 +595,6 @@ export function initReplay(config: WebReplayConfig): ReplayController {
         ? { distinctId: idOrPayload, ...(props ?? {}) }
         : { ...idOrPayload };
     sendBatch.setIdentify(payload);
-    if (payload.distinctId) presence?.updateDistinctId(payload.distinctId);
     // Workspace policy: "always record identified users" flips a
     // previously-dropped session back into recording the moment the
     // customer calls identify(). Saves an "I had this user but no
@@ -655,7 +649,6 @@ export function initReplay(config: WebReplayConfig): ReplayController {
         }
       }
       session.stopAutoFlush();
-      presence?.stop();
       emitSessionEnd("manual");
       await flush();
     },
