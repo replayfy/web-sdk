@@ -1,16 +1,13 @@
 name: Publish (npm + CDN)
 
-# Auto-publish on merge to main — but ONLY when package.json's version has been
-# bumped to something not already on npm (registries reject duplicate versions,
-# so a plain "publish every push" would fail on the second merge). Bump the
-# version in the same PR and merging it ships the release.
+# Publish on a version TAG (not a bare push to main), so shipping a release is an
+# explicit, auditable action rather than any push to main. Release ritual:
+#   1. bump "version" in package.json + add a CHANGELOG entry, merge to main
+#   2. git tag v0.1.2 && git push origin v0.1.2   -> this workflow publishes
+# The version-guard step below still skips if that version is already on npm.
 on:
   push:
-    branches: [main]
-    paths:
-      - "src/**"
-      - "package.json"
-      - ".github/workflows/publish.yml"
+    tags: ["v[0-9]+.[0-9]+.[0-9]+*"]
 
 jobs:
   publish:
@@ -19,9 +16,9 @@ jobs:
       contents: read
       id-token: write # npm provenance + (optional) OIDC
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "20.17.0"
           registry-url: "https://registry.npmjs.org"
