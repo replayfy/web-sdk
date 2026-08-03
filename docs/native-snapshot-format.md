@@ -84,8 +84,9 @@ fun walk(v: View, parentBounds: Rect): NativeViewNode? {
 
 ### Flutter
 
-Walk the `Element` tree using `visitChildElements`, classify with the
-table already in `uxcam-flutter/lib/src/smart_events/uxcam_widget_classifier.dart`.
+Walk the `Element` tree using `visitChildElements`, classifying each
+element by widget type with a classifier lookup table (button / text /
+image / input / scrollable / …).
 
 ### React Native
 
