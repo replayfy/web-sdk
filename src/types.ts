@@ -62,6 +62,17 @@ export interface ReplayController {
    * camelCase, no spaces) so they're searchable in funnels.
    */
   track: (name: string, properties?: Record<string, unknown>) => void;
+  /**
+   * Report a developer-caught exception on the session timeline. Emits the same
+   * error event the automatic window handlers emit — so a handled error is
+   * first-class in the dashboard's issues — parsed identically (name / message /
+   * stack / frames). `opts.handled` defaults to true; pass false to record it as
+   * an unhandled/fatal error.
+   *
+   * Example:
+   *   try { risky(); } catch (e) { replay.captureException(e); }
+   */
+  captureException: (error: unknown, opts?: { handled?: boolean }) => void;
 }
 
 export type { IdentifyPayload };

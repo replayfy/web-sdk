@@ -118,7 +118,7 @@ export interface NetworkEventData {
  * raw `Error.stack` string, normalised to a platform-neutral shape (the
  * native SDKs emit the same fields from their own symbolicated traces).
  *
- * `frames[0]` (the throw site) is the primary input to Sentry-style
+ * `frames[0]` (the throw site) is the primary input to structured
  * Issue fingerprinting — grouping on structured frames is far more
  * stable than hashing the raw stack string, which drifts with source
  * maps, minified names, and line-number churn.
@@ -142,6 +142,11 @@ export interface ErrorEventData {
    *  fingerprint. Empty when the throw carried no usable stack. */
   frames?: StackFrame[];
   kind: "error" | "unhandledrejection";
+  /** True when reported via the public captureException (a developer-CAUGHT
+   *  error) rather than an uncaught window error/rejection. Undefined/false on
+   *  the auto paths. The backend classifies a handled error as an "exception"
+   *  (vs an uncaught "crash"), mirroring the mobile `fatal` discriminator. */
+  handled?: boolean;
 }
 
 export interface NavigationEventData {
