@@ -1,6 +1,6 @@
 {
   "name": "@replayfyapp/browser",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Replayfy browser SDK — session replay, product analytics, and error capture for the web.",
   "keywords": [
     "session-replay",
@@ -9,7 +9,7 @@
     "web-vitals",
     "replayfy"
   ],
-  "license": "MIT",
+  "license": "BSD-3-Clause",
   "author": "Replayfy",
   "homepage": "https://replayfy.app",
   "repository": {
