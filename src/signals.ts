@@ -100,6 +100,42 @@ function splitErrorName(raw: string): { name: string; message: string } {
   return { name: "Error", message: raw };
 }
 
+/**
+ * Build an ErrorEventData from an arbitrary caught/thrown value. Shared by the
+ * public captureException so a developer-reported error is byte-identical to an
+ * uncaught one (same name/message/stack/frames parsing) apart from `handled`.
+ */
+export function errorDataFromValue(
+  value: unknown,
+  handled: boolean,
+): ErrorEventData {
+  if (value instanceof Error) {
+    return {
+      kind: "error",
+      name: value.name || "Error",
+      message: value.message || String(value),
+      stack: value.stack,
+      frames: framesFromError(value),
+      handled,
+    };
+  }
+  // Non-Error thrown value: serialise best-effort; there is no stack to parse.
+  let raw: string;
+  try {
+    raw = typeof value === "string" ? value : JSON.stringify(value);
+  } catch {
+    raw = String(value);
+  }
+  const { name, message } = splitErrorName(raw || "");
+  return {
+    kind: "error",
+    name: name || "Error",
+    message: message || raw || String(value),
+    frames: [],
+    handled,
+  };
+}
+
 export function createErrorCapture(
   onEvent: (data: ErrorEventData) => void,
 ): StopHandle {

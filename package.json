@@ -1,23 +1,60 @@
 {
-  "name": "@replay/web-sdk",
+  "name": "@replayfyapp/browser",
   "version": "0.1.0",
-  "main": "./dist/index.js",
+  "description": "Replayfy browser SDK — session replay, product analytics, and error capture for the web.",
+  "keywords": [
+    "session-replay",
+    "product-analytics",
+    "rrweb",
+    "error-tracking",
+    "web-vitals",
+    "replayfy"
+  ],
+  "license": "MIT",
+  "author": "Replayfy",
+  "homepage": "https://replayfy.app",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/replayfy/web-sdk.git"
+  },
+  "bugs": {
+    "url": "https://github.com/replayfy/web-sdk/issues"
+  },
+  "sideEffects": false,
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.mjs",
   "types": "./dist/index.d.ts",
+  "unpkg": "./dist/replay.global.js",
+  "jsdelivr": "./dist/replay.global.js",
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
-      "import": "./dist/index.js",
-      "require": "./dist/index.js",
-      "default": "./dist/index.js"
+      "import": "./dist/index.mjs",
+      "require": "./dist/index.cjs"
     },
     "./schema": {
       "types": "./dist/schema.d.ts",
-      "import": "./dist/schema.js",
-      "default": "./dist/schema.js"
+      "import": "./dist/schema.mjs",
+      "require": "./dist/schema.cjs"
     }
   },
+  "files": [
+    "dist",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
   "scripts": {
-    "build": "tsc -p tsconfig.json"
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "prepublishOnly": "npm run build"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=18"
   },
   "dependencies": {
     "error-stack-parser-es": "^0.1.5",
@@ -25,6 +62,7 @@
     "web-vitals": "^5.2.0"
   },
   "devDependencies": {
+    "tsup": "^8.5.1",
     "typescript": "^5.4.5"
   }
 }

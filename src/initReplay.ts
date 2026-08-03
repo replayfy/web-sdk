@@ -22,6 +22,7 @@ import {
   createPerformanceCapture,
   createRageDeadClickCapture,
   createViewportCapture,
+  errorDataFromValue,
 } from "./signals";
 import { fetchRemoteConfig } from "./remote-config";
 import { getBrowserFingerprint } from "./fingerprint";
@@ -631,11 +632,33 @@ export function initReplay(config: WebReplayConfig): ReplayController {
     });
   };
 
+  // Report a developer-caught exception as the same `error` event the automatic
+  // window handlers emit, marked handled (so the dashboard classifies it as an
+  // "exception" vs an uncaught "crash"). Mirrors track()'s emit path.
+  const captureException: ReplayController["captureException"] = (
+    error,
+    opts,
+  ) => {
+    // Same policy as the automatic error path: if sampling-out dropped this
+    // session but the workspace says "always record errors", a reported
+    // exception flips recording back on — otherwise the handled error the
+    // feature exists to surface would be discarded on the next flush.
+    if (!blocked && !sampled && sampleOverrides?.alwaysRecordErrors) {
+      sampled = true;
+    }
+    emit({
+      ts: Date.now(),
+      type: "error",
+      data: errorDataFromValue(error, opts?.handled ?? true),
+    });
+  };
+
   return {
     sessionId: session.sessionId,
     flush,
     identify,
     track,
+    captureException,
     stop: async () => {
       for (const k of Object.keys(captures)) {
         const slot = captures[k];

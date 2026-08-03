@@ -1,0 +1,24 @@
+name: CI
+
+# Build gate — runs on every PR/push so a broken build can't be published.
+# (npm publish + the CDN upload are handled by publish.yml on a version bump.)
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20.17.0"
+      - name: Install
+        run: |
+          if [ -f package-lock.json ]; then npm ci; else npm install; fi
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Build (npm + CDN bundle)
+        run: npm run build
