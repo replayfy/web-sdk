@@ -123,6 +123,12 @@ async function gzipMainThread(json: string): Promise<ArrayBuffer | null> {
   }
 }
 
+/** Retry a failed replay batch a few times before giving up. Transient failures
+ *  (network/CORS rejection, 5xx, 429) are retried; a 4xx or a 2xx-but-rejected is
+ *  terminal. On a hard outage the caller re-queues the batch for the next flush. */
+const MAX_SEND_ATTEMPTS = 3;
+const SEND_BACKOFF_MS = 300;
+
 export function createBatchSender(config: WebReplayConfig): BatchSender {
   const endpoint = new URL("/v1/replay/batch", config.apiHost).toString();
   const fetchImpl = config.fetchImpl ?? window.fetch.bind(window);
@@ -184,22 +190,55 @@ export function createBatchSender(config: WebReplayConfig): BatchSender {
     // transparently inflate before JSON parsing.
     if (gzip) headers["content-encoding"] = "gzip";
 
-    const response = await fetchImpl(endpoint, {
-      method: "POST",
-      headers,
-      body,
-    });
-
-    if (!response.ok) {
-      throw new Error(`Replay batch failed with status ${response.status}`);
+    // Retry transient failures with exponential backoff. A fetch rejection
+    // (network/CORS) or a 5xx/429 is transient; a 4xx or a 2xx-but-rejected is
+    // terminal (retrying won't help), so we surface those immediately. After the
+    // last attempt the error propagates and the caller re-queues the batch.
+    let lastError: unknown;
+    for (let attempt = 1; attempt <= MAX_SEND_ATTEMPTS; attempt += 1) {
+      try {
+        const response = await fetchImpl(endpoint, {
+          method: "POST",
+          headers,
+          body,
+        });
+        if (response.ok) {
+          const payload = (await response.json()) as ApiResponse<{
+            accepted: boolean;
+          }>;
+          if (!payload.ok || !payload.data.accepted) {
+            throw new Error("Replay batch rejected by server");
+          }
+          return; // delivered
+        }
+        // Only 5xx / 429 are worth retrying; any other status is terminal.
+        if (response.status < 500 && response.status !== 429) {
+          throw new Error(`Replay batch failed with status ${response.status}`);
+        }
+        lastError = new Error(
+          `Replay batch failed with status ${response.status}`,
+        );
+      } catch (e) {
+        // Terminal errors thrown above must not burn retries — re-throw them.
+        if (
+          e instanceof Error &&
+          (e.message.startsWith("Replay batch failed with status") ||
+            e.message === "Replay batch rejected by server")
+        ) {
+          throw e;
+        }
+        // Otherwise it's a network/CORS fetch rejection → retryable.
+        lastError = e;
+      }
+      if (attempt < MAX_SEND_ATTEMPTS) {
+        await new Promise((r) =>
+          setTimeout(r, SEND_BACKOFF_MS * 2 ** (attempt - 1)),
+        );
+      }
     }
-
-    const payload = (await response.json()) as ApiResponse<{
-      accepted: boolean;
-    }>;
-    if (!payload.ok || !payload.data.accepted) {
-      throw new Error("Replay batch rejected by server");
-    }
+    throw lastError instanceof Error
+      ? lastError
+      : new Error("Replay batch send failed after retries");
   };
 
   send.setIdentify = (identify) => {

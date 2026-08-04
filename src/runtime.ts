@@ -13,6 +13,9 @@ interface SessionRuntime {
   makeEventId: () => string;
   push: (event: ReplayEvent) => void;
   drain: () => ReplayEvent[];
+  /** Put un-sent events back at the FRONT of the buffer after a failed send, so
+   *  the next flush retries them instead of dropping the batch. Bounded. */
+  requeue: (events: ReplayEvent[]) => void;
   nextSequence: () => number;
   pageContext: () => ReplayBatchEnvelope["page"];
   startAutoFlush: (flush: () => Promise<void>) => void;
@@ -55,6 +58,10 @@ function shortId(prefix: string): string {
   return `${prefix}${hex}`;
 }
 
+/** Hard cap on buffered events so a sustained ingest outage (every flush failing
+ *  and re-queuing) can't grow the buffer without bound. A few MB of rrweb. */
+const MAX_BUFFERED_EVENTS = 20000;
+
 export function createSessionRuntime(config: WebReplayConfig): SessionRuntime {
   const startedAt = Date.now();
   const sessionId = config.sessionId ?? shortId("ses_");
@@ -80,6 +87,19 @@ export function createSessionRuntime(config: WebReplayConfig): SessionRuntime {
       buffer.push(event);
     },
     drain: () => buffer.splice(0, buffer.length),
+    requeue: (events) => {
+      if (events.length === 0) return;
+      // Prepend the un-sent (older) events ahead of anything captured during the
+      // failed send, preserving order — without spreading a possibly-large array
+      // into unshift() (which can overflow the call stack).
+      const tail = buffer.splice(0, buffer.length);
+      for (let i = 0; i < events.length; i += 1) buffer.push(events[i]);
+      for (let i = 0; i < tail.length; i += 1) buffer.push(tail[i]);
+      // Bound memory during a sustained outage: keep the OLDEST events — the rrweb
+      // FullSnapshot lives there and losing it makes the whole recording
+      // unplayable — dropping the newest beyond the cap.
+      if (buffer.length > MAX_BUFFERED_EVENTS) buffer.length = MAX_BUFFERED_EVENTS;
+    },
     nextSequence: () => {
       sequence += 1;
       return sequence;

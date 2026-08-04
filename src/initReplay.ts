@@ -147,7 +147,16 @@ export function initReplay(config: WebReplayConfig): ReplayController {
       ? (config.beforeSend({ envelope })?.envelope ?? null)
       : envelope;
     if (!nextEnvelope) return;
-    await sendBatch(nextEnvelope);
+    try {
+      await sendBatch(nextEnvelope);
+    } catch {
+      // Send ultimately failed (network down, ingest outage, server error). Put
+      // the events back so the NEXT flush retries them rather than dropping the
+      // batch — dropping the first batch loses the rrweb FullSnapshot and makes
+      // the whole recording unplayable ("no replay frames"). Bounded in
+      // requeue(), so a sustained outage can't grow the buffer without limit.
+      session.requeue(events);
+    }
   };
 
   const scheduleFlush = () => {
@@ -325,6 +334,12 @@ export function initReplay(config: WebReplayConfig): ReplayController {
       // option validation) — passing `false` explicitly can throw on init.
       // Letting them default to rrweb's own defaults is safer.
       const rrwebOpts: Record<string, unknown> = { emit: emitSnapshot };
+      // Re-emit a full snapshot periodically. rrweb only snapshots once on
+      // record(); if THAT batch is lost (network blip / ingest outage), the
+      // recording is unplayable — incremental mutations with no base to apply
+      // them to. A periodic checkout self-heals a lost initial snapshot and lets
+      // a live viewer join mid-session. Paired with the flush re-queue.
+      rrwebOpts.checkoutEveryNms = 120000;
       if (typeof nextPrivacy.maskAllInputs === "boolean")
         rrwebOpts.maskAllInputs = nextPrivacy.maskAllInputs;
       if (nextPrivacy.maskTextSelector)
