@@ -245,5 +245,5 @@ is configured in the dashboard, the dashboard wins.
 
 ## Links
 
-- Docs: https://replayfy.app
+- Docs: https://docs.replayfy.app/platforms/web
 - Dashboard: https://replayfy.app
