@@ -361,15 +361,47 @@ export function initReplay(config: WebReplayConfig): ReplayController {
         rrwebOpts.maskInputOptions = { password: true };
       }
       let stop: (() => void) | undefined;
+      let heartbeat: ReturnType<typeof setInterval> | undefined;
       try {
         stop = record(rrwebOpts as Parameters<typeof record>[0]);
+        // rrweb only snapshots on ACTIVITY, so an idle page stops emitting and
+        // the replay stream ends at the last DOM mutation — far short of the real
+        // wall-clock session — while a lost/absent base leaves the whole recording
+        // unplayable ("no replay frames"). Force a full snapshot on a wall-clock
+        // TIMER (every 30s, regardless of activity): this keeps the stream
+        // spanning the whole session (idle included) and guarantees a FRESH BASE
+        // exists within 30s of any point — self-healing a lost initial snapshot,
+        // surviving the privacy-driven restart below (which doesn't re-snapshot),
+        // and enabling live mid-join. The SDK analog of the reference tracker's
+        // periodic keepalive.
+        heartbeat = setInterval(() => {
+          try {
+            record.takeFullSnapshot(true);
+          } catch {
+            /* recorder not active — ignore */
+          }
+        }, 30_000);
+        // Priority-flush the initial FullSnapshot now instead of waiting for the
+        // 3s auto-flush, so the recording is playable ASAP and the most important
+        // batch (the base) is the first one persisted + retried.
+        scheduleFlush();
       } catch (e) {
         // Surface in console + telemetry, but don't break the whole SDK —
         // we still want console/network/errors capture even if rrweb fails.
         // eslint-disable-next-line no-console
         console.error("[replay-sdk] rrweb.record failed:", e);
       }
-      if (stop) captures.rrweb = { stop };
+      if (stop) {
+        const stopRec = stop;
+        captures.rrweb = {
+          stop: () => {
+            if (heartbeat) clearInterval(heartbeat);
+            stopRec();
+          },
+        };
+      } else if (heartbeat) {
+        clearInterval(heartbeat);
+      }
       installedPrivacy = nextPrivacy;
     }
 
