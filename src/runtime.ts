@@ -29,13 +29,18 @@ interface SessionRuntime {
   pageContext: () => ReplayBatchEnvelope["page"];
   startAutoFlush: (flush: () => Promise<void>) => void;
   stopAutoFlush: () => void;
-  flushWithBeacon: (
-    sendBatch: (
-      envelope: ReplayBatchEnvelope,
-      useBeacon?: boolean,
-    ) => Promise<void>,
-  ) => void;
+  /** Deliver everything buffered on page-hide/unload, CHUNKED so each piece
+   *  stays under the beacon/keepalive ~64KB cap. A single oversized final batch
+   *  is silently dropped by the browser → the session's closing frames never
+   *  persist (a blank/frozen replay tail). Each chunk goes through the
+   *  transport's unload-reliable sendFinal (keepalive-fetch, beacon fallback). */
+  flushFinal: (sendFinal: (envelope: ReplayBatchEnvelope) => void) => void;
 }
+
+/** Conservative per-chunk byte budget for the final flush. sendBeacon and
+ *  keepalive fetch both cap the body near 64KB; 55KB leaves headroom for the
+ *  envelope wrapper. rrweb payloads are ~ASCII so string length ≈ byte length. */
+const MAX_FINAL_CHUNK_BYTES = 55_000;
 
 function safeTimezone(): string | undefined {
   try {
@@ -221,22 +226,40 @@ export function createSessionRuntime(config: WebReplayConfig): SessionRuntime {
     stopAutoFlush: () => {
       if (timer !== undefined) window.clearInterval(timer);
     },
-    flushWithBeacon: (sendBatch) => {
+    flushFinal: (sendFinal) => {
       const events = buffer.splice(0, buffer.length);
       if (events.length === 0) return;
-      void sendBatch(
-        {
+      let chunk: ReplayEvent[] = [];
+      let chunkBytes = 0;
+      const ship = () => {
+        if (chunk.length === 0) return;
+        sequence += 1;
+        sendFinal({
           projectId: config.projectId,
           sessionId,
           segmentId,
-          sequence: sequence + 1,
+          sequence,
           sentAt: Date.now(),
           sdk,
           page: pageContext(),
-          events,
-        },
-        true,
-      );
+          events: chunk,
+        });
+        chunk = [];
+        chunkBytes = 0;
+      };
+      for (let i = 0; i < events.length; i += 1) {
+        const ev = events[i];
+        const evBytes = JSON.stringify(ev).length;
+        // Close the current chunk before an event that would overflow it — but
+        // never emit an empty chunk, so a single event over the cap still ships
+        // alone (the best we can do without async compression on unload).
+        if (chunkBytes + evBytes > MAX_FINAL_CHUNK_BYTES && chunk.length > 0) {
+          ship();
+        }
+        chunk.push(ev);
+        chunkBytes += evBytes;
+      }
+      ship();
     },
   };
 }

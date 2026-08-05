@@ -27,6 +27,10 @@ export interface BatchSender {
    *  identity only when the same session resumed; a fresh session is cleared to
    *  anonymous. Call once, before any setIdentify. */
   bindSession: (sessionId: string, resumed: boolean) => void;
+  /** Unload-reliable send for the final flush: a keepalive fetch (survives page
+   *  teardown AND sets the api-key header, so it authenticates even where ?k=
+   *  isn't accepted), falling back to sendBeacon. Fire-and-forget. */
+  sendFinal: (envelope: ReplayBatchEnvelope) => void;
 }
 
 /**
@@ -338,6 +342,41 @@ export function createBatchSender(config: WebReplayConfig): BatchSender {
   };
   send.setFingerprint = (fp) => {
     currentFingerprint = fp;
+  };
+  const beaconFallback = (json: string) => {
+    try {
+      if (typeof navigator !== "undefined" && navigator.sendBeacon) {
+        // Beacon can't set headers, so the key rides as ?k= (the backend accepts
+        // either). Kept < 55KB per chunk by the caller so it isn't dropped.
+        const url = `${endpoint}?${new URLSearchParams({ k: config.apiKey }).toString()}`;
+        navigator.sendBeacon(url, new Blob([json], { type: "application/json" }));
+      }
+    } catch {
+      /* nothing left to try — the page is going away */
+    }
+  };
+  send.sendFinal = (envelope) => {
+    const json = JSON.stringify({
+      envelope,
+      identify: currentIdentify,
+      fingerprint: currentFingerprint,
+    });
+    // Primary: keepalive fetch. It survives the unload and, unlike sendBeacon,
+    // sets the x-replay-api-key HEADER. Only fall back to a beacon if the fetch
+    // rejects/throws while the page is still alive (no double-send on success).
+    try {
+      void fetchImpl(endpoint, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-replay-api-key": config.apiKey,
+        },
+        body: json,
+        keepalive: true,
+      }).catch(() => beaconFallback(json));
+    } catch {
+      beaconFallback(json);
+    }
   };
 
   return send;

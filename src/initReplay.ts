@@ -646,17 +646,21 @@ export function initReplay(config: WebReplayConfig): ReplayController {
 
   session.startAutoFlush(flush);
 
-  window.addEventListener("beforeunload", () => {
-    emitSessionEnd("unload");
-    session.flushWithBeacon(sendBatch);
-  });
-
+  // Deliver the tail reliably as the page goes away. visibilitychange:hidden is
+  // the signal that fires FIRST on a tab close (and the only one guaranteed when
+  // a mobile tab is backgrounded / on bfcache), so the closing frames are
+  // usually shipped while the page is still alive; pagehide + beforeunload mop
+  // up anything left. Each call drains the buffer, so the later ones are no-ops
+  // when an earlier one already sent — no duplicate batches.
+  const finalFlush = (reason: SessionEndEventData["reason"]) => {
+    emitSessionEnd(reason);
+    session.flushFinal(sendBatch.sendFinal);
+  };
   document.addEventListener("visibilitychange", () => {
-    if (document.visibilityState === "hidden") {
-      emitSessionEnd("visibility_hidden");
-      session.flushWithBeacon(sendBatch);
-    }
+    if (document.visibilityState === "hidden") finalFlush("visibility_hidden");
   });
+  window.addEventListener("pagehide", () => finalFlush("unload"));
+  window.addEventListener("beforeunload", () => finalFlush("unload"));
 
   // Keep the session's last-activity marker fresh on genuine USER interaction —
   // deliberately NOT the SDK's own heartbeat/perf events, so an idle tab that's
