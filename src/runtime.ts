@@ -14,6 +14,12 @@ interface SessionRuntime {
    *  back/forward. The caller records a resume as a navigation, not a new
    *  session_start, so the original entry page is preserved. */
   resumed: boolean;
+  /** Re-anchor a FRESH session's clock to NOW. Called at the visibility-gated
+   *  start so the timeline begins when the page is first VISIBLE, not when a
+   *  hidden / prerendered tab happened to construct the runtime. The caller only
+   *  invokes it for !resumed sessions, so a reload keeps its original startedAt
+   *  (offset continuity across the load). */
+  beginFreshClock: () => void;
   sdk: ReplaySdkDescriptor;
   makeEventId: () => string;
   push: (event: ReplayEvent) => void;
@@ -181,8 +187,18 @@ export function createSessionRuntime(config: WebReplayConfig): SessionRuntime {
   return {
     sessionId,
     segmentId,
-    startedAt,
+    // Live getter — `beginFreshClock()` can re-anchor it at the visibility-gated
+    // start, and the emit()/minDuration reads must see the updated value.
+    get startedAt() {
+      return startedAt;
+    },
     resumed,
+    beginFreshClock: () => {
+      startedAt = Date.now();
+      lastActivityAt = startedAt;
+      lastActivityPersist = startedAt;
+      writePersistedSession({ sid: sessionId, st: startedAt, la: startedAt });
+    },
     sdk,
     makeEventId: () => globalThis.crypto.randomUUID(),
     push: (event) => {

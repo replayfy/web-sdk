@@ -84,6 +84,23 @@ export function initReplay(config: WebReplayConfig): ReplayController {
   // must not record even those. Nothing flips this back within a page load.
   let blocked = false;
 
+  // Visibility gate + snapshot-ordering flags. Following the reference tracker:
+  // defer the ENTIRE session start until the tab is first VISIBLE (never record a
+  // hidden / prerendered tab), and only let a batch ship once the session's DOM
+  // snapshot exists — so a batch never creates a server-side session before its
+  // full_snapshot is in it.
+  //  - `started`      : the visibility-gated start has run (tab was/became visible).
+  //  - `snapshotReady`: rrweb's first full_snapshot has been buffered.
+  //  - `rrwebFailed`  : record() threw, so no snapshot will ever arrive.
+  // flush()/finalFlush() ship nothing until `started && (snapshotReady ||
+  // rrwebFailed)`. Net effect: a tab that loads hidden and is closed while still
+  // hidden creates NO session, and a started session's first batch always carries
+  // the snapshot (or rrweb is known-failed and the no-replay session ships for the
+  // backend to keep-if-analytics / reap-if-empty).
+  let started = false;
+  let snapshotReady = false;
+  let rrwebFailed = false;
+
   if (config.distinctId)
     sendBatch.setIdentify({ distinctId: config.distinctId });
 
@@ -146,6 +163,10 @@ export function initReplay(config: WebReplayConfig): ReplayController {
   let lastRrwebActivityAt = Date.now();
   const emitSnapshot = (rrwebEvent: eventWithTime) => {
     lastRrwebActivityAt = Date.now();
+    // The session becomes shippable the moment its first FULL snapshot (type 2)
+    // is buffered — every later incremental is a diff against it, so a batch sent
+    // before this would create an unplayable "no replay" session server-side.
+    if (rrwebEvent.type === 2) snapshotReady = true;
     const data: SnapshotEventData = { recorder: "rrweb", rrwebEvent };
     emit({
       ts: rrwebEvent.timestamp,
@@ -171,6 +192,12 @@ export function initReplay(config: WebReplayConfig): ReplayController {
       session.drain();
       return;
     }
+    // Visibility + snapshot gate: hold (keep buffering, don't ship) until the
+    // gated start has run AND rrweb's snapshot is buffered (or rrweb is known to
+    // have failed). This is what guarantees the first batch that creates the
+    // server-side session carries the full_snapshot — never a snapshot-less "no
+    // replay" row — and that a not-yet-visible tab ships nothing at all.
+    if (!started || (!snapshotReady && !rrwebFailed)) return;
     // minDuration gate: hold (keep buffering, don't ship) until the session has
     // lived past minDurationMs, so bounce sessions shorter than the minimum are
     // never uploaded (they're discarded on unload). 0 disables. Bounded by the
@@ -446,6 +473,12 @@ export function initReplay(config: WebReplayConfig): ReplayController {
         // and enabling live mid-join. The SDK analog of the reference tracker's
         // periodic keepalive.
         heartbeat = setInterval(() => {
+          // Never force a snapshot while the tab is HIDDEN. A backgrounded tab has
+          // no visible activity to record, so forcing keepalive snapshots there
+          // just pads the session with a dead idle tail (the frameless-long-session
+          // phantom). The reference tracker likewise lets hidden time drive a
+          // restart, not blind timers. It resumes forcing once the tab is visible.
+          if (document.visibilityState === "hidden") return;
           // Idle-aware: skip the forced full snapshot when rrweb already emitted
           // within the last interval (the page is active and self-heals via its
           // own stream + the 2-min checkout). Only force one when the page has
@@ -467,6 +500,11 @@ export function initReplay(config: WebReplayConfig): ReplayController {
         // we still want console/network/errors capture even if rrweb fails.
         // eslint-disable-next-line no-console
         console.error("[replay-sdk] rrweb.record failed:", e);
+        // No snapshot will ever arrive, so release the flush hold — otherwise the
+        // session (console/network/errors, no replay) would buffer forever and
+        // never ship. It ships as a no-replay session; the backend keeps it only
+        // if it carries analytics/signal, otherwise reaps it.
+        rrwebFailed = true;
       }
       if (stop) {
         const stopRec = stop;
@@ -548,76 +586,94 @@ export function initReplay(config: WebReplayConfig): ReplayController {
     );
   };
 
-  // A fresh session opens with session_start (sets the entry page). A RESUMED
-  // session — a reload or same-tab back/forward within the inactivity window —
-  // instead records the reload as a page navigation, so the original entry page
-  // is preserved and the reload shows on the timeline as a page transition
-  // rather than a second "session start".
-  if (session.resumed) {
-    emit({
-      ts: Date.now(),
-      type: "navigation",
-      data: {
-        to: window.location.href,
-        trigger: "load",
-      } satisfies NavigationEventData,
-    });
-  } else {
-    emitSessionStart();
-  }
-  emitViewport();
+  // The visibility-gated start. Following the reference tracker, NOTHING is
+  // emitted, installed, or flushed until the tab is first VISIBLE — a tab that
+  // loads hidden (background-opened, prerendered) records nothing until the user
+  // actually looks at it, and one closed while still hidden never creates a
+  // session. Runs at most once (the `started` guard).
+  const startCapture = () => {
+    if (started) return;
+    started = true;
+    // A FRESH session anchors its clock to NOW (first-visible) so the timeline
+    // begins when the page is seen, not when a hidden tab constructed the
+    // runtime. A resumed session keeps its original startedAt (offset continuity).
+    if (!session.resumed) session.beginFreshClock();
 
-  // We install captures in *two phases* to avoid losing the rrweb
-  // FullSnapshot. Phase 1 starts everything EXCEPT rrweb. Phase 2 runs
-  // after remote config arrives (or 300ms timeout, whichever's first) and
-  // starts rrweb with the final privacy/canvas options.
-  //
-  // Why split? rrweb only fires FullSnapshot on initial `record()`. If we
-  // started it in phase 1 with stale config, then stopped+restarted in
-  // phase 2 because `recordCanvas` flipped, the new instance does NOT
-  // re-emit a FullSnapshot (rrweb 2.0-alpha quirk). The Replayer then
-  // has incremental snapshots with nothing to apply them to → blank
-  // screen with "no replay frames" in the dashboard.
-  installCaptures({
-    console: config.captureConsole !== false,
-    network: config.captureNetwork !== false,
-    errors: config.captureErrors !== false,
-    // Default-on in phase 1 so we don't miss the LCP window while remote
-    // config is in flight. If remote arrives and says off, the next
-    // installCaptures call disables it.
-    performance: true,
-    captureHeaders: config.captureHeaders ?? false,
-    maskAllInputs: config.maskAllInputs ?? true,
-    // Phase 1 deliberately skips rrweb — see installCaptures internals.
-    skipRrweb: true,
-  });
-
-  // Promise race: whichever fires first wins. We never wait > 300ms for
-  // remote config — a slow /v1/sdk/config request shouldn't delay
-  // recording.
-  const remotePromise = fetchRemoteConfig(config);
-  const timeoutPromise = new Promise<null>((r) =>
-    setTimeout(() => r(null), 300),
-  );
-  void Promise.race([remotePromise, timeoutPromise]).then(async (remote) => {
-    // If the race was won by the timeout, await the actual remote in the
-    // background so it can still adjust mid-session — but start recording
-    // NOW using local config as the source of truth.
-    if (remote === null) {
-      installCaptures({
-        console: config.captureConsole !== false,
-        network: config.captureNetwork !== false,
-        errors: config.captureErrors !== false,
-        performance: true,
-        captureHeaders: config.captureHeaders ?? false,
-        maskAllInputs: config.maskAllInputs ?? true,
+    // A fresh session opens with session_start (sets the entry page). A RESUMED
+    // session — a reload or same-tab back/forward within the inactivity window —
+    // instead records the reload as a page navigation, so the original entry page
+    // is preserved and the reload shows on the timeline as a page transition
+    // rather than a second "session start".
+    if (session.resumed) {
+      emit({
+        ts: Date.now(),
+        type: "navigation",
+        data: {
+          to: window.location.href,
+          trigger: "load",
+        } satisfies NavigationEventData,
       });
-      const lateRemote = await remotePromise.catch(() => null);
-      if (lateRemote) applyRemoteConfig(lateRemote);
-      return;
+    } else {
+      emitSessionStart();
     }
-    applyRemoteConfig(remote);
-  });
+    emitViewport();
+
+    // We install captures in *two phases* to avoid losing the rrweb
+    // FullSnapshot. Phase 1 starts everything EXCEPT rrweb. Phase 2 runs
+    // after remote config arrives (or 300ms timeout, whichever's first) and
+    // starts rrweb with the final privacy/canvas options.
+    //
+    // Why split? rrweb only fires FullSnapshot on initial `record()`. If we
+    // started it in phase 1 with stale config, then stopped+restarted in
+    // phase 2 because `recordCanvas` flipped, the new instance does NOT
+    // re-emit a FullSnapshot (rrweb 2.0-alpha quirk). The Replayer then
+    // has incremental snapshots with nothing to apply them to → blank
+    // screen with "no replay frames" in the dashboard.
+    installCaptures({
+      console: config.captureConsole !== false,
+      network: config.captureNetwork !== false,
+      errors: config.captureErrors !== false,
+      // Default-on in phase 1 so we don't miss the LCP window while remote
+      // config is in flight. If remote arrives and says off, the next
+      // installCaptures call disables it.
+      performance: true,
+      captureHeaders: config.captureHeaders ?? false,
+      maskAllInputs: config.maskAllInputs ?? true,
+      // Phase 1 deliberately skips rrweb — see installCaptures internals.
+      skipRrweb: true,
+    });
+
+    // Promise race: whichever fires first wins. We never wait > 300ms for
+    // remote config — a slow /v1/sdk/config request shouldn't delay
+    // recording.
+    const remotePromise = fetchRemoteConfig(config);
+    const timeoutPromise = new Promise<null>((r) =>
+      setTimeout(() => r(null), 300),
+    );
+    void Promise.race([remotePromise, timeoutPromise]).then(async (remote) => {
+      // If the race was won by the timeout, await the actual remote in the
+      // background so it can still adjust mid-session — but start recording
+      // NOW using local config as the source of truth.
+      if (remote === null) {
+        installCaptures({
+          console: config.captureConsole !== false,
+          network: config.captureNetwork !== false,
+          errors: config.captureErrors !== false,
+          performance: true,
+          captureHeaders: config.captureHeaders ?? false,
+          maskAllInputs: config.maskAllInputs ?? true,
+        });
+        const lateRemote = await remotePromise.catch(() => null);
+        if (lateRemote) applyRemoteConfig(lateRemote);
+        return;
+      }
+      applyRemoteConfig(remote);
+    });
+
+    // Start the periodic flush now (not while hidden). Its first tick and any
+    // scheduleFlush() are still held by the snapshot gate until the base exists.
+    session.startAutoFlush(flush);
+  };
 
   function applyRemoteConfig(
     remote: NonNullable<Awaited<ReturnType<typeof fetchRemoteConfig>>>,
@@ -715,10 +771,6 @@ export function initReplay(config: WebReplayConfig): ReplayController {
     }
   }
 
-  // (sampleOverrides + minDurationMs declared earlier — see above)
-
-  session.startAutoFlush(flush);
-
   // Deliver the tail reliably as the page goes away. visibilitychange:hidden is
   // the signal that fires FIRST on a tab close (and the only one guaranteed when
   // a mobile tab is backgrounded / on bfcache), so the closing frames are
@@ -726,6 +778,11 @@ export function initReplay(config: WebReplayConfig): ReplayController {
   // up anything left. Each call drains the buffer, so the later ones are no-ops
   // when an earlier one already sent — no duplicate batches.
   const finalFlush = (reason: SessionEndEventData["reason"]) => {
+    // Never create a server-side session on the way out for a tab that never
+    // visibly started, or whose snapshot never arrived (and rrweb didn't fail) —
+    // same gate flush() uses. A load-hidden-then-closed tab and a pre-snapshot
+    // bounce both ship nothing.
+    if (!started || (!snapshotReady && !rrwebFailed)) return;
     // Discard a bounce session that never reached minDuration — don't ship its
     // held buffer on the way out.
     if (minDurationMs > 0 && Date.now() - session.startedAt < minDurationMs) {
@@ -758,6 +815,24 @@ export function initReplay(config: WebReplayConfig): ReplayController {
       passive: true,
       capture: true,
     });
+  }
+
+  // Kick off the visibility-gated start. If the tab is already visible, start
+  // synchronously — unchanged behavior for the overwhelmingly common case. If it
+  // loaded hidden (background-opened tab / prerender, which report "hidden"),
+  // defer the entire start to the first time it becomes visible, then unregister,
+  // so a hidden tab is never recorded and — if it's closed while still hidden —
+  // no session is ever created.
+  if (document.visibilityState !== "hidden") {
+    startCapture();
+  } else {
+    const onFirstVisible = () => {
+      if (document.visibilityState !== "hidden") {
+        document.removeEventListener("visibilitychange", onFirstVisible);
+        startCapture();
+      }
+    };
+    document.addEventListener("visibilitychange", onFirstVisible);
   }
 
   const identify: ReplayController["identify"] = (idOrPayload, props) => {
