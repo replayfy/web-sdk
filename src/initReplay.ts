@@ -111,6 +111,7 @@ export function initReplay(config: WebReplayConfig): ReplayController {
       href: redactUrlForStorage(window.location.href),
       path: window.location.pathname,
       referrer: redactUrlForStorage(document.referrer),
+      title: document.title || undefined,
     };
     emit({ ts: Date.now(), type: "session_start", data });
   };

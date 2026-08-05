@@ -74,6 +74,8 @@ export interface SessionStartEventData {
   href: string;
   path: string;
   referrer: string;
+  /** document.title of the entry page — the first screen's human name. */
+  title?: string;
 }
 
 export interface SessionEndEventData {
@@ -152,6 +154,9 @@ export interface ErrorEventData {
 export interface NavigationEventData {
   from?: string;
   to: string;
+  /** document.title at the time of the view — a human screen name for the
+   *  dashboard's Screens list, not just an opaque URL. */
+  title?: string;
   // On web: history-stack triggers. On native: app-routing triggers.
   trigger:
     | "pushState"

@@ -223,6 +223,9 @@ export function createNavigationCapture(
       from: redactUrlForStorage(currentUrl),
       to: redactUrlForStorage(nextUrl),
       trigger,
+      // Human-readable screen name so the dashboard can label screens by title,
+      // not just an opaque URL (parity with the reference tracker's page location).
+      title: document.title || undefined,
     });
     currentUrl = nextUrl;
   };
@@ -274,40 +277,77 @@ export function createViewportCapture(onEvent: () => void): StopHandle {
  * The persistence service increments session.rageCount / deadCount based
  * on these.
  */
-type RageDeadEmit = (data: {
-  kind: "rage_click" | "dead_click";
-  x: number;
-  y: number;
-  selector: string;
-  count?: number;
-}) => void;
+type ClickEmit = (
+  data:
+    | { kind: "rage_click"; x: number; y: number; selector: string; count: number }
+    | { kind: "dead_click"; x: number; y: number; selector: string }
+    | {
+        kind: "click";
+        selector: string;
+        label: string;
+        nx: number;
+        ny: number;
+        uiId: string;
+      },
+) => void;
 
-export function createRageDeadClickCapture(onEvent: RageDeadEmit): StopHandle {
+export function createRageDeadClickCapture(onEvent: ClickEmit): StopHandle {
   const recent: Array<{ x: number; y: number; ts: number }> = [];
   const PROXIMITY_PX = 24;
   const RAGE_WINDOW_MS = 1000;
   const DEAD_OBSERVE_MS = 500;
 
+  // ONE shared observer with a dirty-timestamp — not a fresh observer per click.
+  // A click is "dead" only if nothing mutated AND the URL didn't change within
+  // the window (a navigation IS a response).
+  let lastMutation = 0;
   const observer = new MutationObserver(() => {
-    /* presence is what matters */
+    lastMutation = Date.now();
   });
-  observer.observe(document.body, {
-    childList: true,
-    subtree: true,
-    attributes: true,
-    characterData: true,
-  });
+  try {
+    observer.observe(document.documentElement, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      characterData: true,
+    });
+  } catch {
+    /* document not ready — best effort */
+  }
 
   const onClick = (ev: MouseEvent) => {
-    const now = ev.timeStamp ?? Date.now();
-    // Trim entries older than the rage window so the list stays O(N) tiny.
+    const now = Date.now();
+    // Resolve the raw target to the meaningful clickable ancestor; null = the
+    // element (or an ancestor) is masked, so we emit NO identity for it.
+    const target = resolveClickable(ev.target);
+    if (!target) return;
+    const selector = cssPath(target);
+
+    // Semantic click event — every real click, for heatmaps / click funnels.
+    // Mirrors our mobile TapEventData (selector + label + content-normalized
+    // coords 0..1e4 + a stable uiId bucket).
+    const label = targetLabel(target);
+    const nx = normCoord(
+      ev.pageX,
+      document.documentElement.scrollWidth || window.innerWidth,
+    );
+    const ny = normCoord(
+      ev.pageY,
+      document.documentElement.scrollHeight || window.innerHeight,
+    );
+    onEvent({
+      kind: "click",
+      selector,
+      label,
+      nx,
+      ny,
+      uiId: hashId(`${location.pathname}#${selector}#${label}`),
+    });
+
+    // Rage: ≥3 clicks within PROXIMITY_PX in RAGE_WINDOW_MS.
     while (recent.length > 0 && now - recent[0].ts > RAGE_WINDOW_MS)
       recent.shift();
     recent.push({ x: ev.clientX, y: ev.clientY, ts: now });
-
-    // Rage: count clicks in the last RAGE_WINDOW_MS within PROXIMITY_PX of
-    // the current point. Three or more = a rage event. Reset the buffer on
-    // each fire so we don't spam events for sustained mashing.
     const close = recent.filter(
       (r) =>
         Math.abs(r.x - ev.clientX) < PROXIMITY_PX &&
@@ -318,37 +358,20 @@ export function createRageDeadClickCapture(onEvent: RageDeadEmit): StopHandle {
         kind: "rage_click",
         x: ev.clientX,
         y: ev.clientY,
-        selector: describe(ev.target as Element | null),
+        selector,
         count: close.length,
       });
       recent.length = 0;
     }
 
-    // Dead-click probe: if no mutation fires within the next 500 ms after
-    // a click, mark it dead. We use the existing observer to keep a single
-    // global subscription rather than churning per-click.
-    const baseline = Math.random(); // we just need a key
-    let mutated = false;
-    const obs = new MutationObserver(() => {
-      mutated = true;
-    });
-    obs.observe(document.body, {
-      childList: true,
-      subtree: true,
-      attributes: true,
-      characterData: true,
-    });
+    // Dead-click: no mutation AND no navigation within the window.
+    const hrefBefore = location.href;
     window.setTimeout(() => {
-      obs.disconnect();
-      if (!mutated) {
-        onEvent({
-          kind: "dead_click",
-          x: ev.clientX,
-          y: ev.clientY,
-          selector: describe(ev.target as Element | null),
-        });
+      const mutated = lastMutation >= now;
+      const navigated = location.href !== hrefBefore;
+      if (!mutated && !navigated) {
+        onEvent({ kind: "dead_click", x: ev.clientX, y: ev.clientY, selector });
       }
-      void baseline; // keep TS quiet about unused
     }, DEAD_OBSERVE_MS);
   };
 
@@ -729,22 +752,150 @@ export function createPerformanceCapture(
   };
 }
 
-/** Produce a short CSS selector for an element — `button.primary#checkout` */
-function describe(el: Element | null): string {
+/** Meaningful clickable element types — mirrors the reference tracker's getTarget. */
+const CLICKABLE_TAGS = new Set([
+  "BUTTON", "A", "SELECT", "LI", "TR", "TH", "TD",
+  "INPUT", "TEXTAREA", "SUMMARY", "OPTION", "LABEL",
+]);
+
+/** rrweb-style privacy classes/attrs that mark a subtree as blocked/masked. */
+function isMaskedNode(node: Element): boolean {
+  const c = node.classList;
+  return (
+    (!!c && (c.contains("rr-block") || c.contains("rr-ignore") || c.contains("rr-mask"))) ||
+    node.getAttribute("data-rr-block") === "true" ||
+    node.getAttribute("data-replay-block") === "true"
+  );
+}
+
+/** Walk from the raw event target up to the nearest MEANINGFUL clickable element
+ *  (control, [role=button], [onclick], [tabindex], or clickable tag), climbing
+ *  out of SVG internals to the owning <svg>. Returns null if the target or any
+ *  ancestor on the way is masked — we then emit no identity for that click. */
+function resolveClickable(raw: EventTarget | null): Element | null {
+  let el: Element | null = raw instanceof Element ? raw : null;
+  if (el && el.namespaceURI === "http://www.w3.org/2000/svg") {
+    const owner = el.closest("svg");
+    if (owner) el = owner;
+  }
+  let node: Element | null = el;
+  let depth = 0;
+  while (node && depth < 12) {
+    if (isMaskedNode(node)) return null;
+    if (
+      CLICKABLE_TAGS.has(node.tagName) ||
+      node.getAttribute("role") === "button" ||
+      node.hasAttribute("onclick") ||
+      node.hasAttribute("tabindex")
+    ) {
+      return node;
+    }
+    node = node.parentElement;
+    depth += 1;
+  }
+  return el;
+}
+
+// Reject hashed / utility class tokens (e.g. "css-1a2b3c", "sc-bdVaJa") so the
+// selector prefers stable, human-authored classes.
+const WORD_LIKE_CLASS = /^[a-zA-Z][a-zA-Z-]{2,}$/;
+const DATA_ID_ATTRS = ["data-testid", "data-test", "data-qa", "data-cy"];
+
+function cssEscape(s: string): string {
+  try {
+    const g = window as unknown as { CSS?: { escape?: (v: string) => string } };
+    if (g.CSS?.escape) return g.CSS.escape(s);
+  } catch {
+    /* fall through */
+  }
+  return s.replace(/([^a-zA-Z0-9_-])/g, "\\$1");
+}
+
+/** A reasonably-unique, stable CSS path: id → data-* test id → word-like class →
+ *  tag:nth-of-type, up to a few ancestors. Far more stable than tag + first-two
+ *  classes (parity with the reference tracker's getCSSPath). */
+function cssPath(el: Element | null): string {
   if (!el) return "";
-  const tag = el.tagName?.toLowerCase() ?? "";
-  const id = el.id ? `#${el.id}` : "";
-  const cls =
-    (el as HTMLElement).className &&
-    typeof (el as HTMLElement).className === "string"
-      ? "." +
-        (el as HTMLElement).className
-          .split(/\s+/)
-          .filter(Boolean)
-          .slice(0, 2)
-          .join(".")
-      : "";
-  return `${tag}${id}${cls}`.slice(0, 80);
+  const segs: string[] = [];
+  let node: Element | null = el;
+  let depth = 0;
+  while (node && node.nodeType === 1 && depth < 5) {
+    if (node.id) {
+      segs.unshift(`#${cssEscape(node.id)}`);
+      break; // an id is unique enough — stop climbing
+    }
+    let seg = node.tagName.toLowerCase();
+    const dataAttr = DATA_ID_ATTRS.find((a) => node!.hasAttribute(a));
+    if (dataAttr) {
+      seg += `[${dataAttr}="${cssEscape(node.getAttribute(dataAttr) ?? "")}"]`;
+      segs.unshift(seg);
+      break;
+    }
+    const className =
+      typeof (node as HTMLElement).className === "string"
+        ? (node as HTMLElement).className
+        : "";
+    const cls = className.split(/\s+/).find((c) => WORD_LIKE_CLASS.test(c));
+    if (cls) {
+      seg += `.${cssEscape(cls)}`;
+    } else if (node.parentElement) {
+      const siblings = Array.prototype.filter.call(
+        node.parentElement.children,
+        (c: Element) => c.tagName === node!.tagName,
+      ) as Element[];
+      if (siblings.length > 1) {
+        seg += `:nth-of-type(${siblings.indexOf(node) + 1})`;
+      }
+    }
+    segs.unshift(seg);
+    node = node.parentElement;
+    depth += 1;
+  }
+  return segs.join(" > ").slice(0, 200);
+}
+
+function normSpaces(s: string): string {
+  return s.replace(/\s+/g, " ").trim();
+}
+
+/** A human label for a clicked element — attribute label, input placeholder, or
+ *  short trimmed text. NEVER an input's actual value (that's user data), except a
+ *  submit button's caption. Capped at 100 chars. */
+function targetLabel(el: Element | null): string {
+  if (!el) return "";
+  const attr =
+    el.getAttribute("data-label") ||
+    el.getAttribute("aria-label") ||
+    el.getAttribute("title") ||
+    el.getAttribute("alt") ||
+    el.getAttribute("name");
+  if (attr) return normSpaces(attr).slice(0, 100);
+  if (el.tagName === "INPUT" || el.tagName === "TEXTAREA") {
+    const ph = el.getAttribute("placeholder");
+    if (ph) return normSpaces(ph).slice(0, 100);
+    const input = el as HTMLInputElement;
+    if (input.type === "submit" || input.type === "button") {
+      return normSpaces(input.value || "").slice(0, 100);
+    }
+    return "";
+  }
+  const text = (el as HTMLElement).innerText || el.textContent || "";
+  return normSpaces(text).slice(0, 100);
+}
+
+/** Content-normalized coordinate in 0..10000 (like the reference tracker), so a
+ *  click maps to the same heatmap bucket across viewport sizes. */
+function normCoord(page: number, extent: number): number {
+  if (!extent || extent <= 0) return 0;
+  return Math.max(0, Math.min(10000, Math.round((page / extent) * 10000)));
+}
+
+/** djb2 hash → short base36 id. Buckets clicks on the same logical target across
+ *  sessions (route # selector # label) for heatmaps/funnels. */
+function hashId(s: string): string {
+  let h = 5381;
+  for (let i = 0; i < s.length; i += 1) h = ((h << 5) + h) ^ s.charCodeAt(i);
+  return (h >>> 0).toString(36);
 }
 
 /**
