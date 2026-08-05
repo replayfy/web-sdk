@@ -32,19 +32,35 @@ export function createConsoleCapture(
     (...args: unknown[]) => void
   >();
 
+  // Flood guard: a console.log in a tight loop shouldn't drown the session in
+  // events. Cap captured messages per rolling window (the real console is still
+  // called, so devtools output is unchanged) — parity with the reference tracker.
+  const THROTTLE_LIMIT = 30;
+  const THROTTLE_WINDOW_MS = 1000;
+  let windowStart = Date.now();
+  let windowCount = 0;
+
   for (const level of methods) {
     originals.set(level, console[level].bind(console));
     console[level] = (...args: unknown[]) => {
-      const serialized = args.map((arg) => serializeConsoleArg(arg));
-      onEvent({
-        level,
-        // formatConsoleArg renders each arg as JSON when it's an object —
-        // gives us a real `{"foo":1,"bar":2}` in `message` instead of the
-        // `[object Object]` you get from Array.prototype.join.
-        message: serialized.map(formatConsoleArg).join(" "),
-        args: serialized,
-        stack: level === "error" ? new Error().stack : undefined,
-      });
+      const now = Date.now();
+      if (now - windowStart > THROTTLE_WINDOW_MS) {
+        windowStart = now;
+        windowCount = 0;
+      }
+      windowCount += 1;
+      if (windowCount <= THROTTLE_LIMIT) {
+        const serialized = args.map((arg) => serializeConsoleArg(arg));
+        onEvent({
+          level,
+          // formatConsoleArg renders each arg as JSON when it's an object —
+          // gives us a real `{"foo":1,"bar":2}` in `message` instead of the
+          // `[object Object]` you get from Array.prototype.join.
+          message: serialized.map(formatConsoleArg).join(" "),
+          args: serialized,
+          stack: level === "error" ? new Error().stack : undefined,
+        });
+      }
       originals.get(level)?.(...args);
     };
   }
@@ -1196,10 +1212,55 @@ export function createNetworkCapture(
     return originalXhrSend.apply(this, args);
   };
 
+  // navigator.sendBeacon capture (analytics pings, unload telemetry) — the
+  // reference tracker patches it too. Skip OUR OWN ingest beacons (the unload
+  // path) so we never record ourselves.
+  const originalSendBeacon =
+    typeof navigator !== "undefined" && navigator.sendBeacon
+      ? navigator.sendBeacon.bind(navigator)
+      : undefined;
+  const isOwnIngest = (u: string) =>
+    u.indexOf("/v1/replay") !== -1 ||
+    (!!config.apiHost && u.indexOf(config.apiHost) === 0);
+  if (originalSendBeacon) {
+    navigator.sendBeacon = (
+      url: string | URL,
+      data?: BodyInit | null,
+    ): boolean => {
+      const urlStr = String(url);
+      const ok = originalSendBeacon(url, data ?? undefined);
+      try {
+        if (!isOwnIngest(urlStr)) {
+          let body: string | undefined;
+          if (typeof data === "string") body = data.slice(0, MAX_BODY);
+          else if (data instanceof URLSearchParams)
+            body = data.toString().slice(0, MAX_BODY);
+          const at = Date.now();
+          onEvent({
+            requestId: globalThis.crypto.randomUUID(),
+            transport: "beacon",
+            method: "POST",
+            url: redactUrlForStorage(urlStr, { patterns: config.redactUrls }),
+            statusCode: ok ? 200 : undefined,
+            startedAt: at,
+            endedAt: at,
+            durationMs: 0,
+            ok,
+            requestBody: body,
+          });
+        }
+      } catch {
+        /* never let capture break the caller's beacon */
+      }
+      return ok;
+    };
+  }
+
   return () => {
     window.fetch = originalFetch;
     XMLHttpRequest.prototype.open = originalXhrOpen;
     XMLHttpRequest.prototype.send = originalXhrSend;
     XMLHttpRequest.prototype.setRequestHeader = originalSetRequestHeader;
+    if (originalSendBeacon) navigator.sendBeacon = originalSendBeacon;
   };
 }

@@ -96,7 +96,7 @@ export interface ConsoleEventData {
 
 export interface NetworkEventData {
   requestId: string;
-  transport: "fetch" | "xhr";
+  transport: "fetch" | "xhr" | "beacon";
   method: string;
   url: string;
   statusCode?: number;
