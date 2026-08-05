@@ -41,6 +41,21 @@ export interface WebReplayConfig extends ReplayPrivacyConfig {
   sdk?: Partial<ReplaySdkDescriptor>;
   beforeSend?: (event: WebReplayEventContext) => WebReplayEventContext | null;
   fetchImpl?: typeof fetch;
+  /** Don't start recording at all when the browser sends Do-Not-Track
+   *  (navigator.doNotTrack === "1"). Off by default; opt in for strict privacy. */
+  respectDoNotTrack?: boolean;
+  /** Record <canvas> contents. Off by default (bandwidth); can also be enabled
+   *  from remote config, but this lets a self-hosted/local caller force it. */
+  recordCanvas?: boolean;
+  /** Record nested CROSS-origin iframes (requires the SDK in the child frame).
+   *  Off by default; host override for the remote-config flag. */
+  recordCrossOriginIframes?: boolean;
+  /** Mask email addresses inside visible text nodes in the replay. On by default
+   *  (privacy floor); set false to keep raw text. */
+  maskTextEmails?: boolean;
+  /** Also mask long digit runs (≥5) in visible text (card/PII-looking numbers).
+   *  Off by default (avoids masking order ids / counts). */
+  maskTextNumbers?: boolean;
 }
 
 export interface WebReplayEventContext {

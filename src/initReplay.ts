@@ -38,6 +38,28 @@ export function initReplay(config: WebReplayConfig): ReplayController {
     throw new Error("initReplay must run in a browser context");
   }
 
+  // Honor Do-Not-Track when the customer opts in: install NOTHING and return an
+  // inert controller, so no data is captured or sent.
+  if (config.respectDoNotTrack) {
+    const dnt =
+      navigator.doNotTrack === "1" ||
+      (window as unknown as { doNotTrack?: string }).doNotTrack === "1" ||
+      (navigator as unknown as { msDoNotTrack?: string }).msDoNotTrack === "1";
+    if (dnt) {
+      const noop = () => {};
+      return {
+        sessionId: "",
+        flush: async () => {},
+        identify: noop,
+        track: noop,
+        captureException: noop,
+        setAnonymousId: noop,
+        setMetadata: noop,
+        stop: async () => {},
+      };
+    }
+  }
+
   const session = createSessionRuntime(config);
   const sendBatch = createBatchSender(config);
   const { fp: fingerprint } = getBrowserFingerprint();
@@ -142,6 +164,13 @@ export function initReplay(config: WebReplayConfig): ReplayController {
       session.drain();
       return;
     }
+    // minDuration gate: hold (keep buffering, don't ship) until the session has
+    // lived past minDurationMs, so bounce sessions shorter than the minimum are
+    // never uploaded (they're discarded on unload). 0 disables. Bounded by the
+    // runtime buffer cap.
+    if (minDurationMs > 0 && Date.now() - session.startedAt < minDurationMs) {
+      return;
+    }
     const events = session.drain();
     if (events.length === 0) return;
     const envelope: ReplayBatchEnvelope = {
@@ -228,7 +257,6 @@ export function initReplay(config: WebReplayConfig): ReplayController {
     alwaysRecordIdentified: boolean;
   } | null = null;
   let minDurationMs = 0;
-  void minDurationMs;
 
   const installCaptures = (effective: {
     console: boolean;
@@ -313,8 +341,12 @@ export function initReplay(config: WebReplayConfig): ReplayController {
       maskAllInputs: effective.maskAllInputs ?? config.maskAllInputs ?? true, // safe default
       maskTextSelector: effective.maskTextSelector ?? config.maskTextSelector,
       blockSelector: effective.blockSelector ?? config.blockSelector,
-      recordCanvas: effective.recordCanvas ?? false,
-      recordCrossOriginIframes: effective.recordCrossOriginIframes ?? false,
+      // Host config can force these on without waiting for remote config.
+      recordCanvas: effective.recordCanvas ?? config.recordCanvas ?? false,
+      recordCrossOriginIframes:
+        effective.recordCrossOriginIframes ??
+        config.recordCrossOriginIframes ??
+        false,
       // Serialise input-type masks so the change-detection below can use a
       // simple string equality check.
       maskInputOptionsKey: Object.keys(
@@ -351,6 +383,23 @@ export function initReplay(config: WebReplayConfig): ReplayController {
       // them to. A periodic checkout self-heals a lost initial snapshot and lets
       // a live viewer join mid-session. Paired with the flush re-queue.
       rrwebOpts.checkoutEveryNms = 120000;
+      // Default privacy floor for VISIBLE TEXT: mask email addresses in every
+      // text node (opt out with maskTextEmails:false), and optionally long digit
+      // runs (maskTextNumbers). maskAllInputs already covers input VALUES; this
+      // covers free-text PII the reference tracker masks by default.
+      const maskEmails = config.maskTextEmails !== false;
+      if (maskEmails || config.maskTextNumbers) {
+        rrwebOpts.maskTextFn = (text: string): string => {
+          let t = text;
+          if (maskEmails)
+            t = t.replace(/[\w.+-]+@[\w-]+\.[\w.-]+/g, "[email]");
+          if (config.maskTextNumbers)
+            t = t.replace(/\b\d{5,}\b/g, (m) =>
+              "•".repeat(Math.min(m.length, 12)),
+            );
+          return t;
+        };
+      }
       if (typeof nextPrivacy.maskAllInputs === "boolean")
         rrwebOpts.maskAllInputs = nextPrivacy.maskAllInputs;
       if (nextPrivacy.maskTextSelector)
@@ -659,6 +708,11 @@ export function initReplay(config: WebReplayConfig): ReplayController {
   // up anything left. Each call drains the buffer, so the later ones are no-ops
   // when an earlier one already sent — no duplicate batches.
   const finalFlush = (reason: SessionEndEventData["reason"]) => {
+    // Discard a bounce session that never reached minDuration — don't ship its
+    // held buffer on the way out.
+    if (minDurationMs > 0 && Date.now() - session.startedAt < minDurationMs) {
+      return;
+    }
     emitSessionEnd(reason);
     session.flushFinal(sendBatch.sendFinal);
   };
