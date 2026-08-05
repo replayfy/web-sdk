@@ -144,3 +144,101 @@ export function withRedactedUrl(
   }
   return result;
 }
+
+/** Query-string keys whose VALUES are ALWAYS scrubbed from any captured URL,
+ *  with zero configuration — credentials that must never be stored server-side.
+ *  Matched case-insensitively. Mirrors the reference tracker's default URL
+ *  sanitizer (tokens leaking into stored nav/entry URLs is a real exposure). */
+export const DEFAULT_SENSITIVE_QUERY_KEYS = [
+  "jwt", "token", "access_token", "refresh_token", "id_token", "auth",
+  "authorization", "password", "passwd", "pwd", "secret", "api_key", "apikey",
+  "invitation", "invite", "reset-password", "reset_password", "otp", "sig",
+  "signature", "code", "state",
+];
+
+const CC_RE = /\b(?:\d[ -]?){13,19}\b/g;
+
+function luhnValid(num: string): boolean {
+  let sum = 0;
+  let alt = false;
+  for (let i = num.length - 1; i >= 0; i -= 1) {
+    let d = num.charCodeAt(i) - 48;
+    if (alt) {
+      d *= 2;
+      if (d > 9) d -= 9;
+    }
+    sum += d;
+    alt = !alt;
+  }
+  return sum % 10 === 0;
+}
+
+/** Mask any 13–19 digit run that passes the Luhn check (a real card number),
+ *  leaving other long digit strings (order ids, timestamps) intact. */
+export function scrubCreditCards(text: string): string {
+  return text.replace(CC_RE, (m) => {
+    const digits = m.replace(/\D/g, "");
+    return digits.length >= 13 && digits.length <= 19 && luhnValid(digits)
+      ? "[REDACTED_CC]"
+      : m;
+  });
+}
+
+/** Parse a possibly-relative URL, mutate its query, and re-serialize preserving
+ *  absolute-vs-relative form. Returns the input unchanged on parse failure. */
+function editQuery(url: string, edit: (q: URLSearchParams) => boolean): string {
+  try {
+    const absolute = /^[a-z][a-z0-9+.-]*:\/\//i.test(url);
+    const u = new URL(url, "http://_local_");
+    if (!edit(u.searchParams)) return url;
+    return absolute ? u.toString() : u.pathname + u.search + u.hash;
+  } catch {
+    return url;
+  }
+}
+
+/** Redact a URL before it is stored. Always masks the built-in sensitive query
+ *  keys; then applies the workspace policy: strip all query params except an
+ *  allowlist, custom redact patterns, and a Luhn-checked credit-card scrub. */
+export function redactUrlForStorage(
+  url: string,
+  policy?: {
+    strip?: boolean;
+    allowed?: string[];
+    blockCC?: boolean;
+    patterns?: Array<string | RegExp>;
+  },
+): string {
+  let out = editQuery(url, (q) => {
+    const keys: string[] = [];
+    q.forEach((_v, k) => keys.push(k));
+    let changed = false;
+    for (const k of keys) {
+      if (DEFAULT_SENSITIVE_QUERY_KEYS.includes(k.toLowerCase())) {
+        q.set(k, "[REDACTED]");
+        changed = true;
+      }
+    }
+    return changed;
+  });
+  if (policy?.strip) {
+    const allow = new Set((policy.allowed ?? []).map((a) => a.toLowerCase()));
+    out = editQuery(out, (q) => {
+      const keys: string[] = [];
+      q.forEach((_v, k) => keys.push(k));
+      let changed = false;
+      for (const k of keys) {
+        if (!allow.has(k.toLowerCase())) {
+          q.delete(k);
+          changed = true;
+        }
+      }
+      return changed;
+    });
+  }
+  if (policy?.patterns && policy.patterns.length > 0) {
+    out = withRedactedUrl(out, policy.patterns);
+  }
+  if (policy?.blockCC) out = scrubCreditCards(out);
+  return out;
+}

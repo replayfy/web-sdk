@@ -26,6 +26,7 @@ import {
 } from "./signals";
 import { fetchRemoteConfig } from "./remote-config";
 import { getBrowserFingerprint } from "./fingerprint";
+import { redactUrlForStorage } from "./utils";
 import type { ReplayController, WebReplayConfig } from "./types";
 
 interface CaptureSlot {
@@ -103,9 +104,13 @@ export function initReplay(config: WebReplayConfig): ReplayController {
 
   const emitSessionStart = () => {
     const data: SessionStartEventData = {
-      href: window.location.href,
+      // Scrub credentials (jwt/token/password/reset-password/…) out of the entry
+      // URL + referrer before they're stored — magic-link / OAuth / reset flows
+      // routinely carry them in the query string. Fires before remote config, so
+      // only the always-on default key scrub applies here (the critical case).
+      href: redactUrlForStorage(window.location.href),
       path: window.location.pathname,
-      referrer: document.referrer,
+      referrer: redactUrlForStorage(document.referrer),
     };
     emit({ ts: Date.now(), type: "session_start", data });
   };

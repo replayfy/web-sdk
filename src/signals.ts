@@ -12,7 +12,7 @@ import {
   redactHeaders,
   serializeConsoleArg,
   toHeaderRecord,
-  withRedactedUrl,
+  redactUrlForStorage,
 } from "./utils";
 
 type StopHandle = () => void;
@@ -213,9 +213,15 @@ export function createNavigationCapture(
 
   const emit = (trigger: NavigationEventData["trigger"]) => {
     const nextUrl = window.location.href;
+    // Skip no-op emits: a pushState/replaceState that doesn't change the URL
+    // (common — routers re-push the same route) shouldn't create a screen event.
+    // 'load' always emits (it's the entry).
+    if (trigger !== "load" && nextUrl === currentUrl) return;
     onEvent({
-      from: currentUrl,
-      to: nextUrl,
+      // Scrub credentials out of the stored URLs (tokens/reset-links routinely
+      // ride in the query string). Default key scrub — always on, no config.
+      from: redactUrlForStorage(currentUrl),
+      to: redactUrlForStorage(nextUrl),
       trigger,
     });
     currentUrl = nextUrl;
@@ -800,7 +806,7 @@ export function createNetworkCapture(
         requestId,
         transport: "fetch",
         method: request.method,
-        url: withRedactedUrl(request.url, config.redactUrls),
+        url: redactUrlForStorage(request.url, { patterns: config.redactUrls }),
         startedAt,
         endedAt: Date.now(),
         durationMs: Date.now() - startedAt,
@@ -830,7 +836,7 @@ export function createNetworkCapture(
         requestId,
         transport: "fetch",
         method: request.method,
-        url: withRedactedUrl(request.url, config.redactUrls),
+        url: redactUrlForStorage(request.url, { patterns: config.redactUrls }),
         startedAt,
         endedAt: Date.now(),
         durationMs: Date.now() - startedAt,
@@ -938,7 +944,7 @@ export function createNetworkCapture(
           requestId: meta.requestId,
           transport: "xhr",
           method: meta.method,
-          url: withRedactedUrl(meta.url, config.redactUrls),
+          url: redactUrlForStorage(meta.url, { patterns: config.redactUrls }),
           startedAt: meta.startedAt,
           endedAt: Date.now(),
           durationMs: Date.now() - meta.startedAt,
@@ -965,7 +971,7 @@ export function createNetworkCapture(
             requestId: meta.requestId,
             transport: "xhr",
             method: meta.method,
-            url: withRedactedUrl(meta.url, config.redactUrls),
+            url: redactUrlForStorage(meta.url, { patterns: config.redactUrls }),
             startedAt: meta.startedAt,
             endedAt: Date.now(),
             durationMs: Date.now() - meta.startedAt,
