@@ -138,7 +138,14 @@ export function initReplay(config: WebReplayConfig): ReplayController {
     emit({ ts: Date.now(), type: "session_start", data });
   };
 
+  // Last time rrweb emitted ANYTHING (full or incremental). Drives the
+  // idle-aware heartbeat: on a busy page rrweb is already streaming, so the
+  // forced 30s full snapshot is pure overhead — we only force one once the page
+  // has gone quiet (where the stream would otherwise end and a mid-join viewer
+  // would have no base).
+  let lastRrwebActivityAt = Date.now();
   const emitSnapshot = (rrwebEvent: eventWithTime) => {
+    lastRrwebActivityAt = Date.now();
     const data: SnapshotEventData = { recorder: "rrweb", rrwebEvent };
     emit({
       ts: rrwebEvent.timestamp,
@@ -247,7 +254,8 @@ export function initReplay(config: WebReplayConfig): ReplayController {
     allowed: string[];
     blockCC: boolean;
   } = { strip: false, allowed: [], blockCC: false };
-  void urlRedactionPolicy; // read by createNetworkCapture (closure)
+  // Read live per-request by createNetworkCapture via the getUrlPolicy closure,
+  // so a remote-config privacy update applies without re-installing the capture.
 
   // Sampling overrides — populated when /v1/sdk/config arrives. Referenced
   // inside error + identify handlers so they can flip a dropped session
@@ -297,6 +305,9 @@ export function initReplay(config: WebReplayConfig): ReplayController {
           },
           (d: NetworkEventData) =>
             emit({ ts: d.startedAt, type: "network", data: d }),
+          // Live URL-redaction policy — read per request so the remote
+          // strip/allowlist/blockCC applies without re-installing the capture.
+          () => urlRedactionPolicy,
         ),
       );
       syncCapture("errors", effective.errors, () =>
@@ -435,6 +446,12 @@ export function initReplay(config: WebReplayConfig): ReplayController {
         // and enabling live mid-join. The SDK analog of the reference tracker's
         // periodic keepalive.
         heartbeat = setInterval(() => {
+          // Idle-aware: skip the forced full snapshot when rrweb already emitted
+          // within the last interval (the page is active and self-heals via its
+          // own stream + the 2-min checkout). Only force one when the page has
+          // gone quiet — keeping the self-heal for idle pages without
+          // re-serializing a busy large-DOM app every 30s.
+          if (Date.now() - lastRrwebActivityAt < 30_000) return;
           try {
             record.takeFullSnapshot(true);
           } catch {
@@ -486,6 +503,7 @@ export function initReplay(config: WebReplayConfig): ReplayController {
         },
         (d: NetworkEventData) =>
           emit({ ts: d.startedAt, type: "network", data: d }),
+        () => urlRedactionPolicy,
       ),
     );
     syncCapture("errors", effective.errors, () =>

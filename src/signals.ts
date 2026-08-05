@@ -987,6 +987,14 @@ function snapshotConnection(): { rtt?: number; effectiveType?: string } {
 export function createNetworkCapture(
   config: WebReplayConfig,
   onEvent: (data: NetworkEventData) => void,
+  /** Live URL-redaction policy (strip/allowlist/blockCC) — read fresh per
+   *  request so a remote-config update applies WITHOUT re-installing the capture
+   *  (the network patches are installed once). Cheap: a closure read. */
+  getUrlPolicy?: () => {
+    strip?: boolean;
+    allowed?: string[];
+    blockCC?: boolean;
+  },
 ): StopHandle {
   const originalFetch = (config.fetchImpl ?? window.fetch).bind(window);
   const originalXhrOpen = XMLHttpRequest.prototype.open;
@@ -994,6 +1002,26 @@ export function createNetworkCapture(
   const originalSetRequestHeader = XMLHttpRequest.prototype.setRequestHeader;
 
   const MAX_BODY = config.maxBodyBytes ?? 8 * 1024;
+  // The full URL-redaction policy for THIS request: always-on default key scrub
+  // (inside redactUrlForStorage) + host redactUrls + the live remote policy.
+  const urlPolicy = () => ({
+    patterns: config.redactUrls,
+    ...(getUrlPolicy?.() ?? {}),
+  });
+  // Apply the host body sanitizer, if any. null → drop the body.
+  const redactBody = (
+    body: string | undefined,
+    direction: "request" | "response",
+    url: string,
+  ): string | undefined => {
+    if (body === undefined || !config.sanitizeBody) return body;
+    try {
+      const out = config.sanitizeBody({ url, direction, body });
+      return out === null ? undefined : (out ?? body);
+    } catch {
+      return body;
+    }
+  };
 
   window.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
     const startedAt = Date.now();
@@ -1031,7 +1059,7 @@ export function createNetworkCapture(
         requestId,
         transport: "fetch",
         method: request.method,
-        url: redactUrlForStorage(request.url, { patterns: config.redactUrls }),
+        url: redactUrlForStorage(request.url, urlPolicy()),
         startedAt,
         endedAt: Date.now(),
         durationMs: Date.now() - startedAt,
@@ -1049,8 +1077,8 @@ export function createNetworkCapture(
               config.redactHeaderNames,
             )
           : undefined,
-        requestBody,
-        responseBody,
+        requestBody: redactBody(requestBody, "request", request.url),
+        responseBody: redactBody(responseBody, "response", request.url),
         connectionRtt: conn.rtt,
         connectionEffectiveType: conn.effectiveType,
       });
@@ -1061,7 +1089,7 @@ export function createNetworkCapture(
         requestId,
         transport: "fetch",
         method: request.method,
-        url: redactUrlForStorage(request.url, { patterns: config.redactUrls }),
+        url: redactUrlForStorage(request.url, urlPolicy()),
         startedAt,
         endedAt: Date.now(),
         durationMs: Date.now() - startedAt,
@@ -1169,7 +1197,7 @@ export function createNetworkCapture(
           requestId: meta.requestId,
           transport: "xhr",
           method: meta.method,
-          url: redactUrlForStorage(meta.url, { patterns: config.redactUrls }),
+          url: redactUrlForStorage(meta.url, urlPolicy()),
           startedAt: meta.startedAt,
           endedAt: Date.now(),
           durationMs: Date.now() - meta.startedAt,
@@ -1196,7 +1224,7 @@ export function createNetworkCapture(
             requestId: meta.requestId,
             transport: "xhr",
             method: meta.method,
-            url: redactUrlForStorage(meta.url, { patterns: config.redactUrls }),
+            url: redactUrlForStorage(meta.url, urlPolicy()),
             startedAt: meta.startedAt,
             endedAt: Date.now(),
             durationMs: Date.now() - meta.startedAt,
@@ -1240,7 +1268,7 @@ export function createNetworkCapture(
             requestId: globalThis.crypto.randomUUID(),
             transport: "beacon",
             method: "POST",
-            url: redactUrlForStorage(urlStr, { patterns: config.redactUrls }),
+            url: redactUrlForStorage(urlStr, urlPolicy()),
             statusCode: ok ? 200 : undefined,
             startedAt: at,
             endedAt: at,

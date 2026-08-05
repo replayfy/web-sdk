@@ -30,6 +30,14 @@ export interface WebReplayConfig extends ReplayPrivacyConfig {
    *  values are masked before events leave the browser. */
   redactHeaderNames?: string[];
   maxBodyBytes?: number;
+  /** Rewrite or drop a captured request/response body before it leaves the
+   *  browser — return a sanitized string, or null to drop the body entirely.
+   *  Zero overhead when unset. Runs in addition to server-side redaction. */
+  sanitizeBody?: (info: {
+    url: string;
+    direction: "request" | "response";
+    body: string;
+  }) => string | null | undefined;
   /** Capture per-resource timing (images, scripts, css, fonts) via the
    *  Resource Timing API. Default on. This is the highest-volume perf
    *  channel — raise `resourceMinDurationMs` to trim it at scale. */
