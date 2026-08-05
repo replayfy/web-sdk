@@ -41,6 +41,11 @@ export function initReplay(config: WebReplayConfig): ReplayController {
   const sendBatch = createBatchSender(config);
   const { fp: fingerprint } = getBrowserFingerprint();
   sendBatch.setFingerprint(fingerprint);
+  // Bind identity to THIS session: re-attach a persisted identify() only when the
+  // same session resumed (reload); a fresh/rolled-over session starts anonymous.
+  // Must run BEFORE the config/runtime identify() below so they replace/merge
+  // over the correct base rather than a stale prior-session identity.
+  sendBatch.bindSession(session.sessionId, session.resumed);
   const captures: Record<string, CaptureSlot | null> = {
     console: null,
     network: null,
@@ -470,7 +475,23 @@ export function initReplay(config: WebReplayConfig): ReplayController {
     );
   };
 
-  emitSessionStart();
+  // A fresh session opens with session_start (sets the entry page). A RESUMED
+  // session — a reload or same-tab back/forward within the inactivity window —
+  // instead records the reload as a page navigation, so the original entry page
+  // is preserved and the reload shows on the timeline as a page transition
+  // rather than a second "session start".
+  if (session.resumed) {
+    emit({
+      ts: Date.now(),
+      type: "navigation",
+      data: {
+        to: window.location.href,
+        trigger: "load",
+      } satisfies NavigationEventData,
+    });
+  } else {
+    emitSessionStart();
+  }
   emitViewport();
 
   // We install captures in *two phases* to avoid losing the rrweb
@@ -637,6 +658,26 @@ export function initReplay(config: WebReplayConfig): ReplayController {
     }
   });
 
+  // Keep the session's last-activity marker fresh on genuine USER interaction —
+  // deliberately NOT the SDK's own heartbeat/perf events, so an idle tab that's
+  // only emitting keepalive snapshots still ages out of the resume window. These
+  // are passive + capture so they never delay the page's own handlers, and the
+  // write behind touch() is throttled, so this is effectively free on the hot
+  // pointer/scroll path.
+  const onUserActivity = () => session.touch();
+  const activityEvents = [
+    "pointerdown",
+    "keydown",
+    "scroll",
+    "touchstart",
+  ] as const;
+  for (const evt of activityEvents) {
+    window.addEventListener(evt, onUserActivity, {
+      passive: true,
+      capture: true,
+    });
+  }
+
   const identify: ReplayController["identify"] = (idOrPayload, props) => {
     const payload: IdentifyPayload =
       typeof idOrPayload === "string"
@@ -717,6 +758,11 @@ export function initReplay(config: WebReplayConfig): ReplayController {
           }
           captures[k] = null;
         }
+      }
+      for (const evt of activityEvents) {
+        window.removeEventListener(evt, onUserActivity, {
+          capture: true,
+        } as EventListenerOptions);
       }
       session.stopAutoFlush();
       emitSessionEnd("manual");

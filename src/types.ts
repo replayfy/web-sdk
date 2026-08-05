@@ -14,6 +14,12 @@ export interface WebReplayConfig extends ReplayPrivacyConfig {
    *  session-search filter so you can scope analysis to one release. */
   revId?: string;
   sessionId?: string;
+  /** How long a tab can go WITHOUT user interaction before a reload starts a
+   *  fresh session instead of continuing the current one. Defaults to 30 min
+   *  (the session-analytics norm). This is the client-side session boundary —
+   *  our ingest appends batches by sessionId without validating continuation,
+   *  so the SDK is what decides when one session ends and the next begins. */
+  sessionInactivityMs?: number;
   flushIntervalMs?: number;
   maxBufferSize?: number;
   captureConsole?: boolean;
