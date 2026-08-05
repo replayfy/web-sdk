@@ -23,6 +23,14 @@ export interface BatchSender {
   (envelope: ReplayBatchEnvelope, useBeacon?: boolean): Promise<void>;
   setIdentify: (identify: IdentifyPayload | undefined) => void;
   setFingerprint: (fp: string) => void;
+  /** Bind the sender to THIS page load's session. Re-attaches a persisted
+   *  identity only when the same session resumed; a fresh session is cleared to
+   *  anonymous. Call once, before any setIdentify. */
+  bindSession: (sessionId: string, resumed: boolean) => void;
+  /** Unload-reliable send for the final flush: a keepalive fetch (survives page
+   *  teardown AND sets the api-key header, so it authenticates even where ?k=
+   *  isn't accepted), falling back to sendBeacon. Fire-and-forget. */
+  sendFinal: (envelope: ReplayBatchEnvelope) => void;
 }
 
 /**
@@ -129,10 +137,63 @@ async function gzipMainThread(json: string): Promise<ArrayBuffer | null> {
 const MAX_SEND_ATTEMPTS = 3;
 const SEND_BACKOFF_MS = 300;
 
+/** Where the current tab's identify() payload is stashed, TAGGED with the session
+ *  id it belongs to. A reload re-attaches it ONLY when the same session resumed
+ *  (bindSession checks the sid) — so it closes the "identify lost on reload" gap
+ *  without leaking identity into a DIFFERENT session that happens to share the
+ *  tab (a post-inactivity rollover, or a logged-out visitor on a shared machine).
+ *  sessionStorage (per-tab, cleared on tab-close) also keeps identity from
+ *  sticking to the browser forever with no logout hook. */
+const IDENTIFY_STORAGE_KEY = "replay:identify";
+
+interface StoredIdentify {
+  sid: string;
+  payload: IdentifyPayload;
+}
+
+function loadStoredIdentify(): StoredIdentify | null {
+  try {
+    const raw = sessionStorage.getItem(IDENTIFY_STORAGE_KEY);
+    if (!raw) return null;
+    const s = JSON.parse(raw) as Partial<StoredIdentify>;
+    if (
+      s &&
+      typeof s.sid === "string" &&
+      s.payload &&
+      typeof s.payload === "object" &&
+      (s.payload.distinctId || s.payload.email)
+    ) {
+      return { sid: s.sid, payload: s.payload };
+    }
+  } catch {
+    /* sessionStorage blocked / corrupt — start anonymous */
+  }
+  return null;
+}
+
+function persistIdentify(
+  sid: string | undefined,
+  payload: IdentifyPayload | undefined,
+): void {
+  try {
+    if (!sid || !payload || (!payload.distinctId && !payload.email)) {
+      sessionStorage.removeItem(IDENTIFY_STORAGE_KEY);
+      return;
+    }
+    sessionStorage.setItem(IDENTIFY_STORAGE_KEY, JSON.stringify({ sid, payload }));
+  } catch {
+    /* ignore — identity just won't survive this reload */
+  }
+}
+
 export function createBatchSender(config: WebReplayConfig): BatchSender {
   const endpoint = new URL("/v1/replay/batch", config.apiHost).toString();
   const fetchImpl = config.fetchImpl ?? window.fetch.bind(window);
+  // Identity is seeded by bindSession() (called from initReplay once the session
+  // id + resumed flag are known) — NOT unconditionally at construction, so a
+  // fresh session never inherits a prior session's user. See bindSession.
   let currentIdentify: IdentifyPayload | undefined;
+  let currentSessionId: string | undefined;
 
   let currentFingerprint: string | undefined;
 
@@ -241,15 +302,81 @@ export function createBatchSender(config: WebReplayConfig): BatchSender {
       : new Error("Replay batch send failed after retries");
   };
 
+  send.bindSession = (sessionId, resumed) => {
+    currentSessionId = sessionId;
+    // Re-attach a persisted identity ONLY when this page load resumed the SAME
+    // session it was captured under. A freshly minted session (new tab, or a
+    // post-inactivity rollover in the same tab) starts anonymous until the host
+    // re-identifies — otherwise it would inherit the previous session's
+    // (possibly logged-out or different) user. Ties identity to the session's
+    // lifetime, matching the reference tracker's per-session user id.
+    const stored = loadStoredIdentify();
+    if (resumed && stored && stored.sid === sessionId) {
+      currentIdentify = stored.payload;
+    } else {
+      currentIdentify = undefined;
+      persistIdentify(undefined, undefined); // drop any stale prior-session identity
+    }
+  };
   send.setIdentify = (identify) => {
     if (!identify) {
       currentIdentify = undefined;
+      persistIdentify(currentSessionId, undefined);
       return;
     }
-    currentIdentify = { ...(currentIdentify ?? {}), ...identify };
+    // REPLACE (not merge) when the distinctId changes — a shallow merge would
+    // ship the previous user's email/name/plan/customProps under the new user's
+    // id (cross-user PII contamination). Merge only for a same-user trait update
+    // or a trait-only call (no distinctId).
+    const prev = currentIdentify;
+    const switchingUser =
+      !!identify.distinctId &&
+      !!prev?.distinctId &&
+      identify.distinctId !== prev.distinctId;
+    currentIdentify = switchingUser
+      ? { ...identify }
+      : { ...(prev ?? {}), ...identify };
+    // Persist (tagged with this session) so a reload of the SAME session
+    // re-attaches it; bindSession guards against a different session reusing it.
+    persistIdentify(currentSessionId, currentIdentify);
   };
   send.setFingerprint = (fp) => {
     currentFingerprint = fp;
+  };
+  const beaconFallback = (json: string) => {
+    try {
+      if (typeof navigator !== "undefined" && navigator.sendBeacon) {
+        // Beacon can't set headers, so the key rides as ?k= (the backend accepts
+        // either). Kept < 55KB per chunk by the caller so it isn't dropped.
+        const url = `${endpoint}?${new URLSearchParams({ k: config.apiKey }).toString()}`;
+        navigator.sendBeacon(url, new Blob([json], { type: "application/json" }));
+      }
+    } catch {
+      /* nothing left to try — the page is going away */
+    }
+  };
+  send.sendFinal = (envelope) => {
+    const json = JSON.stringify({
+      envelope,
+      identify: currentIdentify,
+      fingerprint: currentFingerprint,
+    });
+    // Primary: keepalive fetch. It survives the unload and, unlike sendBeacon,
+    // sets the x-replay-api-key HEADER. Only fall back to a beacon if the fetch
+    // rejects/throws while the page is still alive (no double-send on success).
+    try {
+      void fetchImpl(endpoint, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-replay-api-key": config.apiKey,
+        },
+        body: json,
+        keepalive: true,
+      }).catch(() => beaconFallback(json));
+    } catch {
+      beaconFallback(json);
+    }
   };
 
   return send;

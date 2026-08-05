@@ -25,7 +25,8 @@ import {
   errorDataFromValue,
 } from "./signals";
 import { fetchRemoteConfig } from "./remote-config";
-import { getBrowserFingerprint } from "./fingerprint";
+import { getBrowserFingerprint, setStoredFingerprint } from "./fingerprint";
+import { redactUrlForStorage } from "./utils";
 import type { ReplayController, WebReplayConfig } from "./types";
 
 interface CaptureSlot {
@@ -37,10 +38,37 @@ export function initReplay(config: WebReplayConfig): ReplayController {
     throw new Error("initReplay must run in a browser context");
   }
 
+  // Honor Do-Not-Track when the customer opts in: install NOTHING and return an
+  // inert controller, so no data is captured or sent.
+  if (config.respectDoNotTrack) {
+    const dnt =
+      navigator.doNotTrack === "1" ||
+      (window as unknown as { doNotTrack?: string }).doNotTrack === "1" ||
+      (navigator as unknown as { msDoNotTrack?: string }).msDoNotTrack === "1";
+    if (dnt) {
+      const noop = () => {};
+      return {
+        sessionId: "",
+        flush: async () => {},
+        identify: noop,
+        track: noop,
+        captureException: noop,
+        setAnonymousId: noop,
+        setMetadata: noop,
+        stop: async () => {},
+      };
+    }
+  }
+
   const session = createSessionRuntime(config);
   const sendBatch = createBatchSender(config);
   const { fp: fingerprint } = getBrowserFingerprint();
   sendBatch.setFingerprint(fingerprint);
+  // Bind identity to THIS session: re-attach a persisted identify() only when the
+  // same session resumed (reload); a fresh/rolled-over session starts anonymous.
+  // Must run BEFORE the config/runtime identify() below so they replace/merge
+  // over the correct base rather than a stale prior-session identity.
+  sendBatch.bindSession(session.sessionId, session.resumed);
   const captures: Record<string, CaptureSlot | null> = {
     console: null,
     network: null,
@@ -98,14 +126,26 @@ export function initReplay(config: WebReplayConfig): ReplayController {
 
   const emitSessionStart = () => {
     const data: SessionStartEventData = {
-      href: window.location.href,
+      // Scrub credentials (jwt/token/password/reset-password/…) out of the entry
+      // URL + referrer before they're stored — magic-link / OAuth / reset flows
+      // routinely carry them in the query string. Fires before remote config, so
+      // only the always-on default key scrub applies here (the critical case).
+      href: redactUrlForStorage(window.location.href),
       path: window.location.pathname,
-      referrer: document.referrer,
+      referrer: redactUrlForStorage(document.referrer),
+      title: document.title || undefined,
     };
     emit({ ts: Date.now(), type: "session_start", data });
   };
 
+  // Last time rrweb emitted ANYTHING (full or incremental). Drives the
+  // idle-aware heartbeat: on a busy page rrweb is already streaming, so the
+  // forced 30s full snapshot is pure overhead — we only force one once the page
+  // has gone quiet (where the stream would otherwise end and a mid-join viewer
+  // would have no base).
+  let lastRrwebActivityAt = Date.now();
   const emitSnapshot = (rrwebEvent: eventWithTime) => {
+    lastRrwebActivityAt = Date.now();
     const data: SnapshotEventData = { recorder: "rrweb", rrwebEvent };
     emit({
       ts: rrwebEvent.timestamp,
@@ -129,6 +169,13 @@ export function initReplay(config: WebReplayConfig): ReplayController {
   const flush = async () => {
     if (!sampled || blocked) {
       session.drain();
+      return;
+    }
+    // minDuration gate: hold (keep buffering, don't ship) until the session has
+    // lived past minDurationMs, so bounce sessions shorter than the minimum are
+    // never uploaded (they're discarded on unload). 0 disables. Bounded by the
+    // runtime buffer cap.
+    if (minDurationMs > 0 && Date.now() - session.startedAt < minDurationMs) {
       return;
     }
     const events = session.drain();
@@ -207,7 +254,8 @@ export function initReplay(config: WebReplayConfig): ReplayController {
     allowed: string[];
     blockCC: boolean;
   } = { strip: false, allowed: [], blockCC: false };
-  void urlRedactionPolicy; // read by createNetworkCapture (closure)
+  // Read live per-request by createNetworkCapture via the getUrlPolicy closure,
+  // so a remote-config privacy update applies without re-installing the capture.
 
   // Sampling overrides — populated when /v1/sdk/config arrives. Referenced
   // inside error + identify handlers so they can flip a dropped session
@@ -217,7 +265,6 @@ export function initReplay(config: WebReplayConfig): ReplayController {
     alwaysRecordIdentified: boolean;
   } | null = null;
   let minDurationMs = 0;
-  void minDurationMs;
 
   const installCaptures = (effective: {
     console: boolean;
@@ -258,6 +305,9 @@ export function initReplay(config: WebReplayConfig): ReplayController {
           },
           (d: NetworkEventData) =>
             emit({ ts: d.startedAt, type: "network", data: d }),
+          // Live URL-redaction policy — read per request so the remote
+          // strip/allowlist/blockCC applies without re-installing the capture.
+          () => urlRedactionPolicy,
         ),
       );
       syncCapture("errors", effective.errors, () =>
@@ -302,8 +352,12 @@ export function initReplay(config: WebReplayConfig): ReplayController {
       maskAllInputs: effective.maskAllInputs ?? config.maskAllInputs ?? true, // safe default
       maskTextSelector: effective.maskTextSelector ?? config.maskTextSelector,
       blockSelector: effective.blockSelector ?? config.blockSelector,
-      recordCanvas: effective.recordCanvas ?? false,
-      recordCrossOriginIframes: effective.recordCrossOriginIframes ?? false,
+      // Host config can force these on without waiting for remote config.
+      recordCanvas: effective.recordCanvas ?? config.recordCanvas ?? false,
+      recordCrossOriginIframes:
+        effective.recordCrossOriginIframes ??
+        config.recordCrossOriginIframes ??
+        false,
       // Serialise input-type masks so the change-detection below can use a
       // simple string equality check.
       maskInputOptionsKey: Object.keys(
@@ -340,6 +394,23 @@ export function initReplay(config: WebReplayConfig): ReplayController {
       // them to. A periodic checkout self-heals a lost initial snapshot and lets
       // a live viewer join mid-session. Paired with the flush re-queue.
       rrwebOpts.checkoutEveryNms = 120000;
+      // Default privacy floor for VISIBLE TEXT: mask email addresses in every
+      // text node (opt out with maskTextEmails:false), and optionally long digit
+      // runs (maskTextNumbers). maskAllInputs already covers input VALUES; this
+      // covers free-text PII the reference tracker masks by default.
+      const maskEmails = config.maskTextEmails !== false;
+      if (maskEmails || config.maskTextNumbers) {
+        rrwebOpts.maskTextFn = (text: string): string => {
+          let t = text;
+          if (maskEmails)
+            t = t.replace(/[\w.+-]+@[\w-]+\.[\w.-]+/g, "[email]");
+          if (config.maskTextNumbers)
+            t = t.replace(/\b\d{5,}\b/g, (m) =>
+              "•".repeat(Math.min(m.length, 12)),
+            );
+          return t;
+        };
+      }
       if (typeof nextPrivacy.maskAllInputs === "boolean")
         rrwebOpts.maskAllInputs = nextPrivacy.maskAllInputs;
       if (nextPrivacy.maskTextSelector)
@@ -361,15 +432,53 @@ export function initReplay(config: WebReplayConfig): ReplayController {
         rrwebOpts.maskInputOptions = { password: true };
       }
       let stop: (() => void) | undefined;
+      let heartbeat: ReturnType<typeof setInterval> | undefined;
       try {
         stop = record(rrwebOpts as Parameters<typeof record>[0]);
+        // rrweb only snapshots on ACTIVITY, so an idle page stops emitting and
+        // the replay stream ends at the last DOM mutation — far short of the real
+        // wall-clock session — while a lost/absent base leaves the whole recording
+        // unplayable ("no replay frames"). Force a full snapshot on a wall-clock
+        // TIMER (every 30s, regardless of activity): this keeps the stream
+        // spanning the whole session (idle included) and guarantees a FRESH BASE
+        // exists within 30s of any point — self-healing a lost initial snapshot,
+        // surviving the privacy-driven restart below (which doesn't re-snapshot),
+        // and enabling live mid-join. The SDK analog of the reference tracker's
+        // periodic keepalive.
+        heartbeat = setInterval(() => {
+          // Idle-aware: skip the forced full snapshot when rrweb already emitted
+          // within the last interval (the page is active and self-heals via its
+          // own stream + the 2-min checkout). Only force one when the page has
+          // gone quiet — keeping the self-heal for idle pages without
+          // re-serializing a busy large-DOM app every 30s.
+          if (Date.now() - lastRrwebActivityAt < 30_000) return;
+          try {
+            record.takeFullSnapshot(true);
+          } catch {
+            /* recorder not active — ignore */
+          }
+        }, 30_000);
+        // Priority-flush the initial FullSnapshot now instead of waiting for the
+        // 3s auto-flush, so the recording is playable ASAP and the most important
+        // batch (the base) is the first one persisted + retried.
+        scheduleFlush();
       } catch (e) {
         // Surface in console + telemetry, but don't break the whole SDK —
         // we still want console/network/errors capture even if rrweb fails.
         // eslint-disable-next-line no-console
         console.error("[replay-sdk] rrweb.record failed:", e);
       }
-      if (stop) captures.rrweb = { stop };
+      if (stop) {
+        const stopRec = stop;
+        captures.rrweb = {
+          stop: () => {
+            if (heartbeat) clearInterval(heartbeat);
+            stopRec();
+          },
+        };
+      } else if (heartbeat) {
+        clearInterval(heartbeat);
+      }
       installedPrivacy = nextPrivacy;
     }
 
@@ -394,6 +503,7 @@ export function initReplay(config: WebReplayConfig): ReplayController {
         },
         (d: NetworkEventData) =>
           emit({ ts: d.startedAt, type: "network", data: d }),
+        () => urlRedactionPolicy,
       ),
     );
     syncCapture("errors", effective.errors, () =>
@@ -438,7 +548,23 @@ export function initReplay(config: WebReplayConfig): ReplayController {
     );
   };
 
-  emitSessionStart();
+  // A fresh session opens with session_start (sets the entry page). A RESUMED
+  // session — a reload or same-tab back/forward within the inactivity window —
+  // instead records the reload as a page navigation, so the original entry page
+  // is preserved and the reload shows on the timeline as a page transition
+  // rather than a second "session start".
+  if (session.resumed) {
+    emit({
+      ts: Date.now(),
+      type: "navigation",
+      data: {
+        to: window.location.href,
+        trigger: "load",
+      } satisfies NavigationEventData,
+    });
+  } else {
+    emitSessionStart();
+  }
   emitViewport();
 
   // We install captures in *two phases* to avoid losing the rrweb
@@ -593,17 +719,46 @@ export function initReplay(config: WebReplayConfig): ReplayController {
 
   session.startAutoFlush(flush);
 
-  window.addEventListener("beforeunload", () => {
-    emitSessionEnd("unload");
-    session.flushWithBeacon(sendBatch);
-  });
-
-  document.addEventListener("visibilitychange", () => {
-    if (document.visibilityState === "hidden") {
-      emitSessionEnd("visibility_hidden");
-      session.flushWithBeacon(sendBatch);
+  // Deliver the tail reliably as the page goes away. visibilitychange:hidden is
+  // the signal that fires FIRST on a tab close (and the only one guaranteed when
+  // a mobile tab is backgrounded / on bfcache), so the closing frames are
+  // usually shipped while the page is still alive; pagehide + beforeunload mop
+  // up anything left. Each call drains the buffer, so the later ones are no-ops
+  // when an earlier one already sent — no duplicate batches.
+  const finalFlush = (reason: SessionEndEventData["reason"]) => {
+    // Discard a bounce session that never reached minDuration — don't ship its
+    // held buffer on the way out.
+    if (minDurationMs > 0 && Date.now() - session.startedAt < minDurationMs) {
+      return;
     }
+    emitSessionEnd(reason);
+    session.flushFinal(sendBatch.sendFinal);
+  };
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "hidden") finalFlush("visibility_hidden");
   });
+  window.addEventListener("pagehide", () => finalFlush("unload"));
+  window.addEventListener("beforeunload", () => finalFlush("unload"));
+
+  // Keep the session's last-activity marker fresh on genuine USER interaction —
+  // deliberately NOT the SDK's own heartbeat/perf events, so an idle tab that's
+  // only emitting keepalive snapshots still ages out of the resume window. These
+  // are passive + capture so they never delay the page's own handlers, and the
+  // write behind touch() is throttled, so this is effectively free on the hot
+  // pointer/scroll path.
+  const onUserActivity = () => session.touch();
+  const activityEvents = [
+    "pointerdown",
+    "keydown",
+    "scroll",
+    "touchstart",
+  ] as const;
+  for (const evt of activityEvents) {
+    window.addEventListener(evt, onUserActivity, {
+      passive: true,
+      capture: true,
+    });
+  }
 
   const identify: ReplayController["identify"] = (idOrPayload, props) => {
     const payload: IdentifyPayload =
@@ -611,6 +766,20 @@ export function initReplay(config: WebReplayConfig): ReplayController {
         ? { distinctId: idOrPayload, ...(props ?? {}) }
         : { ...idOrPayload };
     sendBatch.setIdentify(payload);
+    // Emit a DISCRETE, timestamped identify marker into the stream (parity with
+    // the reference tracker's UserID message) so the exact moment of anon→known
+    // is a first-class timeline event, not just an attribute on later batches.
+    if (payload.distinctId || payload.email) {
+      emit({
+        ts: Date.now(),
+        type: "custom",
+        data: {
+          kind: "identify",
+          distinctId: payload.distinctId ?? payload.email,
+          ...(payload.email ? { email: payload.email } : {}),
+        },
+      });
+    }
     // Workspace policy: "always record identified users" flips a
     // previously-dropped session back into recording the moment the
     // customer calls identify(). Saves an "I had this user but no
@@ -623,6 +792,33 @@ export function initReplay(config: WebReplayConfig): ReplayController {
     ) {
       sampled = true;
     }
+    void flush();
+  };
+
+  // Host-supplied anonymous/device id — override the SDK's generated fingerprint
+  // so the same person is one anonymous user across the customer's systems.
+  // Persisted so it survives reloads.
+  const setAnonymousId: ReplayController["setAnonymousId"] = (id) => {
+    if (!id || typeof id !== "string") return;
+    const trimmed = id.trim().slice(0, 200);
+    if (!trimmed) return;
+    setStoredFingerprint(trimmed);
+    sendBatch.setFingerprint(trimmed);
+  };
+
+  // Free-form session trait, independent of user identity. Captured into the
+  // stream as a custom event so it's queryable + timeline-visible.
+  const setMetadata: ReplayController["setMetadata"] = (key, value) => {
+    if (!key || typeof key !== "string") return;
+    emit({
+      ts: Date.now(),
+      type: "custom",
+      data: {
+        kind: "session_metadata",
+        key: key.trim().slice(0, 80),
+        value: typeof value === "string" ? value.slice(0, 500) : String(value),
+      },
+    });
     void flush();
   };
 
@@ -664,7 +860,7 @@ export function initReplay(config: WebReplayConfig): ReplayController {
     emit({
       ts: Date.now(),
       type: "error",
-      data: errorDataFromValue(error, opts?.handled ?? true),
+      data: errorDataFromValue(error, opts?.handled ?? true, opts?.metadata),
     });
   };
 
@@ -674,6 +870,8 @@ export function initReplay(config: WebReplayConfig): ReplayController {
     identify,
     track,
     captureException,
+    setAnonymousId,
+    setMetadata,
     stop: async () => {
       for (const k of Object.keys(captures)) {
         const slot = captures[k];
@@ -685,6 +883,11 @@ export function initReplay(config: WebReplayConfig): ReplayController {
           }
           captures[k] = null;
         }
+      }
+      for (const evt of activityEvents) {
+        window.removeEventListener(evt, onUserActivity, {
+          capture: true,
+        } as EventListenerOptions);
       }
       session.stopAutoFlush();
       emitSessionEnd("manual");

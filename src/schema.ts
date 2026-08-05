@@ -74,6 +74,8 @@ export interface SessionStartEventData {
   href: string;
   path: string;
   referrer: string;
+  /** document.title of the entry page — the first screen's human name. */
+  title?: string;
 }
 
 export interface SessionEndEventData {
@@ -94,7 +96,7 @@ export interface ConsoleEventData {
 
 export interface NetworkEventData {
   requestId: string;
-  transport: "fetch" | "xhr";
+  transport: "fetch" | "xhr" | "beacon";
   method: string;
   url: string;
   statusCode?: number;
@@ -147,11 +149,18 @@ export interface ErrorEventData {
    *  the auto paths. The backend classifies a handled error as an "exception"
    *  (vs an uncaught "crash"), mirroring the mobile `fatal` discriminator. */
   handled?: boolean;
+  /** Optional contextual tags a caller attaches to a captureException — e.g. a
+   *  React error boundary's componentStack, the active route, or a feature flag.
+   *  Small key/value map; sharpens dashboard grouping + triage. */
+  metadata?: Record<string, unknown>;
 }
 
 export interface NavigationEventData {
   from?: string;
   to: string;
+  /** document.title at the time of the view — a human screen name for the
+   *  dashboard's Screens list, not just an opaque URL. */
+  title?: string;
   // On web: history-stack triggers. On native: app-routing triggers.
   trigger:
     | "pushState"

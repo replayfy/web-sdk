@@ -12,7 +12,7 @@ import {
   redactHeaders,
   serializeConsoleArg,
   toHeaderRecord,
-  withRedactedUrl,
+  redactUrlForStorage,
 } from "./utils";
 
 type StopHandle = () => void;
@@ -32,19 +32,35 @@ export function createConsoleCapture(
     (...args: unknown[]) => void
   >();
 
+  // Flood guard: a console.log in a tight loop shouldn't drown the session in
+  // events. Cap captured messages per rolling window (the real console is still
+  // called, so devtools output is unchanged) — parity with the reference tracker.
+  const THROTTLE_LIMIT = 30;
+  const THROTTLE_WINDOW_MS = 1000;
+  let windowStart = Date.now();
+  let windowCount = 0;
+
   for (const level of methods) {
     originals.set(level, console[level].bind(console));
     console[level] = (...args: unknown[]) => {
-      const serialized = args.map((arg) => serializeConsoleArg(arg));
-      onEvent({
-        level,
-        // formatConsoleArg renders each arg as JSON when it's an object —
-        // gives us a real `{"foo":1,"bar":2}` in `message` instead of the
-        // `[object Object]` you get from Array.prototype.join.
-        message: serialized.map(formatConsoleArg).join(" "),
-        args: serialized,
-        stack: level === "error" ? new Error().stack : undefined,
-      });
+      const now = Date.now();
+      if (now - windowStart > THROTTLE_WINDOW_MS) {
+        windowStart = now;
+        windowCount = 0;
+      }
+      windowCount += 1;
+      if (windowCount <= THROTTLE_LIMIT) {
+        const serialized = args.map((arg) => serializeConsoleArg(arg));
+        onEvent({
+          level,
+          // formatConsoleArg renders each arg as JSON when it's an object —
+          // gives us a real `{"foo":1,"bar":2}` in `message` instead of the
+          // `[object Object]` you get from Array.prototype.join.
+          message: serialized.map(formatConsoleArg).join(" "),
+          args: serialized,
+          stack: level === "error" ? new Error().stack : undefined,
+        });
+      }
       originals.get(level)?.(...args);
     };
   }
@@ -108,7 +124,9 @@ function splitErrorName(raw: string): { name: string; message: string } {
 export function errorDataFromValue(
   value: unknown,
   handled: boolean,
+  metadata?: Record<string, unknown>,
 ): ErrorEventData {
+  const meta = metadata ? { metadata } : {};
   if (value instanceof Error) {
     return {
       kind: "error",
@@ -117,6 +135,7 @@ export function errorDataFromValue(
       stack: value.stack,
       frames: framesFromError(value),
       handled,
+      ...meta,
     };
   }
   // Non-Error thrown value: serialise best-effort; there is no stack to parse.
@@ -133,6 +152,7 @@ export function errorDataFromValue(
     message: message || raw || String(value),
     frames: [],
     handled,
+    ...meta,
   };
 }
 
@@ -195,12 +215,66 @@ export function createErrorCapture(
     });
   };
 
-  window.addEventListener("error", onError);
-  window.addEventListener("unhandledrejection", onRejection);
+  // Attach to the top window AND every SAME-ORIGIN iframe, so uncaught errors /
+  // rejections thrown inside embedded editors, widget hosts, and micro-frontends
+  // are captured too (they'd otherwise be invisible). Cross-origin frames are
+  // inaccessible and silently skipped.
+  const attached = new Set<Window>();
+  const attach = (w: Window | null) => {
+    if (!w || attached.has(w)) return;
+    try {
+      w.addEventListener("error", onError);
+      w.addEventListener("unhandledrejection", onRejection);
+      attached.add(w);
+    } catch {
+      /* cross-origin window — inaccessible */
+    }
+  };
+  const attachFrame = (frame: HTMLIFrameElement) => {
+    try {
+      // Reading contentWindow.document throws for cross-origin — the same-origin gate.
+      if (frame.contentWindow?.document) attach(frame.contentWindow);
+    } catch {
+      /* cross-origin — skip */
+    }
+  };
+  attach(window);
+  const frames = document.getElementsByTagName("iframe");
+  for (let i = 0; i < frames.length; i += 1) attachFrame(frames[i]);
+
+  // Catch iframes added later; wait for load so contentWindow is ready.
+  let mo: MutationObserver | undefined;
+  try {
+    mo = new MutationObserver((records) => {
+      for (const rec of records) {
+        rec.addedNodes.forEach((n) => {
+          if (n instanceof HTMLIFrameElement) {
+            attachFrame(n);
+            n.addEventListener("load", () => attachFrame(n), { once: true });
+          } else if (n instanceof Element) {
+            n.querySelectorAll("iframe").forEach((f) =>
+              attachFrame(f as HTMLIFrameElement),
+            );
+          }
+        });
+      }
+    });
+    mo.observe(document.documentElement, { childList: true, subtree: true });
+  } catch {
+    /* document not ready */
+  }
 
   return () => {
-    window.removeEventListener("error", onError);
-    window.removeEventListener("unhandledrejection", onRejection);
+    mo?.disconnect();
+    for (const w of attached) {
+      try {
+        w.removeEventListener("error", onError);
+        w.removeEventListener("unhandledrejection", onRejection);
+      } catch {
+        /* window gone */
+      }
+    }
+    attached.clear();
   };
 }
 
@@ -213,10 +287,19 @@ export function createNavigationCapture(
 
   const emit = (trigger: NavigationEventData["trigger"]) => {
     const nextUrl = window.location.href;
+    // Skip no-op emits: a pushState/replaceState that doesn't change the URL
+    // (common — routers re-push the same route) shouldn't create a screen event.
+    // 'load' always emits (it's the entry).
+    if (trigger !== "load" && nextUrl === currentUrl) return;
     onEvent({
-      from: currentUrl,
-      to: nextUrl,
+      // Scrub credentials out of the stored URLs (tokens/reset-links routinely
+      // ride in the query string). Default key scrub — always on, no config.
+      from: redactUrlForStorage(currentUrl),
+      to: redactUrlForStorage(nextUrl),
       trigger,
+      // Human-readable screen name so the dashboard can label screens by title,
+      // not just an opaque URL (parity with the reference tracker's page location).
+      title: document.title || undefined,
     });
     currentUrl = nextUrl;
   };
@@ -268,40 +351,77 @@ export function createViewportCapture(onEvent: () => void): StopHandle {
  * The persistence service increments session.rageCount / deadCount based
  * on these.
  */
-type RageDeadEmit = (data: {
-  kind: "rage_click" | "dead_click";
-  x: number;
-  y: number;
-  selector: string;
-  count?: number;
-}) => void;
+type ClickEmit = (
+  data:
+    | { kind: "rage_click"; x: number; y: number; selector: string; count: number }
+    | { kind: "dead_click"; x: number; y: number; selector: string }
+    | {
+        kind: "click";
+        selector: string;
+        label: string;
+        nx: number;
+        ny: number;
+        uiId: string;
+      },
+) => void;
 
-export function createRageDeadClickCapture(onEvent: RageDeadEmit): StopHandle {
+export function createRageDeadClickCapture(onEvent: ClickEmit): StopHandle {
   const recent: Array<{ x: number; y: number; ts: number }> = [];
   const PROXIMITY_PX = 24;
   const RAGE_WINDOW_MS = 1000;
   const DEAD_OBSERVE_MS = 500;
 
+  // ONE shared observer with a dirty-timestamp — not a fresh observer per click.
+  // A click is "dead" only if nothing mutated AND the URL didn't change within
+  // the window (a navigation IS a response).
+  let lastMutation = 0;
   const observer = new MutationObserver(() => {
-    /* presence is what matters */
+    lastMutation = Date.now();
   });
-  observer.observe(document.body, {
-    childList: true,
-    subtree: true,
-    attributes: true,
-    characterData: true,
-  });
+  try {
+    observer.observe(document.documentElement, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      characterData: true,
+    });
+  } catch {
+    /* document not ready — best effort */
+  }
 
   const onClick = (ev: MouseEvent) => {
-    const now = ev.timeStamp ?? Date.now();
-    // Trim entries older than the rage window so the list stays O(N) tiny.
+    const now = Date.now();
+    // Resolve the raw target to the meaningful clickable ancestor; null = the
+    // element (or an ancestor) is masked, so we emit NO identity for it.
+    const target = resolveClickable(ev.target);
+    if (!target) return;
+    const selector = cssPath(target);
+
+    // Semantic click event — every real click, for heatmaps / click funnels.
+    // Mirrors our mobile TapEventData (selector + label + content-normalized
+    // coords 0..1e4 + a stable uiId bucket).
+    const label = targetLabel(target);
+    const nx = normCoord(
+      ev.pageX,
+      document.documentElement.scrollWidth || window.innerWidth,
+    );
+    const ny = normCoord(
+      ev.pageY,
+      document.documentElement.scrollHeight || window.innerHeight,
+    );
+    onEvent({
+      kind: "click",
+      selector,
+      label,
+      nx,
+      ny,
+      uiId: hashId(`${location.pathname}#${selector}#${label}`),
+    });
+
+    // Rage: ≥3 clicks within PROXIMITY_PX in RAGE_WINDOW_MS.
     while (recent.length > 0 && now - recent[0].ts > RAGE_WINDOW_MS)
       recent.shift();
     recent.push({ x: ev.clientX, y: ev.clientY, ts: now });
-
-    // Rage: count clicks in the last RAGE_WINDOW_MS within PROXIMITY_PX of
-    // the current point. Three or more = a rage event. Reset the buffer on
-    // each fire so we don't spam events for sustained mashing.
     const close = recent.filter(
       (r) =>
         Math.abs(r.x - ev.clientX) < PROXIMITY_PX &&
@@ -312,37 +432,20 @@ export function createRageDeadClickCapture(onEvent: RageDeadEmit): StopHandle {
         kind: "rage_click",
         x: ev.clientX,
         y: ev.clientY,
-        selector: describe(ev.target as Element | null),
+        selector,
         count: close.length,
       });
       recent.length = 0;
     }
 
-    // Dead-click probe: if no mutation fires within the next 500 ms after
-    // a click, mark it dead. We use the existing observer to keep a single
-    // global subscription rather than churning per-click.
-    const baseline = Math.random(); // we just need a key
-    let mutated = false;
-    const obs = new MutationObserver(() => {
-      mutated = true;
-    });
-    obs.observe(document.body, {
-      childList: true,
-      subtree: true,
-      attributes: true,
-      characterData: true,
-    });
+    // Dead-click: no mutation AND no navigation within the window.
+    const hrefBefore = location.href;
     window.setTimeout(() => {
-      obs.disconnect();
-      if (!mutated) {
-        onEvent({
-          kind: "dead_click",
-          x: ev.clientX,
-          y: ev.clientY,
-          selector: describe(ev.target as Element | null),
-        });
+      const mutated = lastMutation >= now;
+      const navigated = location.href !== hrefBefore;
+      if (!mutated && !navigated) {
+        onEvent({ kind: "dead_click", x: ev.clientX, y: ev.clientY, selector });
       }
-      void baseline; // keep TS quiet about unused
     }, DEAD_OBSERVE_MS);
   };
 
@@ -723,22 +826,150 @@ export function createPerformanceCapture(
   };
 }
 
-/** Produce a short CSS selector for an element — `button.primary#checkout` */
-function describe(el: Element | null): string {
+/** Meaningful clickable element types — mirrors the reference tracker's getTarget. */
+const CLICKABLE_TAGS = new Set([
+  "BUTTON", "A", "SELECT", "LI", "TR", "TH", "TD",
+  "INPUT", "TEXTAREA", "SUMMARY", "OPTION", "LABEL",
+]);
+
+/** rrweb-style privacy classes/attrs that mark a subtree as blocked/masked. */
+function isMaskedNode(node: Element): boolean {
+  const c = node.classList;
+  return (
+    (!!c && (c.contains("rr-block") || c.contains("rr-ignore") || c.contains("rr-mask"))) ||
+    node.getAttribute("data-rr-block") === "true" ||
+    node.getAttribute("data-replay-block") === "true"
+  );
+}
+
+/** Walk from the raw event target up to the nearest MEANINGFUL clickable element
+ *  (control, [role=button], [onclick], [tabindex], or clickable tag), climbing
+ *  out of SVG internals to the owning <svg>. Returns null if the target or any
+ *  ancestor on the way is masked — we then emit no identity for that click. */
+function resolveClickable(raw: EventTarget | null): Element | null {
+  let el: Element | null = raw instanceof Element ? raw : null;
+  if (el && el.namespaceURI === "http://www.w3.org/2000/svg") {
+    const owner = el.closest("svg");
+    if (owner) el = owner;
+  }
+  let node: Element | null = el;
+  let depth = 0;
+  while (node && depth < 12) {
+    if (isMaskedNode(node)) return null;
+    if (
+      CLICKABLE_TAGS.has(node.tagName) ||
+      node.getAttribute("role") === "button" ||
+      node.hasAttribute("onclick") ||
+      node.hasAttribute("tabindex")
+    ) {
+      return node;
+    }
+    node = node.parentElement;
+    depth += 1;
+  }
+  return el;
+}
+
+// Reject hashed / utility class tokens (e.g. "css-1a2b3c", "sc-bdVaJa") so the
+// selector prefers stable, human-authored classes.
+const WORD_LIKE_CLASS = /^[a-zA-Z][a-zA-Z-]{2,}$/;
+const DATA_ID_ATTRS = ["data-testid", "data-test", "data-qa", "data-cy"];
+
+function cssEscape(s: string): string {
+  try {
+    const g = window as unknown as { CSS?: { escape?: (v: string) => string } };
+    if (g.CSS?.escape) return g.CSS.escape(s);
+  } catch {
+    /* fall through */
+  }
+  return s.replace(/([^a-zA-Z0-9_-])/g, "\\$1");
+}
+
+/** A reasonably-unique, stable CSS path: id → data-* test id → word-like class →
+ *  tag:nth-of-type, up to a few ancestors. Far more stable than tag + first-two
+ *  classes (parity with the reference tracker's getCSSPath). */
+function cssPath(el: Element | null): string {
   if (!el) return "";
-  const tag = el.tagName?.toLowerCase() ?? "";
-  const id = el.id ? `#${el.id}` : "";
-  const cls =
-    (el as HTMLElement).className &&
-    typeof (el as HTMLElement).className === "string"
-      ? "." +
-        (el as HTMLElement).className
-          .split(/\s+/)
-          .filter(Boolean)
-          .slice(0, 2)
-          .join(".")
-      : "";
-  return `${tag}${id}${cls}`.slice(0, 80);
+  const segs: string[] = [];
+  let node: Element | null = el;
+  let depth = 0;
+  while (node && node.nodeType === 1 && depth < 5) {
+    if (node.id) {
+      segs.unshift(`#${cssEscape(node.id)}`);
+      break; // an id is unique enough — stop climbing
+    }
+    let seg = node.tagName.toLowerCase();
+    const dataAttr = DATA_ID_ATTRS.find((a) => node!.hasAttribute(a));
+    if (dataAttr) {
+      seg += `[${dataAttr}="${cssEscape(node.getAttribute(dataAttr) ?? "")}"]`;
+      segs.unshift(seg);
+      break;
+    }
+    const className =
+      typeof (node as HTMLElement).className === "string"
+        ? (node as HTMLElement).className
+        : "";
+    const cls = className.split(/\s+/).find((c) => WORD_LIKE_CLASS.test(c));
+    if (cls) {
+      seg += `.${cssEscape(cls)}`;
+    } else if (node.parentElement) {
+      const siblings = Array.prototype.filter.call(
+        node.parentElement.children,
+        (c: Element) => c.tagName === node!.tagName,
+      ) as Element[];
+      if (siblings.length > 1) {
+        seg += `:nth-of-type(${siblings.indexOf(node) + 1})`;
+      }
+    }
+    segs.unshift(seg);
+    node = node.parentElement;
+    depth += 1;
+  }
+  return segs.join(" > ").slice(0, 200);
+}
+
+function normSpaces(s: string): string {
+  return s.replace(/\s+/g, " ").trim();
+}
+
+/** A human label for a clicked element — attribute label, input placeholder, or
+ *  short trimmed text. NEVER an input's actual value (that's user data), except a
+ *  submit button's caption. Capped at 100 chars. */
+function targetLabel(el: Element | null): string {
+  if (!el) return "";
+  const attr =
+    el.getAttribute("data-label") ||
+    el.getAttribute("aria-label") ||
+    el.getAttribute("title") ||
+    el.getAttribute("alt") ||
+    el.getAttribute("name");
+  if (attr) return normSpaces(attr).slice(0, 100);
+  if (el.tagName === "INPUT" || el.tagName === "TEXTAREA") {
+    const ph = el.getAttribute("placeholder");
+    if (ph) return normSpaces(ph).slice(0, 100);
+    const input = el as HTMLInputElement;
+    if (input.type === "submit" || input.type === "button") {
+      return normSpaces(input.value || "").slice(0, 100);
+    }
+    return "";
+  }
+  const text = (el as HTMLElement).innerText || el.textContent || "";
+  return normSpaces(text).slice(0, 100);
+}
+
+/** Content-normalized coordinate in 0..10000 (like the reference tracker), so a
+ *  click maps to the same heatmap bucket across viewport sizes. */
+function normCoord(page: number, extent: number): number {
+  if (!extent || extent <= 0) return 0;
+  return Math.max(0, Math.min(10000, Math.round((page / extent) * 10000)));
+}
+
+/** djb2 hash → short base36 id. Buckets clicks on the same logical target across
+ *  sessions (route # selector # label) for heatmaps/funnels. */
+function hashId(s: string): string {
+  let h = 5381;
+  for (let i = 0; i < s.length; i += 1) h = ((h << 5) + h) ^ s.charCodeAt(i);
+  return (h >>> 0).toString(36);
 }
 
 /**
@@ -756,6 +987,14 @@ function snapshotConnection(): { rtt?: number; effectiveType?: string } {
 export function createNetworkCapture(
   config: WebReplayConfig,
   onEvent: (data: NetworkEventData) => void,
+  /** Live URL-redaction policy (strip/allowlist/blockCC) — read fresh per
+   *  request so a remote-config update applies WITHOUT re-installing the capture
+   *  (the network patches are installed once). Cheap: a closure read. */
+  getUrlPolicy?: () => {
+    strip?: boolean;
+    allowed?: string[];
+    blockCC?: boolean;
+  },
 ): StopHandle {
   const originalFetch = (config.fetchImpl ?? window.fetch).bind(window);
   const originalXhrOpen = XMLHttpRequest.prototype.open;
@@ -763,6 +1002,26 @@ export function createNetworkCapture(
   const originalSetRequestHeader = XMLHttpRequest.prototype.setRequestHeader;
 
   const MAX_BODY = config.maxBodyBytes ?? 8 * 1024;
+  // The full URL-redaction policy for THIS request: always-on default key scrub
+  // (inside redactUrlForStorage) + host redactUrls + the live remote policy.
+  const urlPolicy = () => ({
+    patterns: config.redactUrls,
+    ...(getUrlPolicy?.() ?? {}),
+  });
+  // Apply the host body sanitizer, if any. null → drop the body.
+  const redactBody = (
+    body: string | undefined,
+    direction: "request" | "response",
+    url: string,
+  ): string | undefined => {
+    if (body === undefined || !config.sanitizeBody) return body;
+    try {
+      const out = config.sanitizeBody({ url, direction, body });
+      return out === null ? undefined : (out ?? body);
+    } catch {
+      return body;
+    }
+  };
 
   window.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
     const startedAt = Date.now();
@@ -800,7 +1059,7 @@ export function createNetworkCapture(
         requestId,
         transport: "fetch",
         method: request.method,
-        url: withRedactedUrl(request.url, config.redactUrls),
+        url: redactUrlForStorage(request.url, urlPolicy()),
         startedAt,
         endedAt: Date.now(),
         durationMs: Date.now() - startedAt,
@@ -818,8 +1077,8 @@ export function createNetworkCapture(
               config.redactHeaderNames,
             )
           : undefined,
-        requestBody,
-        responseBody,
+        requestBody: redactBody(requestBody, "request", request.url),
+        responseBody: redactBody(responseBody, "response", request.url),
         connectionRtt: conn.rtt,
         connectionEffectiveType: conn.effectiveType,
       });
@@ -830,7 +1089,7 @@ export function createNetworkCapture(
         requestId,
         transport: "fetch",
         method: request.method,
-        url: withRedactedUrl(request.url, config.redactUrls),
+        url: redactUrlForStorage(request.url, urlPolicy()),
         startedAt,
         endedAt: Date.now(),
         durationMs: Date.now() - startedAt,
@@ -938,7 +1197,7 @@ export function createNetworkCapture(
           requestId: meta.requestId,
           transport: "xhr",
           method: meta.method,
-          url: withRedactedUrl(meta.url, config.redactUrls),
+          url: redactUrlForStorage(meta.url, urlPolicy()),
           startedAt: meta.startedAt,
           endedAt: Date.now(),
           durationMs: Date.now() - meta.startedAt,
@@ -965,7 +1224,7 @@ export function createNetworkCapture(
             requestId: meta.requestId,
             transport: "xhr",
             method: meta.method,
-            url: withRedactedUrl(meta.url, config.redactUrls),
+            url: redactUrlForStorage(meta.url, urlPolicy()),
             startedAt: meta.startedAt,
             endedAt: Date.now(),
             durationMs: Date.now() - meta.startedAt,
@@ -981,10 +1240,55 @@ export function createNetworkCapture(
     return originalXhrSend.apply(this, args);
   };
 
+  // navigator.sendBeacon capture (analytics pings, unload telemetry) — the
+  // reference tracker patches it too. Skip OUR OWN ingest beacons (the unload
+  // path) so we never record ourselves.
+  const originalSendBeacon =
+    typeof navigator !== "undefined" && navigator.sendBeacon
+      ? navigator.sendBeacon.bind(navigator)
+      : undefined;
+  const isOwnIngest = (u: string) =>
+    u.indexOf("/v1/replay") !== -1 ||
+    (!!config.apiHost && u.indexOf(config.apiHost) === 0);
+  if (originalSendBeacon) {
+    navigator.sendBeacon = (
+      url: string | URL,
+      data?: BodyInit | null,
+    ): boolean => {
+      const urlStr = String(url);
+      const ok = originalSendBeacon(url, data ?? undefined);
+      try {
+        if (!isOwnIngest(urlStr)) {
+          let body: string | undefined;
+          if (typeof data === "string") body = data.slice(0, MAX_BODY);
+          else if (data instanceof URLSearchParams)
+            body = data.toString().slice(0, MAX_BODY);
+          const at = Date.now();
+          onEvent({
+            requestId: globalThis.crypto.randomUUID(),
+            transport: "beacon",
+            method: "POST",
+            url: redactUrlForStorage(urlStr, urlPolicy()),
+            statusCode: ok ? 200 : undefined,
+            startedAt: at,
+            endedAt: at,
+            durationMs: 0,
+            ok,
+            requestBody: body,
+          });
+        }
+      } catch {
+        /* never let capture break the caller's beacon */
+      }
+      return ok;
+    };
+  }
+
   return () => {
     window.fetch = originalFetch;
     XMLHttpRequest.prototype.open = originalXhrOpen;
     XMLHttpRequest.prototype.send = originalXhrSend;
     XMLHttpRequest.prototype.setRequestHeader = originalSetRequestHeader;
+    if (originalSendBeacon) navigator.sendBeacon = originalSendBeacon;
   };
 }
