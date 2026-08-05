@@ -108,7 +108,9 @@ function splitErrorName(raw: string): { name: string; message: string } {
 export function errorDataFromValue(
   value: unknown,
   handled: boolean,
+  metadata?: Record<string, unknown>,
 ): ErrorEventData {
+  const meta = metadata ? { metadata } : {};
   if (value instanceof Error) {
     return {
       kind: "error",
@@ -117,6 +119,7 @@ export function errorDataFromValue(
       stack: value.stack,
       frames: framesFromError(value),
       handled,
+      ...meta,
     };
   }
   // Non-Error thrown value: serialise best-effort; there is no stack to parse.
@@ -133,6 +136,7 @@ export function errorDataFromValue(
     message: message || raw || String(value),
     frames: [],
     handled,
+    ...meta,
   };
 }
 
@@ -195,12 +199,66 @@ export function createErrorCapture(
     });
   };
 
-  window.addEventListener("error", onError);
-  window.addEventListener("unhandledrejection", onRejection);
+  // Attach to the top window AND every SAME-ORIGIN iframe, so uncaught errors /
+  // rejections thrown inside embedded editors, widget hosts, and micro-frontends
+  // are captured too (they'd otherwise be invisible). Cross-origin frames are
+  // inaccessible and silently skipped.
+  const attached = new Set<Window>();
+  const attach = (w: Window | null) => {
+    if (!w || attached.has(w)) return;
+    try {
+      w.addEventListener("error", onError);
+      w.addEventListener("unhandledrejection", onRejection);
+      attached.add(w);
+    } catch {
+      /* cross-origin window — inaccessible */
+    }
+  };
+  const attachFrame = (frame: HTMLIFrameElement) => {
+    try {
+      // Reading contentWindow.document throws for cross-origin — the same-origin gate.
+      if (frame.contentWindow?.document) attach(frame.contentWindow);
+    } catch {
+      /* cross-origin — skip */
+    }
+  };
+  attach(window);
+  const frames = document.getElementsByTagName("iframe");
+  for (let i = 0; i < frames.length; i += 1) attachFrame(frames[i]);
+
+  // Catch iframes added later; wait for load so contentWindow is ready.
+  let mo: MutationObserver | undefined;
+  try {
+    mo = new MutationObserver((records) => {
+      for (const rec of records) {
+        rec.addedNodes.forEach((n) => {
+          if (n instanceof HTMLIFrameElement) {
+            attachFrame(n);
+            n.addEventListener("load", () => attachFrame(n), { once: true });
+          } else if (n instanceof Element) {
+            n.querySelectorAll("iframe").forEach((f) =>
+              attachFrame(f as HTMLIFrameElement),
+            );
+          }
+        });
+      }
+    });
+    mo.observe(document.documentElement, { childList: true, subtree: true });
+  } catch {
+    /* document not ready */
+  }
 
   return () => {
-    window.removeEventListener("error", onError);
-    window.removeEventListener("unhandledrejection", onRejection);
+    mo?.disconnect();
+    for (const w of attached) {
+      try {
+        w.removeEventListener("error", onError);
+        w.removeEventListener("unhandledrejection", onRejection);
+      } catch {
+        /* window gone */
+      }
+    }
+    attached.clear();
   };
 }
 

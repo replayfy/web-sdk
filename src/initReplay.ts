@@ -25,7 +25,7 @@ import {
   errorDataFromValue,
 } from "./signals";
 import { fetchRemoteConfig } from "./remote-config";
-import { getBrowserFingerprint } from "./fingerprint";
+import { getBrowserFingerprint, setStoredFingerprint } from "./fingerprint";
 import { redactUrlForStorage } from "./utils";
 import type { ReplayController, WebReplayConfig } from "./types";
 
@@ -694,6 +694,20 @@ export function initReplay(config: WebReplayConfig): ReplayController {
         ? { distinctId: idOrPayload, ...(props ?? {}) }
         : { ...idOrPayload };
     sendBatch.setIdentify(payload);
+    // Emit a DISCRETE, timestamped identify marker into the stream (parity with
+    // the reference tracker's UserID message) so the exact moment of anon→known
+    // is a first-class timeline event, not just an attribute on later batches.
+    if (payload.distinctId || payload.email) {
+      emit({
+        ts: Date.now(),
+        type: "custom",
+        data: {
+          kind: "identify",
+          distinctId: payload.distinctId ?? payload.email,
+          ...(payload.email ? { email: payload.email } : {}),
+        },
+      });
+    }
     // Workspace policy: "always record identified users" flips a
     // previously-dropped session back into recording the moment the
     // customer calls identify(). Saves an "I had this user but no
@@ -706,6 +720,33 @@ export function initReplay(config: WebReplayConfig): ReplayController {
     ) {
       sampled = true;
     }
+    void flush();
+  };
+
+  // Host-supplied anonymous/device id — override the SDK's generated fingerprint
+  // so the same person is one anonymous user across the customer's systems.
+  // Persisted so it survives reloads.
+  const setAnonymousId: ReplayController["setAnonymousId"] = (id) => {
+    if (!id || typeof id !== "string") return;
+    const trimmed = id.trim().slice(0, 200);
+    if (!trimmed) return;
+    setStoredFingerprint(trimmed);
+    sendBatch.setFingerprint(trimmed);
+  };
+
+  // Free-form session trait, independent of user identity. Captured into the
+  // stream as a custom event so it's queryable + timeline-visible.
+  const setMetadata: ReplayController["setMetadata"] = (key, value) => {
+    if (!key || typeof key !== "string") return;
+    emit({
+      ts: Date.now(),
+      type: "custom",
+      data: {
+        kind: "session_metadata",
+        key: key.trim().slice(0, 80),
+        value: typeof value === "string" ? value.slice(0, 500) : String(value),
+      },
+    });
     void flush();
   };
 
@@ -747,7 +788,7 @@ export function initReplay(config: WebReplayConfig): ReplayController {
     emit({
       ts: Date.now(),
       type: "error",
-      data: errorDataFromValue(error, opts?.handled ?? true),
+      data: errorDataFromValue(error, opts?.handled ?? true, opts?.metadata),
     });
   };
 
@@ -757,6 +798,8 @@ export function initReplay(config: WebReplayConfig): ReplayController {
     identify,
     track,
     captureException,
+    setAnonymousId,
+    setMetadata,
     stop: async () => {
       for (const k of Object.keys(captures)) {
         const slot = captures[k];

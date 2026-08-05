@@ -149,6 +149,10 @@ export interface ErrorEventData {
    *  the auto paths. The backend classifies a handled error as an "exception"
    *  (vs an uncaught "crash"), mirroring the mobile `fatal` discriminator. */
   handled?: boolean;
+  /** Optional contextual tags a caller attaches to a captureException — e.g. a
+   *  React error boundary's componentStack, the active route, or a feature flag.
+   *  Small key/value map; sharpens dashboard grouping + triage. */
+  metadata?: Record<string, unknown>;
 }
 
 export interface NavigationEventData {

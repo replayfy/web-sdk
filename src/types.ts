@@ -78,7 +78,23 @@ export interface ReplayController {
    * Example:
    *   try { risky(); } catch (e) { replay.captureException(e); }
    */
-  captureException: (error: unknown, opts?: { handled?: boolean }) => void;
+  captureException: (
+    error: unknown,
+    opts?: { handled?: boolean; metadata?: Record<string, unknown> },
+  ) => void;
+  /**
+   * Supply your OWN anonymous/device id (e.g. an app-side visitor id) to override
+   * the SDK's generated one, so the same person is one anonymous user across your
+   * systems. Persists across reloads. Call before or early in the session.
+   */
+  setAnonymousId: (id: string) => void;
+  /**
+   * Attach an arbitrary session-level trait (key/value), independent of user
+   * identity — e.g. `replay.setMetadata("plan", "pro")`. Survives reloads within
+   * the tab and ships with every batch. Unlike identify()'s customProps it needs
+   * no distinctId.
+   */
+  setMetadata: (key: string, value: string) => void;
 }
 
 export type { IdentifyPayload };

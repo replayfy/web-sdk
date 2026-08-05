@@ -44,6 +44,16 @@ export function getBrowserFingerprint(): BrowserFingerprint {
   return { fp, cached: false };
 }
 
+/** Persist a host-supplied anonymous id (setAnonymousId) so it survives reloads
+ *  and future getBrowserFingerprint() calls return it. */
+export function setStoredFingerprint(id: string): void {
+  try {
+    localStorage.setItem(STORAGE_KEY, id);
+  } catch {
+    /* storage unavailable — the id still applies for this page load via setFingerprint */
+  }
+}
+
 /** A random, collision-free anonymous id. Falls back to the environment hash if
  *  crypto is somehow unavailable, so we always return a usable id. */
 function randomAnonId(): string {
