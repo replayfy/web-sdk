@@ -1023,7 +1023,21 @@ export function createNetworkCapture(
     }
   };
 
+  // Never record the SDK's OWN ingest/config/presence traffic. Matches the
+  // batch endpoint (/v1/replay*) and anything on the configured ingest host
+  // (/v1/sdk/config, /v1/mobile/*, presence). Recording our own /v1/sdk/config
+  // request would attribute the SDK's request latency to the host page — the
+  // client's site looks like it made a slow API call it never made, corrupting
+  // the storyline. Used by the fetch, XHR and sendBeacon capture paths below.
+  const isOwnIngest = (u: string) =>
+    u.indexOf("/v1/replay") !== -1 ||
+    (!!config.apiHost && u.indexOf(config.apiHost) === 0);
+
   window.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+    // Skip our own ingest/config request entirely (no capture, no body clone) —
+    // just pass through to the real fetch.
+    const ownUrl = input instanceof Request ? input.url : String(input);
+    if (isOwnIngest(ownUrl)) return originalFetch(input, init);
     const startedAt = Date.now();
     const request = input instanceof Request ? input : new Request(input, init);
     const requestId = globalThis.crypto.randomUUID();
@@ -1158,7 +1172,7 @@ export function createNetworkCapture(
         }
       | undefined;
 
-    if (meta) {
+    if (meta && !isOwnIngest(meta.url)) {
       meta.startedAt = Date.now();
       const finalize = () => {
         const conn = snapshotConnection();
@@ -1247,9 +1261,6 @@ export function createNetworkCapture(
     typeof navigator !== "undefined" && navigator.sendBeacon
       ? navigator.sendBeacon.bind(navigator)
       : undefined;
-  const isOwnIngest = (u: string) =>
-    u.indexOf("/v1/replay") !== -1 ||
-    (!!config.apiHost && u.indexOf(config.apiHost) === 0);
   if (originalSendBeacon) {
     navigator.sendBeacon = (
       url: string | URL,
