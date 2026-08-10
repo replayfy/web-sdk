@@ -5,6 +5,17 @@ All notable changes to `@replayfyapp/browser` are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.9]
+
+### Fixed
+
+- The unload beacon (`navigator.sendBeacon`) now sends its body as a `text/plain`
+  Blob instead of `application/json`. `application/json` is not a CORS-safelisted
+  content type, so cross-origin beacons were being preflighted — and `sendBeacon`
+  cannot perform a preflight, so the browser blocked them and each session's final
+  tail batch was dropped. `text/plain` is safelisted, so the beacon now delivers
+  without a preflight. (The ingest endpoint parses the `text/plain` body as JSON.)
+
 ## [0.1.3]
 
 ### Changed
