@@ -234,11 +234,17 @@ export function createBatchSender(config: WebReplayConfig): BatchSender {
     });
 
     if (useBeacon && "sendBeacon" in navigator) {
-      // sendBeacon is sync and can't set headers, so it stays
-      // uncompressed — it only fires on unload where the last small
+      // sendBeacon is sync and can't set headers, so it stays uncompressed and
+      // the key rides as ?k= — it only fires on unload where the last small
       // batch isn't worth the async gzip round-trip.
+      // The Blob MUST be text/plain, not application/json: the ingest host is
+      // cross-origin to every customer site, and a non-CORS-safelisted
+      // content-type (application/json) turns the POST into a PREFLIGHTED
+      // request — which sendBeacon cannot satisfy, so the browser blocks it
+      // ("CORS error"/provisional headers) and the tail batch is dropped.
+      // text/plain is safelisted → no preflight; the backend parses it as JSON.
       const url = `${endpoint}?${new URLSearchParams({ k: config.apiKey }).toString()}`;
-      navigator.sendBeacon(url, new Blob([json], { type: "application/json" }));
+      navigator.sendBeacon(url, new Blob([json], { type: "text/plain" }));
       return;
     }
 
@@ -347,9 +353,12 @@ export function createBatchSender(config: WebReplayConfig): BatchSender {
     try {
       if (typeof navigator !== "undefined" && navigator.sendBeacon) {
         // Beacon can't set headers, so the key rides as ?k= (the backend accepts
-        // either). Kept < 55KB per chunk by the caller so it isn't dropped.
+        // either). Kept < 55KB per chunk by the caller so it isn't dropped. The
+        // Blob is text/plain (a CORS-safelisted type) so this cross-origin beacon
+        // isn't preflighted — application/json would be, and sendBeacon can't do
+        // a preflight, so the browser would CORS-block it.
         const url = `${endpoint}?${new URLSearchParams({ k: config.apiKey }).toString()}`;
-        navigator.sendBeacon(url, new Blob([json], { type: "application/json" }));
+        navigator.sendBeacon(url, new Blob([json], { type: "text/plain" }));
       }
     } catch {
       /* nothing left to try — the page is going away */
