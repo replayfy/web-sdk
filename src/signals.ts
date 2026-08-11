@@ -545,6 +545,29 @@ interface LoAFEntry extends PerformanceEntry {
   scripts?: LoAFScript[];
 }
 
+// Does this URL target the SDK's OWN ingest / config / presence endpoints?
+// Matched on the URL PATH (host-INDEPENDENT) so a trailing slash, a protocol-
+// relative/relative form, a CDN / alternate origin, or a redirect to a different
+// host can't slip our own traffic into capture. Covers /v1/replay* (batch +
+// assets), /v1/sdk/* (remote config) and /v1/mobile/*, then falls back to the
+// configured apiHost prefix. Shared by the fetch, XHR, sendBeacon AND resource-
+// timing capture paths — the resource-timing observer previously used a weaker,
+// host-only guard that recorded our own /v1/sdk/config as a page resource.
+const OWN_INGEST_PATHS = ["/v1/replay", "/v1/sdk", "/v1/mobile"];
+function isOwnIngestUrl(u: string, apiHost?: string): boolean {
+  let path = u;
+  try {
+    const base = typeof location !== "undefined" ? location.href : undefined;
+    path = new URL(u, base).pathname;
+  } catch {
+    /* not a parseable URL — scan the raw string instead */
+  }
+  for (const p of OWN_INGEST_PATHS) {
+    if (path.indexOf(p) !== -1) return true;
+  }
+  return !!apiHost && u.indexOf(apiHost) === 0;
+}
+
 // Lazy-require web-vitals so SSR / non-browser environments that
 // happen to import this module don't crash at module-eval time.
 // We re-import inside the function body when window exists.
@@ -763,8 +786,15 @@ export function createPerformanceCapture(
         if (entry.duration < minResourceMs) continue;
         const url = entry.name;
         if (url.startsWith("data:")) continue;
-        // Never record the SDK's own batch/config/presence traffic.
-        if (ownHost && url.includes(ownHost)) continue;
+        // Never record the SDK's own batch/config/presence traffic — matched on
+        // PATH so it holds even if this observer was installed without apiHost
+        // (the phase-2 install used to), and even when the entry's host differs
+        // from apiHost (redirect / CDN / alternate origin). This is THE fix for
+        // the SDK recording its own /v1/sdk/config: a buffered resource entry
+        // replayed our own config request as a page resource. ownHost stays as
+        // a fallback for any non-/v1 ingest host.
+        if (isOwnIngestUrl(url, options.apiHost) || (ownHost && url.includes(ownHost)))
+          continue;
         onEvent({
           kind: "perf",
           metric: "resource",
@@ -1029,9 +1059,10 @@ export function createNetworkCapture(
   // request would attribute the SDK's request latency to the host page — the
   // client's site looks like it made a slow API call it never made, corrupting
   // the storyline. Used by the fetch, XHR and sendBeacon capture paths below.
-  const isOwnIngest = (u: string) =>
-    u.indexOf("/v1/replay") !== -1 ||
-    (!!config.apiHost && u.indexOf(config.apiHost) === 0);
+  // Route through the shared path-based matcher (host-independent) instead of a
+  // brittle exact host-prefix, so a trailing slash / redirect / alternate origin
+  // can't defeat it. Used by the fetch, XHR and sendBeacon paths below.
+  const isOwnIngest = (u: string) => isOwnIngestUrl(u, config.apiHost);
 
   window.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
     // Skip our own ingest/config request entirely (no capture, no body clone) —

@@ -580,8 +580,16 @@ export function initReplay(config: WebReplayConfig): ReplayController {
     // persistence service treats the `type: "performance"` channel
     // exactly like custom rage-click events.
     syncCapture("performance", effective.performance !== false, () =>
-      createPerformanceCapture((d) =>
-        emit({ ts: d.ts ?? Date.now(), type: "performance", data: d }),
+      createPerformanceCapture(
+        (d) => emit({ ts: d.ts ?? Date.now(), type: "performance", data: d }),
+        {
+          // Same ingest-exclusion options as the phase-1 install (~line 367) so
+          // a re-created resource-timing observer always knows our own host and
+          // never records /v1/sdk/config or /v1/replay/batch as a page resource.
+          apiHost: config.apiHost,
+          captureResourceTimings: config.captureResourceTimings,
+          resourceMinDurationMs: config.resourceMinDurationMs,
+        },
       ),
     );
   };
