@@ -580,8 +580,16 @@ export function initReplay(config: WebReplayConfig): ReplayController {
     // persistence service treats the `type: "performance"` channel
     // exactly like custom rage-click events.
     syncCapture("performance", effective.performance !== false, () =>
-      createPerformanceCapture((d) =>
-        emit({ ts: d.ts ?? Date.now(), type: "performance", data: d }),
+      createPerformanceCapture(
+        (d) => emit({ ts: d.ts ?? Date.now(), type: "performance", data: d }),
+        {
+          // Give the resource-timing observer our own ingest origin (same options
+          // the phase-1 install passes) so its isServiceURL check can always skip
+          // /v1/sdk/config etc. even if the perf slot is re-created via this path.
+          apiHost: config.apiHost,
+          captureResourceTimings: config.captureResourceTimings,
+          resourceMinDurationMs: config.resourceMinDurationMs,
+        },
       ),
     );
   };
