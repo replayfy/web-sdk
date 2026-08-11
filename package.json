@@ -1,6 +1,6 @@
 {
   "name": "@replayfyapp/browser",
-  "version": "0.1.10",
+  "version": "0.1.11",
   "description": "Replayfy browser SDK — session replay, product analytics, and error capture for the web.",
   "keywords": [
     "session-replay",
