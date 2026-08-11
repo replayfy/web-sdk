@@ -763,7 +763,13 @@ export function createPerformanceCapture(
         if (entry.duration < minResourceMs) continue;
         const url = entry.name;
         if (url.startsWith("data:")) continue;
-        // Never record the SDK's own batch/config/presence traffic.
+        // Never record the SDK's own ingest/config/presence traffic. Mirrors the
+        // reference tracker's resource-timing rule (isServiceURL): skip anything
+        // whose URL starts with our configured ingest origin, so /v1/sdk/config
+        // and /v1/replay/batch never surface as page-resource perf events. The
+        // host-only `ownHost` check stays as a fallback for an apiHost that
+        // carries a path/port a bare startsWith wouldn't match.
+        if (options.apiHost && url.startsWith(options.apiHost)) continue;
         if (ownHost && url.includes(ownHost)) continue;
         onEvent({
           kind: "perf",
