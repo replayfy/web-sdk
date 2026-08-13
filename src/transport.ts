@@ -6,6 +6,10 @@ export interface IdentifyPayload {
   email?: string;
   name?: string;
   plan?: string;
+  /** Avatar image URL is NOT a discrete field here on purpose — set it via
+   *  customProps ({ picture } or { avatar }); the backend picks either key up and
+   *  renders it as the user's avatar. Keeping it in customProps means every SDK
+   *  (web + mobile) supports avatars today with no per-SDK release. */
   customProps?: Record<string, unknown>;
 }
 

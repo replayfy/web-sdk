@@ -142,6 +142,18 @@ replay.identify("user_123", { email: "ada@example.com", plan: "pro" });
 replay.identify({ distinctId: "user_123", name: "Ada Lovelace" });
 ```
 
+Set `picture` (or its alias `avatar`) to a public `https` image URL to give
+the user an avatar in the dashboard (shown on the recording header and Users
+list). It can be a top-level trait or nested under `customProps`; non-URL
+values are ignored.
+
+```ts
+replay.identify("user_123", {
+  email: "ada@example.com",
+  picture: "https://cdn.example.com/u/123.png",
+});
+```
+
 ### `track(name, properties?)`
 
 Record a custom product event. Event names should be stable identifiers
