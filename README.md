@@ -27,11 +27,34 @@ npm install @replayfyapp/browser
 
 ### Script tag (CDN, no build step)
 
-Drop the self-contained bundle on any page — it exposes a global `Replayfy`:
+Drop the self-contained bundle on any page — it exposes a global `Replayfy`. The
+recommended snippet loads it **asynchronously** (so it never blocks page render)
+and stands up a tiny stub that queues `init`/`track`/… calls until the bundle is
+ready, then replays them:
 
 ```html
-<script src="https://cdn.replayfy.app/v1/replay.global.js"></script>
+<!-- Async, non-blocking loader — queues calls until the SDK is ready.
+     `crossorigin` lets the browser report full error stack traces instead of a
+     bare "Script error." (the CDN sends the matching Access-Control-Allow-Origin). -->
+<script>
+  !(function () {
+    var r = (window.Replayfy = window.Replayfy || []);
+    ["init", "identify", "track", "captureException", "flush", "stop"].forEach(function (m) {
+      r[m] = function () { r.push([m].concat([].slice.call(arguments))); };
+    });
+    var s = document.createElement("script");
+    s.async = true;
+    s.crossOrigin = "anonymous";
+    s.src = "https://cdn.replayfy.app/v1/replay.global.js";
+    var f = document.getElementsByTagName("script")[0];
+    f.parentNode.insertBefore(s, f);
+  })();
+</script>
 ```
+
+Each queued call is an array `[method, ...args]`; the bundle drains that queue on
+load (replaying `init()` first). Prefer this over a plain `<script src>` tag,
+which blocks rendering until the bundle downloads.
 
 ## Quick start
 
@@ -52,13 +75,24 @@ replay.track("checkout_started");
 ### With the script tag
 
 ```html
-<script src="https://cdn.replayfy.app/v1/replay.global.js"></script>
+<!-- Async, non-blocking loader (see Install above) -->
 <script>
+  !(function () {
+    var r = (window.Replayfy = window.Replayfy || []);
+    ["init", "identify", "track", "captureException", "flush", "stop"].forEach(function (m) {
+      r[m] = function () { r.push([m].concat([].slice.call(arguments))); };
+    });
+    var s = document.createElement("script");
+    s.async = true;
+    s.crossOrigin = "anonymous";
+    s.src = "https://cdn.replayfy.app/v1/replay.global.js";
+    var f = document.getElementsByTagName("script")[0];
+    f.parentNode.insertBefore(s, f);
+  })();
   Replayfy.init({
     apiKey: "pk_live_123",
     apiHost: "https://us.replayfy.app",
   });
-
   Replayfy.identify("user_123");
   Replayfy.track("checkout_started");
 </script>

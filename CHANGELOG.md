@@ -5,6 +5,28 @@ All notable changes to `@replayfyapp/browser` are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.13]
+
+### Added
+
+- **Async, non-blocking install loader.** The browser bundle now supports the
+  recommended async install snippet: a small inline stub queues `init` /
+  `identify` / `track` / `captureException` / `flush` / `stop` calls made before
+  the bundle finishes downloading, and the bundle replays that queue (in order,
+  `init` first) as soon as it arrives. This lets the script be loaded with
+  `async` so it never blocks page render, while still supporting the "call
+  `Replayfy.init()` immediately" pattern. Fully backward-compatible: with no stub
+  queue present (the previous synchronous two-tag snippet), there is nothing to
+  replay and behavior is unchanged.
+
+### Changed
+
+- The recommended install snippet now loads the bundle with `async` and
+  `crossorigin="anonymous"`. `crossorigin` lets the browser surface a full error
+  stack trace to the SDK instead of an opaque `"Script error."` for uncaught
+  errors thrown from the cross-origin bundle (the CDN sends the matching
+  `Access-Control-Allow-Origin` header).
+
 ## [0.1.9]
 
 ### Fixed
