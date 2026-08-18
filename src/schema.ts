@@ -79,7 +79,7 @@ export interface SessionStartEventData {
 }
 
 export interface SessionEndEventData {
-  reason: "manual" | "unload" | "visibility_hidden";
+  reason: "manual" | "unload" | "visibility_hidden" | "inactivity";
 }
 
 export interface SnapshotEventData {

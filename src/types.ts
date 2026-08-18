@@ -14,11 +14,19 @@ export interface WebReplayConfig extends ReplayPrivacyConfig {
    *  session-search filter so you can scope analysis to one release. */
   revId?: string;
   sessionId?: string;
-  /** How long a tab can go WITHOUT user interaction before a reload starts a
-   *  fresh session instead of continuing the current one. Defaults to 30 min
-   *  (the session-analytics norm). This is the client-side session boundary —
-   *  our ingest appends batches by sessionId without validating continuation,
-   *  so the SDK is what decides when one session ends and the next begins. */
+  /** The inactivity window (ms) that bounds a session. Defaults to 30 min (the
+   *  session-analytics norm, matching GA). "Activity" = genuine engagement —
+   *  interactions, real navigations, and track/identify/captureException — NOT
+   *  background network/perf/console/heartbeat. It governs two things:
+   *    1. on a reload, whether to CONTINUE the tab's session or start fresh;
+   *    2. live, whether an OPEN tab's session has gone idle — after this long
+   *       with no meaningful activity the SDK ends the session (`session_end`,
+   *       reason "inactivity") and rotates to a fresh one when the user returns,
+   *       so a page that merely keeps polling its API can't inflate a session
+   *       nobody is in.
+   *  This is the client-side session boundary — ingest appends batches by
+   *  sessionId without validating continuation, so the SDK decides where one
+   *  session ends and the next begins. Set to 0 to disable the live idle end. */
   sessionInactivityMs?: number;
   flushIntervalMs?: number;
   maxBufferSize?: number;

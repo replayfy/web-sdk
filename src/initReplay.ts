@@ -100,6 +100,15 @@ export function initReplay(config: WebReplayConfig): ReplayController {
   let started = false;
   let snapshotReady = false;
   let rrwebFailed = false;
+  // ── Inactivity end + session rotation ──────────────────────────────────────
+  // `idle` = the session was ENDED after sessionInactivityMs with no MEANINGFUL
+  // activity (interaction / navigation / track — not background network/perf/
+  // heartbeat). While idle, emit() drops everything so a page that keeps polling
+  // its API can't extend a session nobody is in. The next meaningful activity
+  // rotates to a fresh session. `lastMeaningfulAt` is only bumped by markMeaningful().
+  let idle = false;
+  let lastMeaningfulAt = Date.now();
+  let idleTimer: number | undefined;
 
   if (config.distinctId)
     sendBatch.setIdentify({ distinctId: config.distinctId });
@@ -108,6 +117,10 @@ export function initReplay(config: WebReplayConfig): ReplayController {
   const emit = <TData>(
     event: Omit<ReplayEvent<TData>, "id" | "offsetMs" | "source">,
   ) => {
+    // Session was ended for inactivity and nobody's back yet — drop everything
+    // (background network/perf/console/heartbeat) so it can't extend a dead
+    // session. resumeFromIdle() clears `idle` before re-emitting into the fresh one.
+    if (idle) return;
     session.push({
       id: session.makeEventId(),
       // Clamp to >= 0. Some events timestamp themselves off performance
@@ -237,6 +250,49 @@ export function initReplay(config: WebReplayConfig): ReplayController {
     void flush();
   };
 
+  // End the current session because there's been no MEANINGFUL activity for
+  // sessionInactivityMs. Ship its closing batch (with session_end), then gate
+  // emit() so the page's background polling can't keep the dead session alive.
+  const endForIdle = () => {
+    if (idle || !started) return;
+    emitSessionEnd("inactivity");
+    void flush(); // drains synchronously into the send before we gate below
+    idle = true;
+  };
+
+  // A user came back after an inactivity end → the return is a NEW session, not
+  // a continuation. Rotate identity, re-open with session_start + a fresh rrweb
+  // FullSnapshot (its base), and resume. Same anon/identified user (transport
+  // identify/fingerprint state is untouched).
+  const resumeFromIdle = () => {
+    if (!idle) return;
+    idle = false;
+    session.rotate();
+    snapshotReady = false; // the new session must ship its own full_snapshot first
+    emitSessionStart();
+    if (captures.rrweb) {
+      try {
+        record.takeFullSnapshot(true);
+      } catch {
+        /* recorder inactive — the session ships as no-replay (rrwebFailed gate) */
+      }
+    }
+    emitViewport();
+    lastMeaningfulAt = Date.now();
+    scheduleFlush();
+  };
+
+  // The ONLY signal that resets the inactivity clock: genuine engagement —
+  // interactions, real navigations, and explicit track/identify/exception calls.
+  // Deliberately NOT background network/perf/console/heartbeat or app-driven DOM
+  // re-renders, so a page that merely keeps polling its API ages out. Also
+  // revives a session that was already ended.
+  const markMeaningful = () => {
+    lastMeaningfulAt = Date.now();
+    session.touch();
+    if (idle) resumeFromIdle();
+  };
+
   const syncCapture = (
     key: string,
     want: boolean,
@@ -344,9 +400,10 @@ export function initReplay(config: WebReplayConfig): ReplayController {
         }),
       );
       syncCapture("navigation", true, () =>
-        createNavigationCapture((d: NavigationEventData) =>
-          emit({ ts: Date.now(), type: "navigation", data: d }),
-        ),
+        createNavigationCapture((d: NavigationEventData) => {
+          markMeaningful(); // a real route change revives an idle session
+          emit({ ts: Date.now(), type: "navigation", data: d });
+        }),
       );
       syncCapture("viewport", true, () =>
         createViewportCapture(() => {
@@ -557,9 +614,10 @@ export function initReplay(config: WebReplayConfig): ReplayController {
       }),
     );
     syncCapture("navigation", true, () =>
-      createNavigationCapture((d: NavigationEventData) =>
-        emit({ ts: Date.now(), type: "navigation", data: d }),
-      ),
+      createNavigationCapture((d: NavigationEventData) => {
+        markMeaningful(); // a real route change revives an idle session
+        emit({ ts: Date.now(), type: "navigation", data: d });
+      }),
     );
     syncCapture("viewport", true, () =>
       createViewportCapture(() => {
@@ -811,7 +869,7 @@ export function initReplay(config: WebReplayConfig): ReplayController {
   // are passive + capture so they never delay the page's own handlers, and the
   // write behind touch() is throttled, so this is effectively free on the hot
   // pointer/scroll path.
-  const onUserActivity = () => session.touch();
+  const onUserActivity = () => markMeaningful();
   const activityEvents = [
     "pointerdown",
     "keydown",
@@ -823,6 +881,23 @@ export function initReplay(config: WebReplayConfig): ReplayController {
       passive: true,
       capture: true,
     });
+  }
+
+  // Live inactivity timeout: end the session after `inactivityMs` with no
+  // meaningful activity (GA's session model + the reference tracker's own
+  // "stop session after inactivity timeout" TODO). Poll at a fraction of the
+  // window (≤30s) — cheap, and precise enough since the window is minutes.
+  // sessionInactivityMs = 0 (or huge) effectively disables it.
+  if (session.inactivityMs > 0) {
+    const checkEvery = Math.min(
+      30_000,
+      Math.max(1_000, Math.floor(session.inactivityMs / 4)),
+    );
+    idleTimer = window.setInterval(() => {
+      if (!idle && started && Date.now() - lastMeaningfulAt >= session.inactivityMs) {
+        endForIdle();
+      }
+    }, checkEvery);
   }
 
   // Kick off the visibility-gated start. If the tab is already visible, start
@@ -849,6 +924,7 @@ export function initReplay(config: WebReplayConfig): ReplayController {
         ? { distinctId: idOrPayload, ...(props ?? {}) }
         : { ...idOrPayload };
     sendBatch.setIdentify(payload);
+    markMeaningful(); // identify is engagement — revives an idle session
     // Emit a DISCRETE, timestamped identify marker into the stream (parity with
     // the reference tracker's UserID message) so the exact moment of anon→known
     // is a first-class timeline event, not just an attribute on later batches.
@@ -913,6 +989,7 @@ export function initReplay(config: WebReplayConfig): ReplayController {
     if (!name || typeof name !== "string") return;
     const safeName = name.trim().slice(0, 80);
     if (!safeName) return;
+    markMeaningful(); // a tracked event is engagement — revives an idle session
     emit({
       ts: Date.now(),
       type: "custom",
@@ -940,6 +1017,7 @@ export function initReplay(config: WebReplayConfig): ReplayController {
     if (!blocked && !sampled && sampleOverrides?.alwaysRecordErrors) {
       sampled = true;
     }
+    markMeaningful(); // an explicitly-reported exception is engagement
     emit({
       ts: Date.now(),
       type: "error",
@@ -948,7 +1026,11 @@ export function initReplay(config: WebReplayConfig): ReplayController {
   };
 
   return {
-    sessionId: session.sessionId,
+    // Getter — rotate() (inactivity return) changes the id mid-flight, so a host
+    // reading `replay.sessionId` must see the CURRENT session, not the init one.
+    get sessionId() {
+      return session.sessionId;
+    },
     flush,
     identify,
     track,
@@ -956,6 +1038,7 @@ export function initReplay(config: WebReplayConfig): ReplayController {
     setAnonymousId,
     setMetadata,
     stop: async () => {
+      if (idleTimer !== undefined) window.clearInterval(idleTimer);
       for (const k of Object.keys(captures)) {
         const slot = captures[k];
         if (slot) {
