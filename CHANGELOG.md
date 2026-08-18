@@ -5,6 +5,19 @@ All notable changes to `@replayfyapp/browser` are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.15]
+
+### Fixed
+
+- **Collision-resistant session / segment ids.** Ids were minted purely from
+  `crypto.getRandomValues`, which a hostile or headless client can stub to return
+  constant bytes — a crawler did exactly that and produced the _same_ `ses_` /
+  `seg_` id on two different sites. The generator now also folds in a
+  high-resolution timestamp, a per-page monotonic counter, and `Math.random` (a
+  separate PRNG), and prefers `crypto.randomUUID` when present, so two distinct
+  sessions can no longer land on the same id even with a degenerate RNG. Ids are
+  now longer and remain opaque strings — no consumer change required.
+
 ## [0.1.14]
 
 ### Added

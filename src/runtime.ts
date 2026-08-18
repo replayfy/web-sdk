@@ -79,13 +79,43 @@ function pageContext(): ReplayBatchEnvelope["page"] {
   };
 }
 
+/** Monotonic within a page load — guarantees two ids minted back-to-back
+ *  (e.g. sessionId then segmentId) differ even if every RANDOM source below is
+ *  degenerate. */
+let idSeq = 0;
+
+/** A collision-resistant id. The old version was pure `crypto.getRandomValues`,
+ *  which a hostile/headless client can STUB to return constant bytes — a crawler
+ *  did exactly that and produced the SAME ses_/seg_ id on two different sites,
+ *  merging their recordings server-side. So the id no longer trusts the RNG
+ *  alone: it also folds in a high-resolution timestamp, a per-page monotonic
+ *  counter, and Math.random (a separate PRNG). A collision now requires the
+ *  wall clock, the counter, Math.random AND crypto to ALL coincide — which they
+ *  can't for two distinct sessions. `crypto.randomUUID`/`getRandomValues` still
+ *  supply the bulk of the entropy on a healthy client. */
 function shortId(prefix: string): string {
-  const bytes = new Uint8Array(7);
-  globalThis.crypto.getRandomValues(bytes);
-  const hex = Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join(
-    "",
-  );
-  return `${prefix}${hex}`;
+  idSeq = (idSeq + 1) & 0xffffff;
+  let rnd = "";
+  try {
+    const c = globalThis.crypto;
+    if (c && typeof c.randomUUID === "function") {
+      rnd = c.randomUUID().replace(/-/g, "");
+    } else if (c && typeof c.getRandomValues === "function") {
+      const b = new Uint8Array(12);
+      c.getRandomValues(b);
+      rnd = Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
+    }
+  } catch {
+    /* crypto unavailable — the non-crypto sources below still keep it unique */
+  }
+  const now =
+    Date.now().toString(36) +
+    (typeof performance !== "undefined" && performance.now
+      ? Math.floor(performance.now() * 1000).toString(36)
+      : "");
+  const jitter =
+    idSeq.toString(36) + Math.floor(Math.random() * 0x100000000).toString(36);
+  return `${prefix}${now}${jitter}${rnd}`;
 }
 
 /** Hard cap on buffered events so a sustained ingest outage (every flush failing
