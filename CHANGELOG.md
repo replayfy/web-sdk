@@ -5,6 +5,29 @@ All notable changes to `@replayfyapp/browser` are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.14]
+
+### Added
+
+- **Live inactivity session boundary.** An open tab whose user has gone idle now
+  ends its session after `sessionInactivityMs` of no _meaningful_ activity
+  (default 30 min) and starts a fresh session when the user returns. "Meaningful"
+  activity means genuine engagement — pointer / keyboard / scroll / touch
+  interactions, real navigations, and `track` / `identify` / `captureException` —
+  and pointedly _not_ background noise such as network polling, performance
+  entries, console output, or DOM re-renders. This stops a tab that is merely
+  left open (still making background requests) from inflating one session for
+  hours. On idle it emits a `session_end` event with `reason: "inactivity"`; on
+  the user's return it rotates to a new session id and emits a fresh
+  `session_start` (with a new full snapshot). Governed by the existing
+  `sessionInactivityMs` config — set it to `0` to disable the live idle end.
+
+### Note
+
+- This is a session-analytics behavior change: expect more, shorter, and more
+  accurate sessions (a tab idle for hours no longer counts as one long session),
+  which shifts average-session-duration and session-count metrics accordingly.
+
 ## [0.1.13]
 
 ### Added

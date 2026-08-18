@@ -31,6 +31,16 @@ interface SessionRuntime {
    *  the inactivity window continues this session. Cheap + throttled — safe to
    *  call on every pointer/scroll/key event. */
   touch: () => void;
+  /** The inactivity window (ms). Governs BOTH the reload resume-vs-fresh decision
+   *  AND the live idle-timeout that ends a session with no meaningful activity. */
+  inactivityMs: number;
+  /** Start a BRAND-NEW session in place — mint a fresh sessionId/segmentId, reset
+   *  the clock to now, zero the sequence, and drop any residual buffer. Called
+   *  when a user returns after the session was ended for inactivity, so the
+   *  return is a new session (new id) rather than a continuation of a stale one.
+   *  The transport's identify/fingerprint state is untouched — it's the same
+   *  anonymous/identified person. */
+  rotate: () => void;
   nextSequence: () => number;
   pageContext: () => ReplayBatchEnvelope["page"];
   startAutoFlush: (flush: () => Promise<void>) => void;
@@ -85,8 +95,13 @@ const MAX_BUFFERED_EVENTS = 20000;
 /** Where a session's identity lives BETWEEN page loads. sessionStorage is
  *  per-tab: it survives a reload/same-tab navigation but is cleared when the tab
  *  closes — so a reload CONTINUES the session while a brand-new tab starts a
- *  fresh one. That's the reference tracker's per-tab continuation model, minus
- *  its bespoke token format. */
+ *  fresh one. This is a deliberate per-tab session model: each tab is its own
+ *  session, and what ties a person's tabs together is the shared anonymous id
+ *  (see fingerprint.ts, in per-origin localStorage), which the backend uses to
+ *  stitch the tabs' sessions to one user. Cross-tab session sharing — one
+ *  session spanning several open tabs — is intentionally NOT done here; it would
+ *  need a per-tab id in the capture format plus a tab-aware player, and is
+ *  tracked as separate future work. */
 const SESSION_STORAGE_KEY = "replay:ses";
 
 /** Default inactivity window: a reload only continues the session if the last
@@ -171,7 +186,7 @@ export function createSessionRuntime(config: WebReplayConfig): SessionRuntime {
   // resumes, and so `st` is pinned to this session's true origin.
   writePersistedSession({ sid: sessionId, st: startedAt, la: lastActivityAt });
 
-  const segmentId = shortId("seg_");
+  let segmentId = shortId("seg_");
   const buffer: ReplayEvent[] = [];
   let sequence = 0;
   let timer: number | undefined;
@@ -185,18 +200,39 @@ export function createSessionRuntime(config: WebReplayConfig): SessionRuntime {
   };
 
   return {
-    sessionId,
-    segmentId,
+    // Getters, not snapshots — rotate() reassigns the identity mid-flight (a
+    // return after an inactivity end), and every reader (flush's envelope, the
+    // controller's `sessionId`) must see the CURRENT session, not the one that
+    // existed at init.
+    get sessionId() {
+      return sessionId;
+    },
+    get segmentId() {
+      return segmentId;
+    },
     // Live getter — `beginFreshClock()` can re-anchor it at the visibility-gated
     // start, and the emit()/minDuration reads must see the updated value.
     get startedAt() {
       return startedAt;
     },
     resumed,
+    inactivityMs,
     beginFreshClock: () => {
       startedAt = Date.now();
       lastActivityAt = startedAt;
       lastActivityPersist = startedAt;
+      writePersistedSession({ sid: sessionId, st: startedAt, la: startedAt });
+    },
+    rotate: () => {
+      sessionId = shortId("ses_");
+      segmentId = shortId("seg_");
+      startedAt = Date.now();
+      lastActivityAt = startedAt;
+      lastActivityPersist = startedAt;
+      sequence = 0;
+      // The ended session was flushed before we got here; drop any residual so
+      // the new session starts clean (its first batch must be full_snapshot-led).
+      buffer.length = 0;
       writePersistedSession({ sid: sessionId, st: startedAt, la: startedAt });
     },
     sdk,
