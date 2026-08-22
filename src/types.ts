@@ -72,6 +72,12 @@ export interface WebReplayConfig extends ReplayPrivacyConfig {
   /** Also mask long digit runs (≥5) in visible text (card/PII-looking numbers).
    *  Off by default (avoids masking order ids / counts). */
   maskTextNumbers?: boolean;
+  /** "Don't record this screen" — a deny-list of URL PATH globs (`*` = anything
+   *  but `/`, `**` = anything) matched against the current page, e.g.
+   *  `["/settings/billing", "/admin/**"]`. An excluded page records nothing and
+   *  ships nothing; takes precedence over any always-record override + the sample
+   *  rate. Evaluated at init (see initReplay note re: SPA client-navigation). */
+  excludeUrls?: string[];
 }
 
 export interface WebReplayEventContext {
@@ -126,6 +132,14 @@ export interface ReplayController {
    * no distinctId.
    */
   setMetadata: (key: string, value: string) => void;
+  /**
+   * A deep link to the CURRENT session in the dashboard —
+   * `<app-host>/recordings/<sessionId>`, with the app host derived from
+   * `apiHost` (`api.` → `app.`). Returns null before a session has started. This
+   * is the PRIVATE, authenticated dashboard view (not a public share link), so
+   * it exposes nothing to anyone without workspace access.
+   */
+  urlForCurrentSession: () => string | null;
 }
 
 export type { IdentifyPayload };

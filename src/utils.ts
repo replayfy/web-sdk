@@ -242,3 +242,20 @@ export function redactUrlForStorage(
   if (policy?.blockCC) out = scrubCreditCards(out);
   return out;
 }
+
+/**
+ * Derive the dashboard app host from the ingest/API host, mirroring the mobile
+ * SDKs: `https://api.replayfy.app` → `https://app.replayfy.app`. A host that does
+ * not start with `api.` (self-hosted / custom) is returned unchanged.
+ */
+export function dashboardHostFromApiHost(apiHost: string): string {
+  try {
+    const u = new URL(apiHost);
+    if (u.hostname.startsWith("api.")) {
+      u.hostname = "app." + u.hostname.slice(4);
+    }
+    return u.origin;
+  } catch {
+    return apiHost.replace(/\/+$/, "");
+  }
+}

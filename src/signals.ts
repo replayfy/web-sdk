@@ -397,26 +397,32 @@ export function createRageDeadClickCapture(onEvent: ClickEmit): StopHandle {
     if (!target) return;
     const selector = cssPath(target);
 
-    // Semantic click event — every real click, for heatmaps / click funnels.
+    // Semantic click event — for heatmaps / click funnels. Emitted ONLY for a
+    // genuinely interactive target, so a bare container / body / padding click
+    // (whose label is empty) never lands in the funnel with the CSS selector
+    // standing in for "Text". Rage/dead detection below still runs on ANY click
+    // — frustration on a dead zone is itself a real signal.
     // Mirrors our mobile TapEventData (selector + label + content-normalized
     // coords 0..1e4 + a stable uiId bucket).
-    const label = targetLabel(target);
-    const nx = normCoord(
-      ev.pageX,
-      document.documentElement.scrollWidth || window.innerWidth,
-    );
-    const ny = normCoord(
-      ev.pageY,
-      document.documentElement.scrollHeight || window.innerHeight,
-    );
-    onEvent({
-      kind: "click",
-      selector,
-      label,
-      nx,
-      ny,
-      uiId: hashId(`${location.pathname}#${selector}#${label}`),
-    });
+    if (isInteractiveEl(target)) {
+      const label = targetLabel(target);
+      const nx = normCoord(
+        ev.pageX,
+        document.documentElement.scrollWidth || window.innerWidth,
+      );
+      const ny = normCoord(
+        ev.pageY,
+        document.documentElement.scrollHeight || window.innerHeight,
+      );
+      onEvent({
+        kind: "click",
+        selector,
+        label,
+        nx,
+        ny,
+        uiId: hashId(`${location.pathname}#${selector}#${label}`),
+      });
+    }
 
     // Rage: ≥3 clicks within PROXIMITY_PX in RAGE_WINDOW_MS.
     while (recent.length > 0 && now - recent[0].ts > RAGE_WINDOW_MS)
@@ -838,6 +844,27 @@ const CLICKABLE_TAGS = new Set([
   "INPUT", "TEXTAREA", "SUMMARY", "OPTION", "LABEL",
 ]);
 
+const INTERACTIVE_ROLES = new Set([
+  "button", "link", "tab", "menuitem", "menuitemcheckbox", "menuitemradio",
+  "checkbox", "radio", "option", "switch",
+]);
+
+/** True when the node is a GENUINELY interactive control — a clickable tag, an
+ *  ARIA interactive role, an onclick handler attr, a focusable tabindex, or a
+ *  contenteditable region. Used both to climb to the meaningful click target AND
+ *  to decide whether a click earns a semantic (funnel/heatmap) event: a click on
+ *  a bare container / body / padding is NOT emitted, so the funnel's element
+ *  "Text" is never a CSS selector standing in for an empty label. */
+function isInteractiveEl(node: Element): boolean {
+  if (CLICKABLE_TAGS.has(node.tagName)) return true;
+  const role = node.getAttribute("role");
+  if (role && INTERACTIVE_ROLES.has(role)) return true;
+  if (node.hasAttribute("onclick")) return true;
+  if (node.hasAttribute("tabindex")) return true;
+  if ((node as HTMLElement).isContentEditable) return true;
+  return false;
+}
+
 /** rrweb-style privacy classes/attrs that mark a subtree as blocked/masked. */
 function isMaskedNode(node: Element): boolean {
   const c = node.classList;
@@ -862,14 +889,7 @@ function resolveClickable(raw: EventTarget | null): Element | null {
   let depth = 0;
   while (node && depth < 12) {
     if (isMaskedNode(node)) return null;
-    if (
-      CLICKABLE_TAGS.has(node.tagName) ||
-      node.getAttribute("role") === "button" ||
-      node.hasAttribute("onclick") ||
-      node.hasAttribute("tabindex")
-    ) {
-      return node;
-    }
+    if (isInteractiveEl(node)) return node;
     node = node.parentElement;
     depth += 1;
   }
@@ -943,24 +963,82 @@ function normSpaces(s: string): string {
  *  submit button's caption. Capped at 100 chars. */
 function targetLabel(el: Element | null): string {
   if (!el) return "";
-  const attr =
-    el.getAttribute("data-label") ||
+  const cap = (s: string) => normSpaces(s).slice(0, 100);
+
+  // 1. Author-intent labels on the element itself. `name` is deliberately NOT
+  //    here — it is rarely human-facing and used to win over visible text, so a
+  //    <button name="submit">Start free</button> was mislabelled "submit".
+  const direct =
     el.getAttribute("aria-label") ||
-    el.getAttribute("title") ||
-    el.getAttribute("alt") ||
-    el.getAttribute("name");
-  if (attr) return normSpaces(attr).slice(0, 100);
-  if (el.tagName === "INPUT" || el.tagName === "TEXTAREA") {
-    const ph = el.getAttribute("placeholder");
-    if (ph) return normSpaces(ph).slice(0, 100);
-    const input = el as HTMLInputElement;
-    if (input.type === "submit" || input.type === "button") {
-      return normSpaces(input.value || "").slice(0, 100);
-    }
-    return "";
+    el.getAttribute("data-label") ||
+    el.getAttribute("title");
+  if (direct && normSpaces(direct)) return cap(direct);
+
+  // 2. aria-labelledby → the referenced element(s') text.
+  const labelledby = el.getAttribute("aria-labelledby");
+  if (labelledby) {
+    const doc = el.ownerDocument;
+    const txt = labelledby
+      .split(/\s+/)
+      .map((id) => (doc ? doc.getElementById(id)?.textContent ?? "" : ""))
+      .join(" ");
+    if (normSpaces(txt)) return cap(txt);
   }
+
+  const tag = el.tagName;
+
+  // 3. Form controls — resolve their human label, NEVER the typed value.
+  if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") {
+    const input = el as HTMLInputElement;
+    const doc = el.ownerDocument;
+    const forLabel =
+      input.id && doc
+        ? doc.querySelector(`label[for="${cssEscape(input.id)}"]`)
+        : null;
+    const wrap = el.closest("label");
+    const lbl = (forLabel || wrap)?.textContent;
+    if (lbl && normSpaces(lbl)) return cap(lbl);
+    const ph = el.getAttribute("placeholder");
+    if (ph && normSpaces(ph)) return cap(ph);
+    if (tag === "INPUT") {
+      const type = (input.type || "").toLowerCase();
+      if (type === "submit" || type === "button" || type === "reset")
+        return cap(input.value || type);
+      if (type === "image")
+        return cap(el.getAttribute("alt") || input.value || "image");
+    }
+    if (tag === "SELECT") {
+      const opt = (el as unknown as HTMLSelectElement).selectedOptions?.[0]
+        ?.textContent;
+      if (opt && normSpaces(opt)) return cap(opt);
+    }
+    // Never leak the typed value; fall back to the field name or control kind.
+    return cap(el.getAttribute("name") || tag.toLowerCase());
+  }
+
+  // 4. Visible text — the primary path for buttons and links.
   const text = (el as HTMLElement).innerText || el.textContent || "";
-  return normSpaces(text).slice(0, 100);
+  if (normSpaces(text)) return cap(text);
+
+  // 5. Icon / image controls with no text: a descendant image's alt, a
+  //    labelled descendant, or the element's own alt.
+  const imgAlt = el.querySelector("img[alt]")?.getAttribute("alt");
+  if (imgAlt && normSpaces(imgAlt)) return cap(imgAlt);
+  const descLabelled =
+    el.querySelector("[aria-label]")?.getAttribute("aria-label") ||
+    el.querySelector("[title]")?.getAttribute("title") ||
+    el.querySelector("[alt]")?.getAttribute("alt");
+  if (descLabelled && normSpaces(descLabelled)) return cap(descLabelled);
+  const ownAlt = el.getAttribute("alt");
+  if (ownAlt && normSpaces(ownAlt)) return cap(ownAlt);
+
+  // 6. Final sane fallback — a role/tag word, NEVER the CSS selector and NEVER
+  //    empty (the empty return is exactly what made the dashboard fall back to
+  //    the selector as the element "Text").
+  const role = el.getAttribute("role");
+  if (role) return role;
+  const t = tag.toLowerCase();
+  return t === "a" ? "link" : t;
 }
 
 /** Content-normalized coordinate in 0..10000 (like the reference tracker), so a
