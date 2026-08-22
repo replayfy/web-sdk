@@ -154,6 +154,7 @@ Only `apiKey` and `apiHost` are required.
 | `maskTextSelector` | `string` | — | CSS selector for text nodes to mask in the replay. |
 | `blockSelector` | `string` | — | CSS selector for elements to fully block (rendered as a placeholder). |
 | `redactUrls` | `Array<string \| RegExp>` | — | Patterns whose matches are stripped from captured URLs. |
+| `excludeUrls` | `string[]` | — | Path globs (`*` = anything but `/`, `**` = anything), e.g. `["/settings/billing", "/admin/**"]`, that opt a page out of recording. On a matching page the SDK records and ships nothing — a per-page opt-out that beats any always-record override and the sample rate. |
 | `sdk` | `object` | — | Override SDK descriptor fields (name/version) reported with each batch. |
 | `beforeSend` | `(event) => event \| null` | — | Inspect or mutate each batch before it's sent; return `null` to drop it. |
 | `fetchImpl` | `typeof fetch` | `window.fetch` | Custom `fetch` implementation (advanced/testing). |
@@ -223,6 +224,19 @@ The current session's id (string), handy for correlating with your own logs.
 
 ```ts
 console.log(replay.sessionId);
+```
+
+### `urlForCurrentSession()`
+
+A deep link to the current session in the dashboard —
+`<app-host>/recordings/<sessionId>`, with the app host derived from `apiHost`.
+Returns `null` before a session has started. This is the private, authenticated
+dashboard view (not a public share link), so it exposes nothing to anyone
+without workspace access.
+
+```ts
+const url = replay.urlForCurrentSession();
+// → "https://app.replayfy.app/recordings/ses_123" (or null before start)
 ```
 
 ## Privacy & masking
