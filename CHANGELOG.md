@@ -5,6 +5,26 @@ All notable changes to `@replayfyapp/browser` are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.16]
+
+### Fixed
+
+- **Click labels resolve to real text, never a CSS selector.** `targetLabel()`
+  now derives human text — aria-label, aria-labelledby, an associated
+  `<label>` / placeholder, submit value, `<select>` option, innerText, a
+  descendant `<img alt>`, else a generic role word — and never returns an empty
+  label or a selector. The funnel's element "Text" stops falling back to
+  `body > header > …`. A `<button name="…">` now yields its visible text
+  instead of the `name`. Container / body / padding clicks no longer emit a
+  semantic click at all (rage/dead detection still runs on any click).
+
+### Added
+
+- **`urlForCurrentSession()`** on the controller — the dashboard link for the
+  live session (`<app-host>/recordings/<id>`).
+- **`excludeUrls`** config — a path-glob deny-list; a matching page records and
+  ships nothing.
+
 ## [0.1.15]
 
 ### Fixed
