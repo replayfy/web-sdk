@@ -26,7 +26,7 @@ import {
 } from "./signals";
 import { fetchRemoteConfig } from "./remote-config";
 import { getBrowserFingerprint, setStoredFingerprint } from "./fingerprint";
-import { redactUrlForStorage } from "./utils";
+import { redactUrlForStorage, dashboardHostFromApiHost } from "./utils";
 import type { ReplayController, WebReplayConfig } from "./types";
 
 interface CaptureSlot {
@@ -56,6 +56,7 @@ export function initReplay(config: WebReplayConfig): ReplayController {
         setAnonymousId: noop,
         setMetadata: noop,
         stop: async () => {},
+        urlForCurrentSession: () => null,
       };
     }
   }
@@ -756,6 +757,23 @@ export function initReplay(config: WebReplayConfig): ReplayController {
       return;
     }
 
+    // Host-configured URL/route EXCLUSION — the "don't record this screen" opt-out
+    // for web. A deny-list of path globs (e.g. "/settings/billing", "/admin/**")
+    // beats every "always record" override and the sample roll; like
+    // shouldNotRecord, an excluded URL does NO capture work and ships nothing.
+    // NOTE (SPA follow-up): this is evaluated at init/config time. A single-page
+    // app that CLIENT-navigates into an excluded route mid-session is not yet
+    // re-gated — that needs a navigation hook that pauses/resumes capture.
+    if (
+      (config.excludeUrls ?? []).some((g) =>
+        matchesGlob(g, window.location.href),
+      )
+    ) {
+      blocked = true;
+      sampled = false;
+      return;
+    }
+
     // ---- Sampling decision ------------------------------------------
     // Start by rolling the sample rate. The "always record" overrides
     // below can flip the decision back on for this particular session.
@@ -1037,6 +1055,13 @@ export function initReplay(config: WebReplayConfig): ReplayController {
     captureException,
     setAnonymousId,
     setMetadata,
+    // Deep link to THIS session in the dashboard — the private, authed
+    // /recordings/<id> route (NOT a public share link). Read the live session id
+    // (it rotates on inactivity), and derive the app host from apiHost.
+    urlForCurrentSession: () =>
+      session.sessionId
+        ? `${dashboardHostFromApiHost(config.apiHost)}/recordings/${session.sessionId}`
+        : null,
     stop: async () => {
       if (idleTimer !== undefined) window.clearInterval(idleTimer);
       for (const k of Object.keys(captures)) {
