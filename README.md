@@ -65,7 +65,7 @@ import { initReplay } from "@replayfyapp/browser";
 
 const replay = initReplay({
   apiKey: "pk_live_123",
-  apiHost: "https://us.replayfy.app",
+  apiHost: "https://us.replayfy.app",  // or your self-hosted API URL
 });
 
 replay.identify("user_123");
@@ -91,7 +91,7 @@ replay.track("checkout_started");
   })();
   Replayfy.init({
     apiKey: "pk_live_123",
-    apiHost: "https://us.replayfy.app",
+    apiHost: "https://us.replayfy.app",  // or your self-hosted API URL
   });
   Replayfy.identify("user_123");
   Replayfy.track("checkout_started");
@@ -111,7 +111,7 @@ Every capture and privacy option can be set at init — only `apiKey` and
 ```ts
 const replay = initReplay({
   apiKey: "pk_live_123",
-  apiHost: "https://us.replayfy.app",
+  apiHost: "https://us.replayfy.app",  // or your self-hosted API URL
 
   // capture (all default to true except captureHeaders)
   captureConsole: true, // console.* output on the timeline
@@ -135,7 +135,7 @@ Only `apiKey` and `apiHost` are required.
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
 | `apiKey` | `string` | — | **Required.** Your project's publishable API key. |
-| `apiHost` | `string` | — | **Required.** Replayfy ingest host, e.g. `https://us.replayfy.app`. |
+| `apiHost` | `string` | — | **Required.** Replayfy ingest host, e.g. `https://us.replayfy.app` (or your self-hosted API URL). |
 | `projectId` | `string` | — | Optional project identifier, useful when one key spans environments. |
 | `distinctId` | `string` | — | Identify the user at startup (equivalent to calling `identify` immediately). |
 | `revId` | `string` | — | Build / release id of the deployed app, so you can scope replays and funnels to one release. |
@@ -272,7 +272,7 @@ the mask/block selectors at it. The real values never leave the browser:
 ```ts
 initReplay({
   apiKey: "pk_live_123",
-  apiHost: "https://us.replayfy.app",
+  apiHost: "https://us.replayfy.app",  // or your self-hosted API URL
   maskAllInputs: true, // default — every <input> value is masked
   maskTextSelector: ".rpf-mask", // mask the text content of matching elements
   blockSelector: ".rpf-block", // replace matching elements with a placeholder
