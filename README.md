@@ -139,7 +139,7 @@ Only `apiKey` and `apiHost` are required.
 | `projectId` | `string` | — | Optional project identifier, useful when one key spans environments. |
 | `distinctId` | `string` | — | Identify the user at startup (equivalent to calling `identify` immediately). |
 | `revId` | `string` | — | Build / release id of the deployed app, so you can scope replays and funnels to one release. |
-| `sessionId` | `string` | auto | Override the generated session id (advanced; normally left unset). |
+| `sessionId` | `string` | auto | Override the generated session id (advanced; normally left unset). Must be a string of at most 2000 UTF-8 bytes with no control characters; anything else is ignored with a console warning and a generated id is used. |
 | `flushIntervalMs` | `number` | `3000` | How often, in milliseconds, buffered events are sent. |
 | `maxBufferSize` | `number` | — | Maximum number of events to hold in memory between flushes. |
 | `captureConsole` | `boolean` | `true` | Record `console.*` output on the session timeline. |

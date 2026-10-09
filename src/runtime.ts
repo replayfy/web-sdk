@@ -35,7 +35,8 @@ interface SessionRuntime {
    *  AND the live idle-timeout that ends a session with no meaningful activity. */
   inactivityMs: number;
   /** Start a BRAND-NEW session in place — mint a fresh sessionId/segmentId, reset
-   *  the clock to now, zero the sequence, and drop any residual buffer. Called
+   *  the clock to now, and drop any residual buffer. The batch sequence is NOT
+   *  reset: it is a tab-wide count (see claimSequence). Called
    *  when a user returns after the session was ended for inactivity, so the
    *  return is a new session (new id) rather than a continuation of a stale one.
    *  The transport's identify/fingerprint state is untouched — it's the same
@@ -139,6 +140,26 @@ const SESSION_STORAGE_KEY = "replay:ses";
  *  Overridable via config.sessionInactivityMs. */
 const DEFAULT_INACTIVITY_MS = 30 * 60 * 1000;
 
+/** Where the tab's batch counter lives: the highest batch `sequence` used in this
+ *  tab so far. Each page load continues from it, so a session that spans page
+ *  loads (a reload, a same-tab navigation) never reuses a number. SDKs up to
+ *  0.1.16 restarted at 1 per page load, and servers keying batches on
+ *  (sessionId, sequence) then dropped or overwrote one page's batches. A key of
+ *  its own (not a field of SESSION_STORAGE_KEY) keeps the session record written
+ *  exactly as before, so an older SDK page in the same tab can't erase it. */
+const SEQUENCE_STORAGE_KEY = "replay:sq";
+
+/** Highest batch sequence the ingest accepts (it is stored as INT4). */
+const MAX_SEQUENCE = 2_147_483_647;
+
+/** Largest host-supplied sessionId the ingest accepts, in UTF-8 bytes. */
+const MAX_SESSION_ID_BYTES = 2000;
+
+/** Characters the ingest rejects in an id: C0 controls (incl. NUL) and lone
+ *  UTF-16 surrogates. */
+const INVALID_ID_CHARS =
+  /[\u0000-\u001F\u007F]|[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+
 /** Don't persist the last-activity marker on every pointer/scroll event — once
  *  every few seconds keeps the reload window accurate at negligible cost. The
  *  window (minutes) dwarfs this staleness, so it never changes a resume verdict. */
@@ -153,13 +174,23 @@ interface PersistedSession {
   la: number;
 }
 
+/** True for a session id the ingest will accept. */
+function isUsableSessionId(id: unknown): id is string {
+  return (
+    typeof id === "string" &&
+    id.length > 0 &&
+    new TextEncoder().encode(id).length <= MAX_SESSION_ID_BYTES &&
+    !INVALID_ID_CHARS.test(id)
+  );
+}
+
 function readPersistedSession(): PersistedSession | null {
   try {
     const raw = sessionStorage.getItem(SESSION_STORAGE_KEY);
     if (!raw) return null;
     const p = JSON.parse(raw) as Partial<PersistedSession>;
     if (
-      typeof p.sid === "string" &&
+      isUsableSessionId(p.sid) &&
       typeof p.st === "number" &&
       typeof p.la === "number"
     ) {
@@ -181,12 +212,32 @@ function writePersistedSession(p: PersistedSession): void {
   }
 }
 
+/** The tab's highest batch sequence so far, or 0 when there is none (or it is
+ *  unreadable or out of range). */
+function readStoredSequence(): number {
+  try {
+    const n = Number(sessionStorage.getItem(SEQUENCE_STORAGE_KEY));
+    return Number.isInteger(n) && n > 0 && n <= MAX_SEQUENCE ? n : 0;
+  } catch {
+    return 0;
+  }
+}
+
+function writeStoredSequence(n: number): void {
+  try {
+    sessionStorage.setItem(SEQUENCE_STORAGE_KEY, String(n));
+  } catch {
+    /* unavailable/full — the next page load restarts numbering at 1, which the
+       server still keeps apart by segmentId. */
+  }
+}
+
 export function createSessionRuntime(config: WebReplayConfig): SessionRuntime {
   const now = Date.now();
   const inactivityMs = config.sessionInactivityMs ?? DEFAULT_INACTIVITY_MS;
 
   // Decide this page load's session identity:
-  //   1. an explicit config.sessionId always wins (host-controlled).
+  //   1. a usable explicit config.sessionId always wins (host-controlled).
   //   2. otherwise resume the tab's stored session if the last USER interaction
   //      was within the inactivity window (reload / same-tab back-forward) —
   //      reusing its original startedAt so offsets stay monotonic across loads.
@@ -195,8 +246,18 @@ export function createSessionRuntime(config: WebReplayConfig): SessionRuntime {
   let startedAt: number;
   let lastActivityAt: number;
   let resumed = false;
-  if (config.sessionId) {
-    sessionId = config.sessionId;
+  // The ingest rejects an unusable id, so sending one would fail every batch:
+  // ignore it (with a warning) and fall back to the SDK's own id.
+  const hostSessionId = isUsableSessionId(config.sessionId)
+    ? config.sessionId
+    : undefined;
+  if (config.sessionId && !hostSessionId) {
+    console.warn(
+      `[replay-sdk] config.sessionId ignored: it must be a string of at most ${MAX_SESSION_ID_BYTES} bytes with no control characters.`,
+    );
+  }
+  if (hostSessionId) {
+    sessionId = hostSessionId;
     startedAt = now;
     lastActivityAt = now;
   } else {
@@ -218,7 +279,20 @@ export function createSessionRuntime(config: WebReplayConfig): SessionRuntime {
 
   let segmentId = shortId("seg_");
   const buffer: ReplayEvent[] = [];
-  let sequence = 0;
+  // Continue the tab's batch count (see SEQUENCE_STORAGE_KEY).
+  let sequence = readStoredSequence();
+  // Claim the next batch number: one above the highest used in this tab (by
+  // us, or by another runtime sharing this tab's sessionStorage — a second
+  // init() on the page, a same-origin iframe), persisted synchronously before
+  // the batch is sent so the next page load (even one started from this page's
+  // unload handler) continues after it. Past the ingest's INT4 cap it restarts
+  // at 1, which is safe: the server keys batches per page load (segmentId).
+  const claimSequence = () => {
+    const next = Math.max(sequence, readStoredSequence()) + 1;
+    sequence = next <= MAX_SEQUENCE ? next : 1;
+    writeStoredSequence(sequence);
+    return sequence;
+  };
   let timer: number | undefined;
   let lastActivityPersist = now;
 
@@ -259,7 +333,7 @@ export function createSessionRuntime(config: WebReplayConfig): SessionRuntime {
       startedAt = Date.now();
       lastActivityAt = startedAt;
       lastActivityPersist = startedAt;
-      sequence = 0;
+      // `sequence` is NOT reset: the tab-wide count continues (claimSequence).
       // The ended session was flushed before we got here; drop any residual so
       // the new session starts clean (its first batch must be full_snapshot-led).
       buffer.length = 0;
@@ -294,10 +368,7 @@ export function createSessionRuntime(config: WebReplayConfig): SessionRuntime {
         writePersistedSession({ sid: sessionId, st: startedAt, la: t });
       }
     },
-    nextSequence: () => {
-      sequence += 1;
-      return sequence;
-    },
+    nextSequence: claimSequence,
     pageContext,
     startAutoFlush: (flush) => {
       const flushIntervalMs = config.flushIntervalMs ?? 3000;
@@ -315,12 +386,11 @@ export function createSessionRuntime(config: WebReplayConfig): SessionRuntime {
       let chunkBytes = 0;
       const ship = () => {
         if (chunk.length === 0) return;
-        sequence += 1;
         sendFinal({
           projectId: config.projectId,
           sessionId,
           segmentId,
-          sequence,
+          sequence: claimSequence(),
           sentAt: Date.now(),
           sdk,
           page: pageContext(),

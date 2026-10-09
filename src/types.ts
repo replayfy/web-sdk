@@ -13,6 +13,9 @@ export interface WebReplayConfig extends ReplayPrivacyConfig {
   /** Build / revision id of the deployed app, surfaced as a funnel +
    *  session-search filter so you can scope analysis to one release. */
   revId?: string;
+  /** Use this session id instead of generating one (advanced). It must be a
+   *  string of at most 2000 UTF-8 bytes with no control characters; anything
+   *  else is ignored with a console warning and the SDK generates its own id. */
   sessionId?: string;
   /** The inactivity window (ms) that bounds a session. Defaults to 30 min (the
    *  session-analytics norm, matching GA). "Activity" = genuine engagement —

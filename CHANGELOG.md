@@ -5,6 +5,25 @@ All notable changes to `@replayfyapp/browser` are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **Page loads in one session no longer reuse batch numbers.** A reload or a
+  same-tab navigation continues the tab's session, but each page load
+  restarted its batch `sequence` at 1. Servers that key batches on
+  `(sessionId, sequence)` then silently dropped the later page's first batches
+  (its full snapshot included) or overwrote the earlier page's. The SDK now
+  keeps a tab-wide batch counter in sessionStorage (`replay:sq`) and continues
+  it on every page load, including after an inactivity rotation and for a
+  host-supplied `sessionId`. A tab whose session began on 0.1.16 has no counter
+  yet, so its first page load after the upgrade starts at 1 again; servers need
+  per-page-load (segment) batch keys to keep that load, so upgrade a
+  self-hosted server before, or together with, this SDK.
+- **An unusable `config.sessionId` is ignored with a warning** (not a string,
+  over 2000 UTF-8 bytes, or containing control characters) instead of being
+  sent: the ingest rejects such ids, so every batch would fail.
+
 ## [0.1.16]
 
 ### Fixed
