@@ -23,6 +23,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **An unusable `config.sessionId` is ignored with a warning** (not a string,
   over 2000 UTF-8 bytes, or containing control characters) instead of being
   sent: the ingest rejects such ids, so every batch would fail.
+- **`beforeSend` now runs on the hide/unload batch too.** That batch used to
+  skip the hook, so data a host scrubs or drops in `beforeSend` left the
+  browser on every tab switch and page close. A hook that throws or returns a
+  Promise now drops the batch (fail closed) instead of sending it unscrubbed.
+- **Sampled-out and blocked sessions no longer upload on hide/close.** The
+  unload path skipped the sampling and plan-cap checks, so every tab switch of
+  a sampled-out visitor created a snapshot-less session (counted against the
+  plan). `excludeUrls` also applies now when the remote config can't be
+  fetched.
+- **`session_end` is sent once, when the page really goes away.** Each close
+  sent up to three, and every tab switch ended the session mid-visit
+  (`visibility_hidden`). Hiding a tab now ships its buffered events without
+  ending the session; a page entering the back/forward cache doesn't end it
+  either. The `beforeunload` listener is gone (it can be cancelled, and it kept
+  pages out of the back/forward cache in some browsers).
+- **Pages restored from the back/forward cache are recorded correctly.** The
+  restored page continued its old segment with no new base snapshot, so the
+  replay applied its changes to the DOM of the page shown in between. A restore
+  now starts a new segment with a page view and a fresh full snapshot (and a
+  new session if the inactivity window passed).
+- **Uploads in flight survive navigation.** Small batches are sent with
+  `keepalive`; a regular upload still pending when the page goes away is
+  re-sent once on `pagehide` (same bytes and sequence, which the server
+  dedupes). The unload batch is now one request sized to the browser's 64 KiB
+  keepalive/beacon allowance (the SDK keeps to 48 KiB so the page's own beacons
+  still fit), measured in real UTF-8 bytes, carrying the session end, errors and
+  page views first; several 55 KB chunks at once got all but the first
+  rejected.
+- **Rejected uploads are no longer retried forever.** A bad or revoked key
+  (401), an origin outside the allow-list (403) or a workspace over its plan
+  (`accepted:false`) stops recording for the rest of the page after one
+  request; a malformed batch (400/413) is dropped, and three in a row stop
+  recording; server errors back off (up to 60 s) instead of resending every
+  flush.
+- **A failed upload from before an inactivity rotation no longer lands in the
+  new session** (it was requeued under the new session id), and the stored
+  identity follows the new session id.
+- **A reload is one page view, not two** (the resumed page emitted its own
+  `navigation` event besides the navigation capture's).
+- **The real SDK name and version are reported** (`@replayfyapp/browser` and
+  the package version, instead of `@replay/web-sdk` / `0.1.0`).
+- **Credential-style query parameters** (token, jwt, password, …) are masked in
+  every batch's page URL and referrer, as they already were in events.
+- A session switched back on by always-record-errors / identified-users takes a
+  fresh full snapshot, so its replay doesn't wait for the next checkout.
 
 ## [0.1.16]
 

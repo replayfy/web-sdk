@@ -12,8 +12,12 @@ import {
 } from "./schema";
 import { record, addCustomEvent } from "rrweb";
 import type { eventWithTime } from "rrweb";
-import { createBatchSender, type IdentifyPayload } from "./transport";
-import { createSessionRuntime } from "./runtime";
+import {
+  createBatchSender,
+  type IdentifyPayload,
+  type SendOutcome,
+} from "./transport";
+import { createSessionRuntime, createUploadGate } from "./runtime";
 import {
   createConsoleCapture,
   createErrorCapture,
@@ -26,7 +30,11 @@ import {
 } from "./signals";
 import { fetchRemoteConfig } from "./remote-config";
 import { getBrowserFingerprint, setStoredFingerprint } from "./fingerprint";
-import { redactUrlForStorage, dashboardHostFromApiHost } from "./utils";
+import {
+  applyBeforeSend,
+  redactUrlForStorage,
+  dashboardHostFromApiHost,
+} from "./utils";
 import type { ReplayController, WebReplayConfig } from "./types";
 
 interface CaptureSlot {
@@ -93,7 +101,7 @@ export function initReplay(config: WebReplayConfig): ReplayController {
   //  - `started`      : the visibility-gated start has run (tab was/became visible).
   //  - `snapshotReady`: rrweb's first full_snapshot has been buffered.
   //  - `rrwebFailed`  : record() threw, so no snapshot will ever arrive.
-  // flush()/finalFlush() ship nothing until `started && (snapshotReady ||
+  // flush()/shipTail() ship nothing until `started && (snapshotReady ||
   // rrwebFailed)`. Net effect: a tab that loads hidden and is closed while still
   // hidden creates NO session, and a started session's first batch always carries
   // the snapshot (or rrweb is known-failed and the no-replay session ships for the
@@ -110,6 +118,20 @@ export function initReplay(config: WebReplayConfig): ReplayController {
   let idle = false;
   let lastMeaningfulAt = Date.now();
   let idleTimer: number | undefined;
+  // stop() ran: nothing is captured or sent any more.
+  let stopped = false;
+  // The session a session_end was already emitted for, so it is sent at most
+  // once per session per page, whichever path ends it (unload, inactivity,
+  // stop()). Cleared when a back/forward-cache restore continues the session.
+  let endedSessionId: string | null = null;
+  // pagehide ran: the page is going away (or into the back/forward cache).
+  let unloading = false;
+  // The page went into the back/forward cache after the session started.
+  let inBfcache = false;
+  // Regular uploads: one in flight at a time, backoff after failures, halt when
+  // the server says nothing from this page will be accepted.
+  const gate = createUploadGate(config.flushIntervalMs ?? 3000);
+  let inFlightSend: Promise<void> | null = null;
 
   if (config.distinctId)
     sendBatch.setIdentify({ distinctId: config.distinctId });
@@ -121,7 +143,9 @@ export function initReplay(config: WebReplayConfig): ReplayController {
     // Session was ended for inactivity and nobody's back yet — drop everything
     // (background network/perf/console/heartbeat) so it can't extend a dead
     // session. resumeFromIdle() clears `idle` before re-emitting into the fresh one.
-    if (idle) return;
+    // Also nothing once uploads are blocked/halted or stop() ran: it would only
+    // grow a buffer that is never sent.
+    if (idle || blocked || stopped) return;
     session.push({
       id: session.makeEventId(),
       // Clamp to >= 0. Some events timestamp themselves off performance
@@ -187,6 +211,11 @@ export function initReplay(config: WebReplayConfig): ReplayController {
       type: rrwebEvent.type === 2 ? "full_snapshot" : "incremental_snapshot",
       data,
     });
+    // Ship a full snapshot (initial, heartbeat, checkout) soon rather than on
+    // the next tick: a big one still buffered when the page goes away rarely
+    // fits the unload batch, and the replay after it needs it as its base.
+    // Deferred so rrweb finishes emitting synchronously first.
+    if (rrwebEvent.type === 2 && started) setTimeout(scheduleFlush, 0);
   };
 
   const emitViewport = () => {
@@ -198,10 +227,29 @@ export function initReplay(config: WebReplayConfig): ReplayController {
   };
 
   const emitSessionEnd = (reason: SessionEndEventData["reason"]) => {
+    if (endedSessionId === session.sessionId) return;
+    endedSessionId = session.sessionId;
     emit({ ts: Date.now(), type: "session_end", data: { reason } });
   };
 
-  const flush = async () => {
+  // A sampled-out session was switched back on (always-record errors /
+  // identified users). Its buffered base snapshot was discarded while it was
+  // off, so take a fresh one now — otherwise the replay has nothing to apply
+  // the next diffs to until the 30s heartbeat or the 2-minute checkout.
+  const turnSamplingOn = () => {
+    if (sampled || blocked) return;
+    sampled = true;
+    if (captures.rrweb) {
+      try {
+        record.takeFullSnapshot(true);
+      } catch {
+        /* recorder inactive — the heartbeat/checkout will provide the base */
+      }
+    }
+  };
+
+  const flush = async (opts?: { ignoreBackoff?: boolean }) => {
+    if (stopped) return;
     if (!sampled || blocked) {
       session.drain();
       return;
@@ -219,32 +267,88 @@ export function initReplay(config: WebReplayConfig): ReplayController {
     if (minDurationMs > 0 && Date.now() - session.startedAt < minDurationMs) {
       return;
     }
-    const events = session.drain();
+    // One send at a time (keeps batches in order; a failed one is requeued in
+    // front) and none during a backoff. The events stay buffered; no sequence
+    // number is claimed until a batch is actually built.
+    if (!gate.canSend(opts?.ignoreBackoff)) return;
+    const generation = session.generation;
+    // Batches an earlier page load of this session held back go first, each
+    // under its own page load's segment.
+    const carried = session.carried.shift();
+    const events = carried ? carried.events : session.drain();
     if (events.length === 0) return;
     const envelope: ReplayBatchEnvelope = {
       projectId: config.projectId,
       sessionId: session.sessionId,
-      segmentId: session.segmentId,
+      segmentId: carried ? carried.segmentId : session.segmentId,
       sequence: session.nextSequence(),
       sentAt: Date.now(),
       sdk: session.sdk,
       page: session.pageContext(),
       events,
     };
-    const nextEnvelope = config.beforeSend
-      ? (config.beforeSend({ envelope })?.envelope ?? null)
-      : envelope;
+    const nextEnvelope = applyBeforeSend(config.beforeSend, envelope);
     if (!nextEnvelope) return;
+    gate.begin();
+    const send = (async () => {
+      let outcome: SendOutcome;
+      try {
+        outcome = await sendBatch(nextEnvelope);
+      } catch {
+        outcome = { kind: "retry" };
+      }
+      // Transient failure: put the events back for the next flush (after the
+      // backoff) rather than drop them — dropping the first batch loses the
+      // rrweb FullSnapshot and makes the recording unplayable. Unless the
+      // session rotated meanwhile: then they belong to the ended session and
+      // are dropped (requeue checks the generation). A batch the server
+      // refused ("drop"/"stop") is never resent.
+      if (outcome.kind === "retry") {
+        if (!carried) session.requeue(events, generation);
+        else if (session.generation === generation) session.carried.unshift(carried);
+      }
+      if (gate.end(outcome) === "halt") {
+        haltUploads(
+          outcome.kind === "stop" ? outcome.reason : "batches rejected",
+        );
+      }
+    })();
+    inFlightSend = send;
     try {
-      await sendBatch(nextEnvelope);
-    } catch {
-      // Send ultimately failed (network down, ingest outage, server error). Put
-      // the events back so the NEXT flush retries them rather than dropping the
-      // batch — dropping the first batch loses the rrweb FullSnapshot and makes
-      // the whole recording unplayable ("no replay frames"). Bounded in
-      // requeue(), so a sustained outage can't grow the buffer without limit.
-      session.requeue(events);
+      await send;
+    } finally {
+      if (inFlightSend === send) inFlightSend = null;
     }
+  };
+
+  // Stop every capture (shared by stop() and haltUploads()).
+  const stopCaptures = () => {
+    for (const k of Object.keys(captures)) {
+      const slot = captures[k];
+      if (slot) {
+        try {
+          slot.stop();
+        } catch {
+          /* ignore */
+        }
+        captures[k] = null;
+      }
+    }
+  };
+
+  // The server said nothing this page sends will be accepted (bad or revoked
+  // key, origin not allowed, workspace over its plan) or three batches in a
+  // row were unusable. Stop for the rest of this page load, like the remote
+  // config's shouldNotRecord: no captures, no uploads, nothing buffered.
+  const haltUploads = (reason: string) => {
+    if (blocked) return;
+    blocked = true;
+    sampled = false;
+    session.stopAutoFlush();
+    stopCaptures();
+    session.drain();
+    // eslint-disable-next-line no-console
+    console.warn(`[replay-sdk] recording stopped for this page: ${reason}`);
   };
 
   const scheduleFlush = () => {
@@ -269,13 +373,16 @@ export function initReplay(config: WebReplayConfig): ReplayController {
     if (!idle) return;
     idle = false;
     session.rotate();
+    sendBatch.retagSession(session.sessionId); // same person, new session id
     snapshotReady = false; // the new session must ship its own full_snapshot first
     emitSessionStart();
     if (captures.rrweb) {
       try {
         record.takeFullSnapshot(true);
       } catch {
-        /* recorder inactive — the session ships as no-replay (rrwebFailed gate) */
+        // Recorder inactive: release the snapshot gate so the session ships as
+        // no-replay instead of holding its events forever.
+        rrwebFailed = true;
       }
     }
     emitViewport();
@@ -396,7 +503,7 @@ export function initReplay(config: WebReplayConfig): ReplayController {
       );
       syncCapture("errors", effective.errors, () =>
         createErrorCapture((d: ErrorEventData) => {
-          if (!blocked && !sampled && sampleOverrides?.alwaysRecordErrors) sampled = true;
+          if (sampleOverrides?.alwaysRecordErrors) turnSamplingOn();
           emit({ ts: Date.now(), type: "error", data: d });
         }),
       );
@@ -608,9 +715,7 @@ export function initReplay(config: WebReplayConfig): ReplayController {
         // says "always record errors", flip sampled back on the moment an
         // error fires. The current event + any in the buffer will ship
         // on the next flush.
-        if (!blocked && !sampled && sampleOverrides?.alwaysRecordErrors) {
-          sampled = true;
-        }
+        if (sampleOverrides?.alwaysRecordErrors) turnSamplingOn();
         emit({ ts: Date.now(), type: "error", data: d });
       }),
     );
@@ -660,6 +765,13 @@ export function initReplay(config: WebReplayConfig): ReplayController {
   // session. Runs at most once (the `started` guard).
   const startCapture = () => {
     if (started) return;
+    // excludeUrls is the host's own opt-out, so it applies even when the
+    // remote config never arrives (applyRemoteConfig re-checks it too).
+    if ((config.excludeUrls ?? []).some((g) => matchesGlob(g, window.location.href))) {
+      blocked = true;
+      sampled = false;
+      return;
+    }
     started = true;
     // A FRESH session anchors its clock to NOW (first-visible) so the timeline
     // begins when the page is seen, not when a hidden tab constructed the
@@ -667,22 +779,12 @@ export function initReplay(config: WebReplayConfig): ReplayController {
     if (!session.resumed) session.beginFreshClock();
 
     // A fresh session opens with session_start (sets the entry page). A RESUMED
-    // session — a reload or same-tab back/forward within the inactivity window —
-    // instead records the reload as a page navigation, so the original entry page
-    // is preserved and the reload shows on the timeline as a page transition
-    // rather than a second "session start".
-    if (session.resumed) {
-      emit({
-        ts: Date.now(),
-        type: "navigation",
-        data: {
-          to: window.location.href,
-          trigger: "load",
-        } satisfies NavigationEventData,
-      });
-    } else {
-      emitSessionStart();
-    }
+    // session — a reload or same-tab navigation within the inactivity window —
+    // doesn't: the original entry page is preserved, and the page view is the
+    // navigation(load) the navigation capture emits on install (installed just
+    // below, for every page load). Emitting one here too counted every reload
+    // as two page views.
+    if (!session.resumed) emitSessionStart();
     emitViewport();
 
     // We install captures in *two phases* to avoid losing the rrweb
@@ -745,6 +847,9 @@ export function initReplay(config: WebReplayConfig): ReplayController {
   function applyRemoteConfig(
     remote: NonNullable<Awaited<ReturnType<typeof fetchRemoteConfig>>>,
   ) {
+    // Uploads were already halted (or stop() ran): a late config must not
+    // re-install the captures.
+    if (blocked || stopped) return;
     // ---- Hard cap gate ----------------------------------------------
     // The workspace has spent its plan's session allowance. Record NOTHING and
     // ship NOTHING — this beats every "always record" override below (a maxed
@@ -806,6 +911,17 @@ export function initReplay(config: WebReplayConfig): ReplayController {
       maskInputOptions[t] = true;
     }
 
+    // Set BEFORE installCaptures: installing rrweb takes the first snapshot and
+    // flushes it straight away, so a minimum duration applied after it never
+    // held that first batch back (every bounce uploaded its snapshot).
+    // Remember the rules so identify()-triggered re-evaluation can flip
+    // sampling on later when alwaysRecordIdentified=true.
+    sampleOverrides = {
+      alwaysRecordErrors: remote.sampling.alwaysRecordErrors,
+      alwaysRecordIdentified: remote.sampling.alwaysRecordIdentified,
+    };
+    minDurationMs = remote.capture.minDurationMs ?? 0;
+
     installCaptures({
       console: remote.capture.console,
       network: remote.capture.network,
@@ -826,14 +942,6 @@ export function initReplay(config: WebReplayConfig): ReplayController {
         (p) => new RegExp(p, "i"),
       ),
     });
-
-    // Remember the rules so identify()-triggered re-evaluation can flip
-    // sampling on later when alwaysRecordIdentified=true.
-    sampleOverrides = {
-      alwaysRecordErrors: remote.sampling.alwaysRecordErrors,
-      alwaysRecordIdentified: remote.sampling.alwaysRecordIdentified,
-    };
-    minDurationMs = remote.capture.minDurationMs ?? 0;
   } // end applyRemoteConfig
 
   // Tiny glob matcher — supports `**` (matches anything) and `*` (matches
@@ -855,31 +963,129 @@ export function initReplay(config: WebReplayConfig): ReplayController {
     }
   }
 
-  // Deliver the tail reliably as the page goes away. visibilitychange:hidden is
-  // the signal that fires FIRST on a tab close (and the only one guaranteed when
-  // a mobile tab is backgrounded / on bfcache), so the closing frames are
-  // usually shipped while the page is still alive; pagehide + beforeunload mop
-  // up anything left. Each call drains the buffer, so the later ones are no-ops
-  // when an earlier one already sent — no duplicate batches.
-  const finalFlush = (reason: SessionEndEventData["reason"]) => {
-    // Never create a server-side session on the way out for a tab that never
-    // visibly started, or whose snapshot never arrived (and rrweb didn't fail) —
-    // same gate flush() uses. A load-hidden-then-closed tab and a pre-snapshot
-    // bounce both ship nothing.
-    if (!started || (!snapshotReady && !rrwebFailed)) return;
-    // Discard a bounce session that never reached minDuration — don't ship its
-    // held buffer on the way out.
-    if (minDurationMs > 0 && Date.now() - session.startedAt < minDurationMs) {
+  // ── Page lifecycle ──────────────────────────────────────────────────────────
+  // The browser order on a close or same-tab navigation is pagehide, then
+  // visibilitychange:hidden, in one task, with no time for async work (gzip).
+  // A tab switch or a mobile app switch fires only visibilitychange — and a
+  // backgrounded mobile page may be killed later without any other event.
+  //  - pagehide: re-send regular uploads still pending (redeliverPending), then
+  //    ship the tail as one keepalive batch. session_end("unload") only when the
+  //    page is really going away (not persisted into the back/forward cache).
+  //  - visibilitychange:hidden: ship the tail without session_end (the session
+  //    goes on), then, if the page is still alive, the rest through the regular
+  //    gzip path.
+  //  - pageshow (persisted): restoreFromBfcache().
+  // No beforeunload listener: it can be cancelled (the page lives on) and it
+  // keeps pages out of the back/forward cache in some browsers.
+
+  // Ship the buffer without waiting (unload-safe): ONE keepalive batch within
+  // the browser's budget, most valuable events first; what doesn't fit stays
+  // buffered for the next regular flush if the page lives on. Same gates as
+  // flush(), and the host's beforeSend runs on it too.
+  const shipTail = (
+    endReason?: SessionEndEventData["reason"],
+    leaving = false,
+  ) => {
+    if (stopped) return;
+    if (!sampled || blocked) {
+      session.drain();
       return;
     }
-    emitSessionEnd(reason);
-    session.flushFinal(sendBatch.sendFinal);
+    // Never create a server-side session on the way out for a tab that never
+    // visibly started, or whose snapshot never arrived (and rrweb didn't fail).
+    if (!started || (!snapshotReady && !rrwebFailed)) return;
+    // Under the minimum duration nothing is uploaded: a bounce is never stored.
+    // But leaving the page isn't necessarily the session's end — a same-tab
+    // navigation continues it on the next page (or this page comes back from
+    // the back/forward cache) — so on pagehide the held events are handed to
+    // whichever page load of this session runs next (stashForNextPage). If none
+    // does, they go with the tab. A tab switch keeps them in memory.
+    if (minDurationMs > 0 && Date.now() - session.startedAt < minDurationMs) {
+      if (leaving) {
+        if (endReason) emitSessionEnd(endReason);
+        session.stashForNextPage();
+      }
+      return;
+    }
+    if (endReason) emitSessionEnd(endReason);
+    session.flushFinal((envelope) => {
+      const next = applyBeforeSend(config.beforeSend, envelope);
+      // Dropped by the hook: nothing to keep for later.
+      return next ? sendBatch.sendFinal(next) : true;
+    }, sendBatch.finalRoom);
   };
-  document.addEventListener("visibilitychange", () => {
-    if (document.visibilityState === "hidden") finalFlush("visibility_hidden");
-  });
-  window.addEventListener("pagehide", () => finalFlush("unload"));
-  window.addEventListener("beforeunload", () => finalFlush("unload"));
+
+  const onPageHide = (e: PageTransitionEvent) => {
+    unloading = true;
+    // First the regular uploads the browser would cancel with the page: they
+    // hold the older events, possibly this page's base snapshot.
+    sendBatch.redeliverPending();
+    if (e.persisted) {
+      // Into the back/forward cache: it may come back, so the session isn't over.
+      inBfcache = started;
+      shipTail(undefined, true);
+    } else {
+      shipTail("unload", true);
+    }
+  };
+
+  const onVisibilityChange = () => {
+    if (document.visibilityState !== "hidden") return;
+    shipTail();
+    if (!unloading) void flush();
+  };
+
+  const onPageShow = (e: PageTransitionEvent) => {
+    if (!e.persisted) return;
+    unloading = false;
+    if (!inBfcache) return;
+    inBfcache = false;
+    restoreFromBfcache();
+  };
+
+  // The page came back from the back/forward cache. Its JS state is intact but
+  // other pages of this tab ran meanwhile, so: new segment (and maybe a new
+  // session, decided like a page load), a page-view event, and a fresh base
+  // snapshot — without it the replay would apply this page's diffs to the DOM
+  // of the page shown in between.
+  const restoreFromBfcache = () => {
+    // Anything buffered before the freeze goes out under the old ids first;
+    // flush() reads the ids and drains synchronously before its first await.
+    void flush();
+    const before = session.sessionId;
+    const continued = session.restoreFromBfcache();
+    if (session.sessionId !== before) sendBatch.retagSession(session.sessionId);
+    idle = false;
+    endedSessionId = null;
+    lastMeaningfulAt = Date.now(); // Back/Forward is the user acting
+    if (continued) {
+      emit({
+        ts: Date.now(),
+        type: "navigation",
+        data: {
+          to: redactUrlForStorage(window.location.href),
+          title: document.title || undefined,
+          trigger: "load",
+        } satisfies NavigationEventData,
+      });
+    } else {
+      emitSessionStart();
+    }
+    emitViewport();
+    if (captures.rrweb) {
+      snapshotReady = false;
+      try {
+        record.takeFullSnapshot(true);
+      } catch {
+        rrwebFailed = true;
+      }
+    }
+    scheduleFlush();
+  };
+
+  document.addEventListener("visibilitychange", onVisibilityChange);
+  window.addEventListener("pagehide", onPageHide);
+  window.addEventListener("pageshow", onPageShow);
 
   // Keep the session's last-activity marker fresh on genuine USER interaction —
   // deliberately NOT the SDK's own heartbeat/perf events, so an idle tab that's
@@ -961,13 +1167,8 @@ export function initReplay(config: WebReplayConfig): ReplayController {
     // previously-dropped session back into recording the moment the
     // customer calls identify(). Saves an "I had this user but no
     // session" support ticket.
-    if (
-      !blocked &&
-      !sampled &&
-      sampleOverrides?.alwaysRecordIdentified &&
-      payload.distinctId
-    ) {
-      sampled = true;
+    if (sampleOverrides?.alwaysRecordIdentified && payload.distinctId) {
+      turnSamplingOn();
     }
     void flush();
   };
@@ -1032,9 +1233,7 @@ export function initReplay(config: WebReplayConfig): ReplayController {
     // session but the workspace says "always record errors", a reported
     // exception flips recording back on — otherwise the handled error the
     // feature exists to surface would be discarded on the next flush.
-    if (!blocked && !sampled && sampleOverrides?.alwaysRecordErrors) {
-      sampled = true;
-    }
+    if (sampleOverrides?.alwaysRecordErrors) turnSamplingOn();
     markMeaningful(); // an explicitly-reported exception is engagement
     emit({
       ts: Date.now(),
@@ -1063,26 +1262,26 @@ export function initReplay(config: WebReplayConfig): ReplayController {
         ? `${dashboardHostFromApiHost(config.apiHost)}/recordings/${session.sessionId}`
         : null,
     stop: async () => {
+      if (stopped) return;
       if (idleTimer !== undefined) window.clearInterval(idleTimer);
-      for (const k of Object.keys(captures)) {
-        const slot = captures[k];
-        if (slot) {
-          try {
-            slot.stop();
-          } catch {
-            /* ignore */
-          }
-          captures[k] = null;
-        }
-      }
+      stopCaptures();
       for (const evt of activityEvents) {
         window.removeEventListener(evt, onUserActivity, {
           capture: true,
         } as EventListenerOptions);
       }
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+      window.removeEventListener("pagehide", onPageHide);
+      window.removeEventListener("pageshow", onPageShow);
       session.stopAutoFlush();
       emitSessionEnd("manual");
-      await flush();
+      // Deliver what is left, even during a backoff: carried batches from an
+      // earlier page load, then the buffer — one batch per flush.
+      for (let i = session.carried.length; i >= 0; i -= 1) {
+        if (inFlightSend) await inFlightSend;
+        await flush({ ignoreBackoff: true });
+      }
+      stopped = true;
     },
   };
 }

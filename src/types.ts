@@ -58,6 +58,10 @@ export interface WebReplayConfig extends ReplayPrivacyConfig {
    *  resources slow enough to matter and cut event volume sharply. */
   resourceMinDurationMs?: number;
   sdk?: Partial<ReplaySdkDescriptor>;
+  /** Inspect or rewrite every batch before it leaves the browser — including
+   *  the batch sent when the tab is hidden or the page unloads. Must be
+   *  synchronous. Return null (or no events) to drop the batch; a hook that
+   *  throws or returns a Promise also drops it, so nothing unscrubbed is sent. */
   beforeSend?: (event: WebReplayEventContext) => WebReplayEventContext | null;
   fetchImpl?: typeof fetch;
   /** Don't start recording at all when the browser sends Do-Not-Track

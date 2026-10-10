@@ -3,7 +3,10 @@ import type {
   ReplayEvent,
   ReplaySdkDescriptor,
 } from "./schema";
+import { SDK_NAME, SDK_VERSION } from "./version";
+import type { SendOutcome } from "./transport";
 import type { WebReplayConfig } from "./types";
+import { redactUrlForStorage, utf8Bytes } from "./utils";
 
 interface SessionRuntime {
   sessionId: string;
@@ -24,9 +27,15 @@ interface SessionRuntime {
   makeEventId: () => string;
   push: (event: ReplayEvent) => void;
   drain: () => ReplayEvent[];
+  /** Bumped whenever the session identity changes in place (rotate(), or a
+   *  back/forward-cache restore that lands in another session). Read it with
+   *  drain() and pass it back to requeue(). */
+  readonly generation: number;
   /** Put un-sent events back at the FRONT of the buffer after a failed send, so
-   *  the next flush retries them instead of dropping the batch. Bounded. */
-  requeue: (events: ReplayEvent[]) => void;
+   *  the next flush retries them instead of dropping the batch. Bounded. Events
+   *  drained under an older generation belong to a session that has since
+   *  ended: they are dropped (returns false), never shipped under the new id. */
+  requeue: (events: ReplayEvent[], generation: number) => boolean;
   /** Mark genuine USER activity (an interaction) so a subsequent reload within
    *  the inactivity window continues this session. Cheap + throttled — safe to
    *  call on every pointer/scroll/key event. */
@@ -46,18 +55,178 @@ interface SessionRuntime {
   pageContext: () => ReplayBatchEnvelope["page"];
   startAutoFlush: (flush: () => Promise<void>) => void;
   stopAutoFlush: () => void;
-  /** Deliver everything buffered on page-hide/unload, CHUNKED so each piece
-   *  stays under the beacon/keepalive ~64KB cap. A single oversized final batch
-   *  is silently dropped by the browser → the session's closing frames never
-   *  persist (a blank/frozen replay tail). Each chunk goes through the
-   *  transport's unload-reliable sendFinal (keepalive-fetch, beacon fallback). */
-  flushFinal: (sendFinal: (envelope: ReplayBatchEnvelope) => void) => void;
+  /** Ship the buffer on hide/unload as ONE batch that fits `roomFor(shell)`
+   *  bytes of events (the browser's keepalive/beacon budget, shared by every
+   *  in-flight unload request of the document — several chunks at once would
+   *  just get the later ones rejected). It carries the most valuable events
+   *  first (selectForFinalBatch); everything else goes back to the buffer, so
+   *  if the page lives on (a tab switch, a back/forward-cache page) the next
+   *  regular flush sends it. `sendFinal` returns false when nothing was sent. */
+  flushFinal: (
+    sendFinal: (envelope: ReplayBatchEnvelope) => boolean,
+    roomFor: (shell: ReplayBatchEnvelope) => number,
+  ) => void;
+  /** Batches an earlier page load of THIS session held back (minimum duration
+   *  not reached) when it went away; the next flushes send them first, each
+   *  under its own segment. Mutable: the caller takes from the front. */
+  carried: CarriedBatch[];
+  /** The page is going away while the session is still under its minimum
+   *  duration: hand the buffer (and anything still carried) to the next page
+   *  load of this session in this tab, through sessionStorage. Returns false
+   *  when there was nothing to keep or it didn't fit (then it's dropped). */
+  stashForNextPage: () => boolean;
+  /** The page came back from the back/forward cache. Decide its identity the
+   *  way a page load would (continue the tab's session when its last activity
+   *  is within the inactivity window, else start a new one) and always start a
+   *  NEW segment: the replay needs a fresh base snapshot for this page. Returns
+   *  true when the session continued. */
+  restoreFromBfcache: () => boolean;
 }
 
-/** Conservative per-chunk byte budget for the final flush. sendBeacon and
- *  keepalive fetch both cap the body near 64KB; 55KB leaves headroom for the
- *  envelope wrapper. rrweb payloads are ~ASCII so string length ≈ byte length. */
-const MAX_FINAL_CHUNK_BYTES = 55_000;
+/** A page load's events waiting to be sent under that page load's segment. */
+export interface CarriedBatch {
+  segmentId: string;
+  events: ReplayEvent[];
+}
+
+/** Where a page leaves events it held back (the session hasn't reached its
+ *  minimum duration yet) for the next page load of the same session in this
+ *  tab: a same-tab navigation continues the session, so the first page's
+ *  events must not be discarded as a "bounce". If no page continues the
+ *  session (tab closed, session expired), they're discarded with the tab — a
+ *  real bounce is still never uploaded. */
+const OUTBOX_STORAGE_KEY = "replay:outbox";
+
+/** Cap on what the outbox may hold, in UTF-16 code units: sessionStorage is
+ *  shared with the host page (quota ~5 MB), so a bigger hold is dropped. */
+const OUTBOX_MAX_CHARS = 1_000_000;
+
+interface Outbox {
+  sid: string;
+  batches: CarriedBatch[];
+}
+
+/** Read and always remove the outbox: it is for the very next page load. */
+function takeOutbox(): Outbox | null {
+  try {
+    const raw = sessionStorage.getItem(OUTBOX_STORAGE_KEY);
+    if (raw === null) return null;
+    sessionStorage.removeItem(OUTBOX_STORAGE_KEY);
+    const o = JSON.parse(raw) as Partial<Outbox>;
+    if (typeof o.sid !== "string" || !Array.isArray(o.batches)) return null;
+    const batches = o.batches.filter(
+      (b): b is CarriedBatch =>
+        !!b &&
+        typeof b.segmentId === "string" &&
+        Array.isArray(b.events) &&
+        b.events.length > 0,
+    );
+    return { sid: o.sid, batches };
+  } catch {
+    return null;
+  }
+}
+
+/** Event types the hide/unload batch keeps first: small and what the session's
+ *  end, errors, page views and custom events depend on. */
+const FINAL_PRIORITY_TYPES = new Set<string>([
+  "session_end",
+  "session_start",
+  "error",
+  "navigation",
+  "custom",
+  "viewport",
+]);
+
+/**
+ * Pick which buffered events the hide/unload batch carries within `room`
+ * bytes (exact UTF-8 cost of each event plus its separator), in three passes:
+ *  1. FINAL_PRIORITY_TYPES, newest first, so a big backlog can't crowd out the
+ *     session's end or its errors;
+ *  2. the replay stream (full/incremental snapshots), oldest first and without
+ *     gaps — each incremental is a diff on the ones before it, so the run stops
+ *     at the first one that doesn't fit;
+ *  3. everything else (console, network, performance…), oldest first.
+ * Returns a flag per event; the batch keeps the original order.
+ */
+function selectForFinalBatch(events: ReplayEvent[], room: number): boolean[] {
+  const take = new Array<boolean>(events.length).fill(false);
+  let left = room;
+  const tryTake = (i: number): boolean => {
+    const cost = utf8Bytes(JSON.stringify(events[i])) + 1;
+    if (cost > left) return false;
+    take[i] = true;
+    left -= cost;
+    return true;
+  };
+  const isReplay = (e: ReplayEvent) =>
+    e.type === "full_snapshot" || e.type === "incremental_snapshot";
+  for (let i = events.length - 1; i >= 0; i -= 1) {
+    if (FINAL_PRIORITY_TYPES.has(events[i].type)) tryTake(i);
+  }
+  for (let i = 0; i < events.length; i += 1) {
+    if (isReplay(events[i]) && !tryTake(i)) break;
+  }
+  for (let i = 0; i < events.length && left > 256; i += 1) {
+    const e = events[i];
+    if (!take[i] && !isReplay(e) && !FINAL_PRIORITY_TYPES.has(e.type)) tryTake(i);
+  }
+  return take;
+}
+
+/** Paces regular uploads: at most one send in flight, an exponential backoff
+ *  (jittered, capped at 60s) after transient failures, and a halt once three
+ *  batches in a row came back unusable or the server said to stop. */
+export interface UploadGate {
+  /** False while a send is in flight, or during a backoff unless
+   *  `ignoreBackoff` (stop() delivering its last batch). */
+  canSend(ignoreBackoff?: boolean): boolean;
+  begin(): void;
+  /** Record a finished send. Returns "halt" when uploads should stop for the
+   *  rest of this page load. */
+  end(outcome: SendOutcome): "halt" | undefined;
+}
+
+export function createUploadGate(
+  intervalMs: number,
+  now: () => number = Date.now,
+  rand: () => number = Math.random,
+): UploadGate {
+  let inFlight = false;
+  let failures = 0;
+  let drops = 0;
+  let retryAt = 0;
+  return {
+    canSend: (ignoreBackoff) =>
+      !inFlight && (ignoreBackoff === true || now() >= retryAt),
+    begin: () => {
+      inFlight = true;
+    },
+    end: (outcome) => {
+      inFlight = false;
+      switch (outcome.kind) {
+        case "ok":
+          failures = 0;
+          drops = 0;
+          retryAt = 0;
+          return undefined;
+        case "retry":
+          failures += 1;
+          retryAt =
+            now() +
+            Math.min(60_000, intervalMs * 2 ** failures) * (0.5 + rand() / 2);
+          return undefined;
+        case "drop":
+          failures = 0;
+          retryAt = 0;
+          drops += 1;
+          return drops >= 3 ? "halt" : undefined;
+        case "stop":
+          return "halt";
+      }
+    },
+  };
+}
 
 function safeTimezone(): string | undefined {
   try {
@@ -69,9 +238,11 @@ function safeTimezone(): string | undefined {
 
 function pageContext(): ReplayBatchEnvelope["page"] {
   return {
-    url: window.location.href,
+    // Credential-style query keys (token, jwt, password, …) are masked before
+    // they reach storage, the same as in session_start and navigation events.
+    url: redactUrlForStorage(window.location.href),
     title: document.title,
-    referrer: document.referrer,
+    referrer: redactUrlForStorage(document.referrer),
     userAgent: navigator.userAgent,
     viewport: { width: window.innerWidth, height: window.innerHeight },
     screen: { width: window.screen.width, height: window.screen.height },
@@ -278,7 +449,14 @@ export function createSessionRuntime(config: WebReplayConfig): SessionRuntime {
   writePersistedSession({ sid: sessionId, st: startedAt, la: lastActivityAt });
 
   let segmentId = shortId("seg_");
+  let generation = 0;
   const buffer: ReplayEvent[] = [];
+  // A previous page load of this session held events back for us.
+  const outbox = takeOutbox();
+  const carried: CarriedBatch[] =
+    outbox && outbox.sid === sessionId && (resumed || !!hostSessionId)
+      ? outbox.batches
+      : [];
   // Continue the tab's batch count (see SEQUENCE_STORAGE_KEY).
   let sequence = readStoredSequence();
   // Claim the next batch number: one above the highest used in this tab (by
@@ -296,9 +474,22 @@ export function createSessionRuntime(config: WebReplayConfig): SessionRuntime {
   let timer: number | undefined;
   let lastActivityPersist = now;
 
+  // Prepend un-sent (older) events ahead of anything captured since, preserving
+  // order — without spreading a possibly-large array into unshift() (which can
+  // overflow the call stack). Bound memory during a sustained outage: keep the
+  // OLDEST events — the rrweb FullSnapshot lives there and losing it makes the
+  // whole recording unplayable — dropping the newest beyond the cap.
+  const requeueFront = (events: ReplayEvent[]) => {
+    if (events.length === 0) return;
+    const tail = buffer.splice(0, buffer.length);
+    for (let i = 0; i < events.length; i += 1) buffer.push(events[i]);
+    for (let i = 0; i < tail.length; i += 1) buffer.push(tail[i]);
+    if (buffer.length > MAX_BUFFERED_EVENTS) buffer.length = MAX_BUFFERED_EVENTS;
+  };
+
   const sdk: ReplaySdkDescriptor = {
-    name: config.sdk?.name ?? "@replay/web-sdk",
-    version: config.sdk?.version ?? "0.1.0",
+    name: config.sdk?.name ?? SDK_NAME,
+    version: config.sdk?.version ?? SDK_VERSION,
     platform: config.sdk?.platform ?? "web",
     ...(config.revId ? { revId: config.revId } : {}),
   };
@@ -336,7 +527,11 @@ export function createSessionRuntime(config: WebReplayConfig): SessionRuntime {
       // `sequence` is NOT reset: the tab-wide count continues (claimSequence).
       // The ended session was flushed before we got here; drop any residual so
       // the new session starts clean (its first batch must be full_snapshot-led).
+      // A send of the ended session still in flight that fails later is dropped
+      // too (generation), not requeued into the new session.
       buffer.length = 0;
+      carried.length = 0;
+      generation += 1;
       writePersistedSession({ sid: sessionId, st: startedAt, la: startedAt });
     },
     sdk,
@@ -345,18 +540,13 @@ export function createSessionRuntime(config: WebReplayConfig): SessionRuntime {
       buffer.push(event);
     },
     drain: () => buffer.splice(0, buffer.length),
-    requeue: (events) => {
-      if (events.length === 0) return;
-      // Prepend the un-sent (older) events ahead of anything captured during the
-      // failed send, preserving order — without spreading a possibly-large array
-      // into unshift() (which can overflow the call stack).
-      const tail = buffer.splice(0, buffer.length);
-      for (let i = 0; i < events.length; i += 1) buffer.push(events[i]);
-      for (let i = 0; i < tail.length; i += 1) buffer.push(tail[i]);
-      // Bound memory during a sustained outage: keep the OLDEST events — the rrweb
-      // FullSnapshot lives there and losing it makes the whole recording
-      // unplayable — dropping the newest beyond the cap.
-      if (buffer.length > MAX_BUFFERED_EVENTS) buffer.length = MAX_BUFFERED_EVENTS;
+    get generation() {
+      return generation;
+    },
+    requeue: (events, gen) => {
+      if (gen !== generation) return false;
+      requeueFront(events);
+      return true;
     },
     touch: () => {
       const t = Date.now();
@@ -379,39 +569,90 @@ export function createSessionRuntime(config: WebReplayConfig): SessionRuntime {
     stopAutoFlush: () => {
       if (timer !== undefined) window.clearInterval(timer);
     },
-    flushFinal: (sendFinal) => {
+    flushFinal: (sendFinal, roomFor) => {
+      if (buffer.length === 0) return;
       const events = buffer.splice(0, buffer.length);
-      if (events.length === 0) return;
-      let chunk: ReplayEvent[] = [];
-      let chunkBytes = 0;
-      const ship = () => {
-        if (chunk.length === 0) return;
-        sendFinal({
-          projectId: config.projectId,
-          sessionId,
-          segmentId,
-          sequence: claimSequence(),
-          sentAt: Date.now(),
-          sdk,
-          page: pageContext(),
-          events: chunk,
-        });
-        chunk = [];
-        chunkBytes = 0;
+      const shell: ReplayBatchEnvelope = {
+        projectId: config.projectId,
+        sessionId,
+        segmentId,
+        // Measured with the widest number; the real one is claimed on send.
+        sequence: MAX_SEQUENCE,
+        sentAt: Date.now(),
+        sdk,
+        page: pageContext(),
+        events: [],
       };
+      const take = selectForFinalBatch(events, roomFor(shell));
+      const chosen: ReplayEvent[] = [];
+      const rest: ReplayEvent[] = [];
       for (let i = 0; i < events.length; i += 1) {
-        const ev = events[i];
-        const evBytes = JSON.stringify(ev).length;
-        // Close the current chunk before an event that would overflow it — but
-        // never emit an empty chunk, so a single event over the cap still ships
-        // alone (the best we can do without async compression on unload).
-        if (chunkBytes + evBytes > MAX_FINAL_CHUNK_BYTES && chunk.length > 0) {
-          ship();
-        }
-        chunk.push(ev);
-        chunkBytes += evBytes;
+        (take[i] ? chosen : rest).push(events[i]);
       }
-      ship();
+      const sent =
+        chosen.length > 0 &&
+        sendFinal({ ...shell, sequence: claimSequence(), events: chosen });
+      requeueFront(sent ? rest : events);
+    },
+    carried,
+    stashForNextPage: () => {
+      const batches = carried.slice();
+      if (buffer.length > 0)
+        batches.push({ segmentId, events: buffer.splice(0, buffer.length) });
+      carried.length = 0;
+      if (batches.length === 0) return false;
+      try {
+        const raw = JSON.stringify({ sid: sessionId, batches } satisfies Outbox);
+        if (raw.length > OUTBOX_MAX_CHARS) return false;
+        sessionStorage.setItem(OUTBOX_STORAGE_KEY, raw);
+        return true;
+      } catch {
+        return false; // storage full/blocked: dropped, as before
+      }
+    },
+    restoreFromBfcache: () => {
+      const t = Date.now();
+      const before = sessionId;
+      const beforeSegment = segmentId;
+      let continued = true;
+      if (!hostSessionId) {
+        // Another page in this tab may have refreshed the activity marker or
+        // rotated the session while this one sat in the cache.
+        const prior = readPersistedSession();
+        const la = prior
+          ? Math.max(prior.la, prior.sid === sessionId ? lastActivityAt : 0)
+          : lastActivityAt;
+        if (t - la < inactivityMs) {
+          if (prior && prior.sid !== sessionId) {
+            sessionId = prior.sid;
+            startedAt = prior.st;
+            generation += 1;
+            carried.length = 0;
+          }
+        } else {
+          sessionId = shortId("ses_");
+          startedAt = t;
+          generation += 1;
+          carried.length = 0;
+          continued = false;
+        }
+      }
+      // Events still buffered from before the freeze (not sent yet: held by the
+      // minimum duration, or by the upload gate) belong to the OLD segment: send
+      // them under it. If the session changed they belong to an ended one and
+      // are dropped, like rotate() does.
+      if (sessionId === before && buffer.length > 0) {
+        carried.push({ segmentId: beforeSegment, events: buffer.splice(0, buffer.length) });
+      }
+      buffer.length = 0;
+      // Events a page shown in between left for this session.
+      const outbox = takeOutbox();
+      if (outbox && outbox.sid === sessionId) carried.push(...outbox.batches);
+      segmentId = shortId("seg_");
+      lastActivityAt = t;
+      lastActivityPersist = t;
+      writePersistedSession({ sid: sessionId, st: startedAt, la: t });
+      return continued;
     },
   };
 }

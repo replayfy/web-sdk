@@ -79,6 +79,8 @@ export interface SessionStartEventData {
 }
 
 export interface SessionEndEventData {
+  /** "visibility_hidden" is no longer emitted by the web SDK (a hidden tab's
+   *  session goes on); kept for older SDKs and native platforms. */
   reason: "manual" | "unload" | "visibility_hidden" | "inactivity";
 }
 
@@ -343,6 +345,9 @@ export interface ReplayIngestResponse {
   accepted: boolean;
   acceptedSequence: number;
   sessionId: string;
+  /** With accepted:false: the workspace is over its plan's session allowance;
+   *  stop recording (the SDK stops for the rest of the page). */
+  shouldNotRecord?: boolean;
 }
 
 export interface ReplaySessionSummary {
