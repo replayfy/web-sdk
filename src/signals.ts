@@ -13,6 +13,7 @@ import {
   serializeConsoleArg,
   toHeaderRecord,
   redactUrlForStorage,
+  truncate,
 } from "./utils";
 
 type StopHandle = () => void;
@@ -908,7 +909,8 @@ function cssEscape(s: string): string {
   } catch {
     /* fall through */
   }
-  return s.replace(/([^a-zA-Z0-9_-])/g, "\\$1");
+  // `u`: escape a whole emoji, not each half of its surrogate pair.
+  return s.replace(/([^a-zA-Z0-9_-])/gu, "\\$1");
 }
 
 /** A reasonably-unique, stable CSS path: id → data-* test id → word-like class →
@@ -951,7 +953,7 @@ function cssPath(el: Element | null): string {
     node = node.parentElement;
     depth += 1;
   }
-  return segs.join(" > ").slice(0, 200);
+  return truncate(segs.join(" > "), 200);
 }
 
 function normSpaces(s: string): string {
@@ -963,7 +965,7 @@ function normSpaces(s: string): string {
  *  submit button's caption. Capped at 100 chars. */
 function targetLabel(el: Element | null): string {
   if (!el) return "";
-  const cap = (s: string) => normSpaces(s).slice(0, 100);
+  const cap = (s: string) => truncate(normSpaces(s), 100);
 
   // 1. Author-intent labels on the element itself. `name` is deliberately NOT
   //    here — it is rarely human-facing and used to win over visible text, so a
@@ -1130,7 +1132,7 @@ export function createNetworkCapture(
     let requestBody: string | undefined;
     try {
       if (typeof init?.body === "string")
-        requestBody = String(init.body).slice(0, MAX_BODY);
+        requestBody = truncate(String(init.body), MAX_BODY);
       else if (init?.body instanceof URLSearchParams)
         requestBody = init.body.toString().slice(0, MAX_BODY);
     } catch {
@@ -1146,7 +1148,7 @@ export function createNetworkCapture(
         if (/json|text|xml|javascript|html/i.test(ct)) {
           const clone = response.clone();
           const text = await clone.text();
-          responseBody = text.slice(0, MAX_BODY);
+          responseBody = truncate(text, MAX_BODY);
         }
       } catch {
         /* response body unreadable */
@@ -1268,7 +1270,7 @@ export function createNetworkCapture(
             /json|text|xml|javascript|html/i.test(ct) &&
             typeof this.responseText === "string"
           ) {
-            responseBody = this.responseText.slice(0, MAX_BODY);
+            responseBody = truncate(this.responseText, MAX_BODY);
           }
         } catch {
           /* unreadable */
@@ -1355,7 +1357,7 @@ export function createNetworkCapture(
       try {
         if (!isOwnIngest(urlStr)) {
           let body: string | undefined;
-          if (typeof data === "string") body = data.slice(0, MAX_BODY);
+          if (typeof data === "string") body = truncate(data, MAX_BODY);
           else if (data instanceof URLSearchParams)
             body = data.toString().slice(0, MAX_BODY);
           const at = Date.now();

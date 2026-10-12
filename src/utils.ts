@@ -259,3 +259,15 @@ export function dashboardHostFromApiHost(apiHost: string): string {
     return apiHost.replace(/\/+$/, "");
   }
 }
+
+/**
+ * `s` cut to at most `max` UTF-16 units without splitting a surrogate pair. A
+ * plain `slice` through an emoji leaves half of it, and the ingest stores reject
+ * the whole batch over that one character (this broke real click labels).
+ */
+export function truncate(s: string, max: number): string {
+  if (s.length <= max) return s;
+  const cut = s.slice(0, max);
+  const last = cut.charCodeAt(cut.length - 1);
+  return last >= 0xd800 && last <= 0xdbff ? cut.slice(0, -1) : cut;
+}
