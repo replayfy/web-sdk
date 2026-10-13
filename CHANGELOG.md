@@ -5,7 +5,7 @@ All notable changes to `@replayfyapp/browser` are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.1.18]
 
 ### Fixed
 
@@ -16,13 +16,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (its full snapshot included) or overwrote the earlier page's. The SDK now
   keeps a tab-wide batch counter in sessionStorage (`replay:sq`) and continues
   it on every page load, including after an inactivity rotation and for a
-  host-supplied `sessionId`. A tab whose session began on 0.1.16 has no counter
-  yet, so its first page load after the upgrade starts at 1 again; servers need
-  per-page-load (segment) batch keys to keep that load, so upgrade a
-  self-hosted server before, or together with, this SDK.
+  host-supplied `sessionId`. A tab whose session began on 0.1.17 or earlier
+  has no counter yet, so its first page load after the upgrade starts at 1
+  again and can still collide there, once per tab; every later load is kept.
 - **An unusable `config.sessionId` is ignored with a warning** (not a string,
   over 2000 UTF-8 bytes, or containing control characters) instead of being
-  sent: the ingest rejects such ids, so every batch would fail.
+  sent: the server can't store such ids, so every batch would fail.
 - **`beforeSend` now runs on the hide/unload batch too.** That batch used to
   skip the hook, so data a host scrubs or drops in `beforeSend` left the
   browser on every tab switch and page close. A hook that throws or returns a
@@ -46,11 +45,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Uploads in flight survive navigation.** Small batches are sent with
   `keepalive`; a regular upload still pending when the page goes away is
   re-sent once on `pagehide` (same bytes and sequence, which the server
-  dedupes). The unload batch is now one request sized to the browser's 64 KiB
-  keepalive/beacon allowance (the SDK keeps to 48 KiB so the page's own beacons
-  still fit), measured in real UTF-8 bytes, carrying the session end, errors and
-  page views first; several 55 KB chunks at once got all but the first
-  rejected.
+  dedupes); one too big for that goes to the next page load of the session,
+  still under its sequence. The unload batch is now one request sized to the
+  browser's 64 KiB keepalive/beacon allowance (the SDK keeps to 48 KiB so the
+  page's own beacons still fit), measured in real UTF-8 bytes, carrying the
+  session end, errors and page views first; several 55 KB chunks at once got
+  all but the first rejected.
 - **Rejected uploads are no longer retried forever.** A bad or revoked key
   (401), an origin outside the allow-list (403) or a workspace over its plan
   (`accepted:false`) stops recording for the rest of the page after one
@@ -66,6 +66,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the package version, instead of `@replay/web-sdk` / `0.1.0`).
 - **Credential-style query parameters** (token, jwt, password, …) are masked in
   every batch's page URL and referrer, as they already were in events.
+- **Short visits are no longer cut off on the device.** The SDK held every
+  batch after the first until the workspace's minimum session duration had
+  passed, and threw the held events away when the page closed sooner (errors
+  included). The server already judges short sessions when they settle,
+  keeping the identified ones and those that caught an error, so it now gets
+  every event and decides.
+- **What doesn't fit the unload budget on a same-tab navigation goes to the
+  next page load** of the session instead of being lost, sent under the page
+  it was recorded on (entry page, referrer and UTM tags intact). A tab switch
+  leaves part of the budget free, so a close right after it still sends its
+  `session_end`.
+- **`stop()` stops everything.** A tab that loaded hidden, or a remote config
+  arriving late, no longer starts recording again after `stop()`, and a second
+  call waits for the first.
+- **A stuck upload no longer blocks the rest:** one with no answer after 30 s
+  (longer for a big body, so a slow connection still gets it through) is
+  cancelled and retried.
 - A session switched back on by always-record-errors / identified-users takes a
   fresh full snapshot, so its replay doesn't wait for the next checkout.
 
