@@ -1,4 +1,10 @@
+import { readFileSync } from "node:fs";
 import { defineConfig } from "tsup";
+
+// The real package version, baked into both builds (src/version.ts) so batches
+// report what is actually running instead of a hard-coded default.
+const pkg = JSON.parse(readFileSync("package.json", "utf8")) as { version: string };
+const define = { __REPLAY_SDK_VERSION__: JSON.stringify(pkg.version) };
 
 /**
  * Two build targets from one source.
@@ -24,6 +30,7 @@ export default defineConfig([
     clean: true,
     treeshake: true,
     target: "es2020",
+    define,
   },
   {
     entry: { replay: "src/cdn.ts" },
@@ -36,6 +43,7 @@ export default defineConfig([
     sourcemap: true,
     treeshake: true,
     target: "es2017",
+    define,
     // Don't wipe the npm build emitted by the first config.
     clean: false,
   },

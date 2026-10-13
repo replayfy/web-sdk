@@ -1,3 +1,6 @@
+import type { ReplayBatchEnvelope } from "./schema";
+import type { WebReplayConfig } from "./types";
+
 /**
  * Convert a single console.log argument into something JSON-safe.
  *
@@ -258,6 +261,62 @@ export function dashboardHostFromApiHost(apiHost: string): string {
   } catch {
     return apiHost.replace(/\/+$/, "");
   }
+}
+
+/** Exact UTF-8 byte length of a string (what a request body actually costs).
+ *  `.length` counts UTF-16 units, which undercounts non-ASCII text up to 3x. */
+export function utf8Bytes(s: string): number {
+  let n = 0;
+  for (let i = 0; i < s.length; i += 1) {
+    const c = s.charCodeAt(i);
+    if (c < 0x80) n += 1;
+    else if (c < 0x800) n += 2;
+    else if (c >= 0xd800 && c <= 0xdbff && i + 1 < s.length) {
+      const d = s.charCodeAt(i + 1);
+      if (d >= 0xdc00 && d <= 0xdfff) {
+        n += 4; // a surrogate pair is one 4-byte code point
+        i += 1;
+      } else n += 3; // lone surrogate: encoded as U+FFFD
+    } else n += 3;
+  }
+  return n;
+}
+
+let beforeSendWarned = false;
+
+/**
+ * Run the host's `beforeSend` hook on a batch, for EVERY send path (the regular
+ * flush and the hide/unload batch alike). Fails closed: a hook that throws,
+ * returns a Promise (it must be synchronous) or returns no events drops the
+ * batch instead of sending what the scrubber didn't finish. Warns once per page.
+ */
+export function applyBeforeSend(
+  hook: WebReplayConfig["beforeSend"],
+  envelope: ReplayBatchEnvelope,
+): ReplayBatchEnvelope | null {
+  if (!hook) return envelope;
+  let out: unknown;
+  try {
+    out = hook({ envelope });
+  } catch (e) {
+    warnBeforeSend(`beforeSend threw, batch dropped: ${String(e)}`);
+    return null;
+  }
+  if (out && typeof (out as { then?: unknown }).then === "function") {
+    warnBeforeSend("beforeSend must be synchronous; batch dropped");
+    return null;
+  }
+  const next = (out as { envelope?: ReplayBatchEnvelope } | null)?.envelope;
+  return next && Array.isArray(next.events) && next.events.length > 0
+    ? next
+    : null;
+}
+
+function warnBeforeSend(message: string): void {
+  if (beforeSendWarned) return;
+  beforeSendWarned = true;
+  // eslint-disable-next-line no-console
+  console.warn(`[replay-sdk] ${message}`);
 }
 
 /**

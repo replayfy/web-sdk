@@ -13,6 +13,9 @@ export interface WebReplayConfig extends ReplayPrivacyConfig {
   /** Build / revision id of the deployed app, surfaced as a funnel +
    *  session-search filter so you can scope analysis to one release. */
   revId?: string;
+  /** Use this session id instead of generating one (advanced). It must be a
+   *  string of at most 2000 UTF-8 bytes with no control characters; anything
+   *  else is ignored with a console warning and the SDK generates its own id. */
   sessionId?: string;
   /** The inactivity window (ms) that bounds a session. Defaults to 30 min (the
    *  session-analytics norm, matching GA). "Activity" = genuine engagement —
@@ -55,6 +58,10 @@ export interface WebReplayConfig extends ReplayPrivacyConfig {
    *  resources slow enough to matter and cut event volume sharply. */
   resourceMinDurationMs?: number;
   sdk?: Partial<ReplaySdkDescriptor>;
+  /** Inspect or rewrite every batch before it leaves the browser — including
+   *  the batch sent when the tab is hidden or the page unloads. Must be
+   *  synchronous. Return null (or no events) to drop the batch; a hook that
+   *  throws or returns a Promise also drops it, so nothing unscrubbed is sent. */
   beforeSend?: (event: WebReplayEventContext) => WebReplayEventContext | null;
   fetchImpl?: typeof fetch;
   /** Don't start recording at all when the browser sends Do-Not-Track

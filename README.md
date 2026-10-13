@@ -139,7 +139,7 @@ Only `apiKey` and `apiHost` are required.
 | `projectId` | `string` | — | Optional project identifier, useful when one key spans environments. |
 | `distinctId` | `string` | — | Identify the user at startup (equivalent to calling `identify` immediately). |
 | `revId` | `string` | — | Build / release id of the deployed app, so you can scope replays and funnels to one release. |
-| `sessionId` | `string` | auto | Override the generated session id (advanced; normally left unset). |
+| `sessionId` | `string` | auto | Override the generated session id (advanced; normally left unset). Must be a string of at most 2000 UTF-8 bytes with no control characters; anything else is ignored with a console warning and a generated id is used. |
 | `flushIntervalMs` | `number` | `3000` | How often, in milliseconds, buffered events are sent. |
 | `maxBufferSize` | `number` | — | Maximum number of events to hold in memory between flushes. |
 | `captureConsole` | `boolean` | `true` | Record `console.*` output on the session timeline. |
@@ -156,7 +156,7 @@ Only `apiKey` and `apiHost` are required.
 | `redactUrls` | `Array<string \| RegExp>` | — | Patterns whose matches are stripped from captured URLs. |
 | `excludeUrls` | `string[]` | — | Path globs (`*` = anything but `/`, `**` = anything), e.g. `["/settings/billing", "/admin/**"]`, that opt a page out of recording. On a matching page the SDK records and ships nothing — a per-page opt-out that beats any always-record override and the sample rate. |
 | `sdk` | `object` | — | Override SDK descriptor fields (name/version) reported with each batch. |
-| `beforeSend` | `(event) => event \| null` | — | Inspect or mutate each batch before it's sent; return `null` to drop it. |
+| `beforeSend` | `(event) => event \| null` | — | Inspect or mutate each batch before it's sent, including the one sent when the tab is hidden or the page unloads. Must be synchronous. Return `null` (or a batch with no events) to drop it; if it throws or returns a Promise, the batch is dropped too, so nothing unscrubbed leaves the browser. |
 | `fetchImpl` | `typeof fetch` | `window.fetch` | Custom `fetch` implementation (advanced/testing). |
 
 ## API

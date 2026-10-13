@@ -1,5 +1,6 @@
-import type { ReplayBatchEnvelope } from "./schema";
+import type { ReplayBatchEnvelope, ReplayIngestResponse } from "./schema";
 import type { WebReplayConfig } from "./types";
+import { utf8Bytes } from "./utils";
 
 export interface IdentifyPayload {
   distinctId?: string;
@@ -19,18 +20,78 @@ interface ApiError {
 }
 type ApiResponse<T> = ApiSuccess<T> | ApiError;
 
+/** What a regular send concluded, for the caller to act on:
+ *  - ok:    delivered (2xx, accepted).
+ *  - retry: transient (network/CORS rejection, 408/429/5xx, a non-JSON 2xx such
+ *           as a captive portal). Keep the events and back off.
+ *  - drop:  this batch is unusable (400/413/415 …). Resending it never helps.
+ *  - stop:  nothing this page sends will be accepted (bad key, origin not
+ *           allowed, wrong endpoint, workspace over its plan). */
+export type SendOutcome =
+  | { kind: "ok" }
+  | { kind: "retry"; status?: number }
+  | { kind: "drop"; status: number }
+  | { kind: "stop"; reason: StopReason };
+
+export type StopReason =
+  | "unauthorized"
+  | "forbidden"
+  | "not_found"
+  | "should_not_record";
+
+/** Map an ingest response to a SendOutcome. `body` is the parsed JSON, or
+ *  undefined when the body wasn't JSON. */
+export function classifyBatchResponse(
+  status: number,
+  body: unknown,
+): SendOutcome {
+  if (status >= 200 && status < 300) {
+    const payload = body as ApiResponse<ReplayIngestResponse> | undefined;
+    if (!payload || typeof payload !== "object") return { kind: "retry", status };
+    if (!payload.ok) return { kind: "drop", status };
+    // The only accepted:false the ingest sends is the plan cap (shouldNotRecord).
+    if (!payload.data?.accepted)
+      return { kind: "stop", reason: "should_not_record" };
+    return { kind: "ok" };
+  }
+  if (status === 401) return { kind: "stop", reason: "unauthorized" };
+  if (status === 403) return { kind: "stop", reason: "forbidden" };
+  if (status === 404 || status === 405 || status === 410)
+    return { kind: "stop", reason: "not_found" };
+  if (status === 408 || status === 429 || status >= 500)
+    return { kind: "retry", status };
+  return { kind: "drop", status };
+}
+
 export interface BatchSender {
-  (envelope: ReplayBatchEnvelope, useBeacon?: boolean): Promise<void>;
+  (envelope: ReplayBatchEnvelope): Promise<SendOutcome>;
   setIdentify: (identify: IdentifyPayload | undefined) => void;
   setFingerprint: (fp: string) => void;
   /** Bind the sender to THIS page load's session. Re-attaches a persisted
    *  identity only when the same session resumed; a fresh session is cleared to
    *  anonymous. Call once, before any setIdentify. */
   bindSession: (sessionId: string, resumed: boolean) => void;
-  /** Unload-reliable send for the final flush: a keepalive fetch (survives page
-   *  teardown AND sets the api-key header, so it authenticates even where ?k=
-   *  isn't accepted), falling back to sendBeacon. Fire-and-forget. */
-  sendFinal: (envelope: ReplayBatchEnvelope) => void;
+  /** The session id changed mid-page (inactivity rotation, back/forward-cache
+   *  restore) for the SAME person: re-tag the stored identity so a reload of the
+   *  new session re-attaches it. */
+  retagSession: (sessionId: string) => void;
+  /** Bytes left for the EVENTS of a hide/unload batch shaped like `shell`
+   *  (its events are ignored), within this page's keepalive budget — less
+   *  UNLOAD_RESERVE_BYTES when `keepReserve` (a tab switch: a close may follow
+   *  while this batch is still in flight). */
+  finalRoom: (shell: ReplayBatchEnvelope, keepReserve?: boolean) => number;
+  /** Unload-reliable send for the hide/unload batch: one keepalive fetch (it
+   *  survives page teardown and carries the api-key header), falling back to
+   *  sendBeacon. Fire-and-forget. Returns false, sending nothing, when the
+   *  body doesn't fit the remaining budget, so the caller keeps the events. */
+  sendFinal: (envelope: ReplayBatchEnvelope) => boolean;
+  /** On pagehide: re-send, with keepalive, any regular send still pending
+   *  WITHOUT keepalive (mid-gzip, in backoff, or a large body), using the same
+   *  bytes and sequence — the browser would otherwise cancel it with the page.
+   *  The server dedupes a copy that also landed (same session/segment/sequence).
+   *  Returns the pending envelopes too big to re-send now, so the caller can
+   *  hand them to the next page load; those sends stop retrying either way. */
+  redeliverPending: () => ReplayBatchEnvelope[];
 }
 
 /**
@@ -131,11 +192,50 @@ async function gzipMainThread(json: string): Promise<ArrayBuffer | null> {
   }
 }
 
-/** Retry a failed replay batch a few times before giving up. Transient failures
- *  (network/CORS rejection, 5xx, 429) are retried; a 4xx or a 2xx-but-rejected is
- *  terminal. On a hard outage the caller re-queues the batch for the next flush. */
+/** In-call retries for a transient failure (network/CORS rejection, 408/5xx).
+ *  After the last one the caller keeps the events and backs off. 429 returns
+ *  at once so the caller's backoff, not these quick retries, paces it. */
 const MAX_SEND_ATTEMPTS = 3;
 const SEND_BACKOFF_MS = 300;
+
+/** Browsers cap the request bodies of all in-flight keepalive fetches AND
+ *  sendBeacon calls of one document at 64 KiB in total — the host page's own
+ *  unload beacons included. The SDK keeps to 48 KiB of it. */
+const KEEPALIVE_BUDGET_BYTES = 48 * 1024;
+/** Regular sends use keepalive (so a navigation can't cancel them) only when
+ *  small, and only while at least the rest of the budget stays free for the
+ *  hide/unload batch. Bigger regular sends use a normal fetch. */
+const REGULAR_KEEPALIVE_MAX_BYTES = 16 * 1024;
+const REGULAR_KEEPALIVE_SHARE_BYTES = 24 * 1024;
+/** Kept free by a tab-switch batch and by pagehide's re-sends, so the closing
+ *  batch (session end, errors, page view first) always fits. */
+const UNLOAD_RESERVE_BYTES = 8 * 1024;
+/** sendBeacon reports no completion: its bytes count against the budget for
+ *  this long (browsers send a queued beacon within well under that). */
+const BEACON_HOLD_MS = 10_000;
+/** A regular upload with no response by then is aborted and retried, so one
+ *  hung request (a half-open mobile connection) can't block every later one.
+ *  Bigger bodies get longer, at an assumed floor of 1 KB/s, so a slow but
+ *  working connection still gets a large snapshot through. */
+const SEND_TIMEOUT_MS = 30_000;
+const MIN_UPLOAD_BYTES_PER_MS = 1;
+
+/** Firefox before 133 ignores `keepalive` (the request dies with the page), so
+ *  the unload path uses sendBeacon there. */
+const KEEPALIVE_SUPPORTED =
+  typeof Request !== "undefined" && "keepalive" in Request.prototype;
+
+/** A regular send that hasn't finished yet. */
+interface PendingSend {
+  envelope: ReplayBatchEnvelope;
+  json: string;
+  /** gzip bytes, once compression finished */
+  gz?: ArrayBuffer;
+  /** the request in flight right now uses keepalive (the browser keeps it) */
+  keepaliveActive: boolean;
+  /** re-sent by redeliverPending(): this send must not POST again */
+  superseded: boolean;
+}
 
 /** Where the current tab's identify() payload is stashed, TAGGED with the session
  *  id it belongs to. A reload re-attaches it ONLY when the same session resumed
@@ -223,89 +323,176 @@ export function createBatchSender(config: WebReplayConfig): BatchSender {
     return { body: json, gzip: false };
   };
 
-  const send: BatchSender = async (
-    envelope: ReplayBatchEnvelope,
-    useBeacon = false,
-  ): Promise<void> => {
+  // Regular sends not finished yet (see redeliverPending), and the keepalive
+  // body bytes this sender has in flight (see KEEPALIVE_BUDGET_BYTES).
+  const pending = new Set<PendingSend>();
+  let keepaliveInflight = 0;
+  // Bytes of recent sendBeacon calls, still counted (see BEACON_HOLD_MS).
+  let beaconBytes = 0;
+  const budgetUsed = () => keepaliveInflight + beaconBytes;
+  // Set once a keepalive request was refused but a plain retry right after got
+  // a real HTTP response: this browser rejects keepalive here (some engines
+  // can't combine it with a CORS preflight). Regular sends then skip it, and
+  // the unload path goes straight to sendBeacon.
+  let keepaliveBroken = false;
+  const beaconUrl = () =>
+    `${endpoint}?${new URLSearchParams({ k: config.apiKey }).toString()}`;
+
+  const readJson = async (response: Response): Promise<unknown> => {
+    try {
+      return await response.json();
+    } catch {
+      return undefined;
+    }
+  };
+
+  const send = (async (envelope: ReplayBatchEnvelope): Promise<SendOutcome> => {
     const json = JSON.stringify({
       envelope,
       identify: currentIdentify,
       fingerprint: currentFingerprint,
     });
+    const p: PendingSend = { envelope, json, keepaliveActive: false, superseded: false };
+    pending.add(p);
+    try {
+      const { body, gzip } = await compressBody(json);
+      if (gzip) p.gz = body as ArrayBuffer;
+      // Re-sent on pagehide while compressing: that copy is the delivery.
+      if (p.superseded) return { kind: "ok" };
+      const bytes = gzip ? (body as ArrayBuffer).byteLength : utf8Bytes(json);
+      const headers: Record<string, string> = {
+        "content-type": "application/json",
+        "x-replay-api-key": config.apiKey,
+      };
+      // Content-Encoding: gzip lets the server (express body-parser)
+      // transparently inflate before JSON parsing.
+      if (gzip) headers["content-encoding"] = "gzip";
 
-    if (useBeacon && "sendBeacon" in navigator) {
-      // sendBeacon is sync and can't set headers, so it stays uncompressed and
-      // the key rides as ?k= — it only fires on unload where the last small
-      // batch isn't worth the async gzip round-trip.
-      // The Blob MUST be text/plain, not application/json: the ingest host is
-      // cross-origin to every customer site, and a non-CORS-safelisted
-      // content-type (application/json) turns the POST into a PREFLIGHTED
-      // request — which sendBeacon cannot satisfy, so the browser blocks it
-      // ("CORS error"/provisional headers) and the tail batch is dropped.
-      // text/plain is safelisted → no preflight; the backend parses it as JSON.
-      const url = `${endpoint}?${new URLSearchParams({ k: config.apiKey }).toString()}`;
-      navigator.sendBeacon(url, new Blob([json], { type: "text/plain" }));
-      return;
-    }
-
-    const { body, gzip } = await compressBody(json);
-    const headers: Record<string, string> = {
-      "content-type": "application/json",
-      "x-replay-api-key": config.apiKey,
-    };
-    // Content-Encoding: gzip lets the server (express body-parser)
-    // transparently inflate before JSON parsing.
-    if (gzip) headers["content-encoding"] = "gzip";
-
-    // Retry transient failures with exponential backoff. A fetch rejection
-    // (network/CORS) or a 5xx/429 is transient; a 4xx or a 2xx-but-rejected is
-    // terminal (retrying won't help), so we surface those immediately. After the
-    // last attempt the error propagates and the caller re-queues the batch.
-    let lastError: unknown;
-    for (let attempt = 1; attempt <= MAX_SEND_ATTEMPTS; attempt += 1) {
-      try {
-        const response = await fetchImpl(endpoint, {
-          method: "POST",
-          headers,
-          body,
-        });
-        if (response.ok) {
-          const payload = (await response.json()) as ApiResponse<{
-            accepted: boolean;
-          }>;
-          if (!payload.ok || !payload.data.accepted) {
-            throw new Error("Replay batch rejected by server");
+      let keepaliveRefused = false;
+      for (let attempt = 1; attempt <= MAX_SEND_ATTEMPTS; attempt += 1) {
+        if (p.superseded) return { kind: "ok" };
+        const keepalive =
+          KEEPALIVE_SUPPORTED &&
+          !keepaliveBroken &&
+          !keepaliveRefused &&
+          bytes <= REGULAR_KEEPALIVE_MAX_BYTES &&
+          budgetUsed() + bytes <= REGULAR_KEEPALIVE_SHARE_BYTES;
+        if (keepalive) {
+          keepaliveInflight += bytes;
+          p.keepaliveActive = true;
+        }
+        let outcome: SendOutcome;
+        const abort =
+          typeof AbortController === "function" ? new AbortController() : undefined;
+        let timedOut = false;
+        const timer = abort
+          ? setTimeout(() => {
+              timedOut = true;
+              abort.abort();
+            }, SEND_TIMEOUT_MS + Math.ceil(bytes / MIN_UPLOAD_BYTES_PER_MS))
+          : undefined;
+        try {
+          const response = await fetchImpl(endpoint, {
+            method: "POST",
+            headers,
+            body,
+            ...(keepalive ? { keepalive: true } : {}),
+            ...(abort ? { signal: abort.signal } : {}),
+          });
+          // A real response right after a refused keepalive: keepalive is
+          // what failed, not the network.
+          if (!keepalive && keepaliveRefused) keepaliveBroken = true;
+          outcome = classifyBatchResponse(
+            response.status,
+            await readJson(response),
+          );
+        } catch {
+          // Network/CORS rejection, a timeout, or the browser refused the
+          // keepalive (budget full, old engine) → transient; retry, without
+          // keepalive unless it was only slow.
+          if (keepalive && !timedOut) keepaliveRefused = true;
+          outcome = { kind: "retry" };
+        } finally {
+          if (timer !== undefined) clearTimeout(timer);
+          if (keepalive) {
+            keepaliveInflight -= bytes;
+            p.keepaliveActive = false;
           }
-          return; // delivered
         }
-        // Only 5xx / 429 are worth retrying; any other status is terminal.
-        if (response.status < 500 && response.status !== 429) {
-          throw new Error(`Replay batch failed with status ${response.status}`);
+        // Handed to pagehide's re-send or to the next page load meanwhile: that
+        // copy delivers these events, so a failure here must not requeue them.
+        if (p.superseded && outcome.kind === "retry") return { kind: "ok" };
+        if (outcome.kind !== "retry" || outcome.status === 429) return outcome;
+        if (attempt < MAX_SEND_ATTEMPTS) {
+          await new Promise((r) =>
+            setTimeout(r, SEND_BACKOFF_MS * 2 ** (attempt - 1)),
+          );
         }
-        lastError = new Error(
-          `Replay batch failed with status ${response.status}`,
-        );
-      } catch (e) {
-        // Terminal errors thrown above must not burn retries — re-throw them.
-        if (
-          e instanceof Error &&
-          (e.message.startsWith("Replay batch failed with status") ||
-            e.message === "Replay batch rejected by server")
-        ) {
-          throw e;
-        }
-        // Otherwise it's a network/CORS fetch rejection → retryable.
-        lastError = e;
       }
-      if (attempt < MAX_SEND_ATTEMPTS) {
-        await new Promise((r) =>
-          setTimeout(r, SEND_BACKOFF_MS * 2 ** (attempt - 1)),
-        );
-      }
+      return p.superseded ? { kind: "ok" } : { kind: "retry" };
+    } finally {
+      pending.delete(p);
     }
-    throw lastError instanceof Error
-      ? lastError
-      : new Error("Replay batch send failed after retries");
+  }) as BatchSender;
+
+  // Fire one keepalive POST within the budget (sendBeacon where keepalive isn't
+  // supported, or as the fallback when the fetch is refused). Returns false,
+  // sending nothing, when it doesn't fit.
+  const fireUnloadSafe = (
+    body: string | ArrayBuffer,
+    gzip: boolean,
+    json: string,
+    reserve = 0,
+  ): boolean => {
+    const bytes = typeof body === "string" ? utf8Bytes(body) : body.byteLength;
+    if (budgetUsed() + bytes + reserve > KEEPALIVE_BUDGET_BYTES) return false;
+    if (!KEEPALIVE_SUPPORTED || keepaliveBroken) return beacon(json, reserve);
+    keepaliveInflight += bytes;
+    const release = () => {
+      keepaliveInflight -= bytes;
+    };
+    try {
+      const headers: Record<string, string> = {
+        "content-type": "application/json",
+        "x-replay-api-key": config.apiKey,
+      };
+      if (gzip) headers["content-encoding"] = "gzip";
+      void fetchImpl(endpoint, { method: "POST", headers, body, keepalive: true })
+        .then(release, () => {
+          release();
+          beacon(json);
+        });
+      return true;
+    } catch {
+      release();
+      return beacon(json, reserve);
+    }
+  };
+
+  // sendBeacon can't set headers, so the key rides as ?k= (the backend accepts
+  // either). The Blob is text/plain (a CORS-safelisted type) so this
+  // cross-origin beacon isn't preflighted — application/json would be, and
+  // sendBeacon can't do a preflight, so the browser would CORS-block it. It
+  // shares the 64 KiB budget, so only bodies that fit are tried.
+  const beacon = (json: string, reserve = 0): boolean => {
+    try {
+      if (typeof navigator === "undefined" || !navigator.sendBeacon) return false;
+      const bytes = utf8Bytes(json);
+      if (budgetUsed() + bytes + reserve > KEEPALIVE_BUDGET_BYTES) return false;
+      const queued = navigator.sendBeacon(
+        beaconUrl(),
+        new Blob([json], { type: "text/plain" }),
+      );
+      if (queued) {
+        beaconBytes += bytes;
+        setTimeout(() => {
+          beaconBytes -= bytes;
+        }, BEACON_HOLD_MS);
+      }
+      return queued;
+    } catch {
+      return false; // nothing left to try — the page is going away
+    }
   };
 
   send.bindSession = (sessionId, resumed) => {
@@ -349,43 +536,44 @@ export function createBatchSender(config: WebReplayConfig): BatchSender {
   send.setFingerprint = (fp) => {
     currentFingerprint = fp;
   };
-  const beaconFallback = (json: string) => {
-    try {
-      if (typeof navigator !== "undefined" && navigator.sendBeacon) {
-        // Beacon can't set headers, so the key rides as ?k= (the backend accepts
-        // either). Kept < 55KB per chunk by the caller so it isn't dropped. The
-        // Blob is text/plain (a CORS-safelisted type) so this cross-origin beacon
-        // isn't preflighted — application/json would be, and sendBeacon can't do
-        // a preflight, so the browser would CORS-block it.
-        const url = `${endpoint}?${new URLSearchParams({ k: config.apiKey }).toString()}`;
-        navigator.sendBeacon(url, new Blob([json], { type: "text/plain" }));
-      }
-    } catch {
-      /* nothing left to try — the page is going away */
-    }
+  send.retagSession = (sessionId) => {
+    currentSessionId = sessionId;
+    persistIdentify(sessionId, currentIdentify);
   };
+  send.finalRoom = (shell, keepReserve) =>
+    KEEPALIVE_BUDGET_BYTES -
+    budgetUsed() -
+    (keepReserve ? UNLOAD_RESERVE_BYTES : 0) -
+    utf8Bytes(
+      JSON.stringify({
+        envelope: { ...shell, events: [] },
+        identify: currentIdentify,
+        fingerprint: currentFingerprint,
+      }),
+    );
   send.sendFinal = (envelope) => {
     const json = JSON.stringify({
       envelope,
       identify: currentIdentify,
       fingerprint: currentFingerprint,
     });
-    // Primary: keepalive fetch. It survives the unload and, unlike sendBeacon,
-    // sets the x-replay-api-key HEADER. Only fall back to a beacon if the fetch
-    // rejects/throws while the page is still alive (no double-send on success).
-    try {
-      void fetchImpl(endpoint, {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          "x-replay-api-key": config.apiKey,
-        },
-        body: json,
-        keepalive: true,
-      }).catch(() => beaconFallback(json));
-    } catch {
-      beaconFallback(json);
+    return fireUnloadSafe(json, false, json);
+  };
+  send.redeliverPending = () => {
+    const unsent: ReplayBatchEnvelope[] = [];
+    for (const p of pending) {
+      if (p.keepaliveActive || p.superseded) continue;
+      // The gzip bytes when compression finished (smaller), else the JSON.
+      // Older events, but the closing batch after them must still fit.
+      const sent = p.gz
+        ? fireUnloadSafe(p.gz, true, p.json, UNLOAD_RESERVE_BYTES)
+        : fireUnloadSafe(p.json, false, p.json, UNLOAD_RESERVE_BYTES);
+      // Too big to re-send now: handed back (same sequence) for the next page
+      // load, so this send must not requeue its events as well.
+      p.superseded = true;
+      if (!sent) unsent.push(p.envelope);
     }
+    return unsent;
   };
 
   return send;

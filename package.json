@@ -1,6 +1,6 @@
 {
   "name": "@replayfyapp/browser",
-  "version": "0.1.17",
+  "version": "0.1.18",
   "description": "Replayfy browser SDK — session replay, product analytics, and error capture for the web.",
   "keywords": [
     "session-replay",
@@ -47,6 +47,7 @@
     "build": "tsup",
     "dev": "tsup --watch",
     "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "node --test test/",
     "prepublishOnly": "npm run build"
   },
   "publishConfig": {
@@ -61,6 +62,7 @@
     "web-vitals": "^5.2.0"
   },
   "devDependencies": {
+    "esbuild": "^0.27.7",
     "tsup": "^8.5.1",
     "typescript": "^5.4.5"
   }
