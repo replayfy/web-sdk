@@ -23,15 +23,98 @@ test("a send drained before rotate() is never requeued into the new session", as
   rt.push(ev("custom", 1));
   rt.push(ev("custom", 2));
   const gen = rt.generation;
+  const seg = rt.segmentId;
   const drained = rt.drain();
   rt.rotate();
   rt.push(ev("custom", 3));
-  assert.equal(rt.requeue(drained, gen, rt.segmentId, rt.pageContext()), false);
+  assert.equal(rt.requeue({ segmentId: seg, events: drained, page: rt.pageContext(), sequence: 1, hooked: true }, gen), false);
+  assert.equal(rt.carried.length, 0);
   assert.deepEqual(rt.drain().map((e) => e.id), ["custom-3"]);
-  // same generation: back at the front, in order
-  rt.push(ev("custom", 5));
-  assert.equal(rt.requeue([ev("custom", 4)], rt.generation, rt.segmentId, rt.pageContext()), true);
-  assert.deepEqual(rt.drain().map((e) => e.id), ["custom-4", "custom-5"]);
+  // a failed batch held for a retry is dropped by a later rotation too
+  rt.push(ev("custom", 4));
+  const held = { segmentId: rt.segmentId, events: rt.drain(), page: rt.pageContext(), sequence: 2, hooked: true };
+  assert.equal(rt.requeue(held, rt.generation), true);
+  rt.rotate();
+  assert.equal(rt.carried.length, 0);
+  assert.equal(rt.drain().length, 0);
+});
+
+test("a failed send is requeued whole, ahead of the buffer, keeping its segment, page and sequence", async () => {
+  installBrowser();
+  const { createSessionRuntime } = await load("runtime.ts");
+  const rt = createSessionRuntime(cfg());
+  rt.push(ev("full_snapshot", 1));
+  const page = { ...rt.pageContext(), url: "https://app.test/scrubbed" };
+  const batch = { segmentId: rt.segmentId, events: rt.drain(), page, sequence: rt.nextSequence(), hooked: true };
+  rt.push(ev("custom", 2)); // captured while the send was in flight
+  assert.equal(rt.requeue(batch, rt.generation), true);
+  assert.deepEqual(rt.carried, [batch], "carried as it was sent, not merged into the buffer");
+  assert.deepEqual(rt.drain().map((e) => e.id), ["custom-2"], "newer events stay behind it");
+  // it survives the outbox with its number and its flag
+  rt.requeue(rt.carried.shift(), rt.generation);
+  rt.stashForNextPage();
+  const next = createSessionRuntime(cfg());
+  assert.deepEqual(next.carried.map((c) => [c.segmentId, c.sequence, c.hooked, c.page.url]), [[batch.segmentId, batch.sequence, true, "https://app.test/scrubbed"]]);
+});
+
+test("held events are bounded during an outage: newest dropped, the oldest batch kept whole", async () => {
+  installBrowser();
+  const { createSessionRuntime } = await load("runtime.ts");
+  const rt = createSessionRuntime(cfg());
+  const MAX = 20_000;
+  const batch = (n, from, sequence) => ({
+    segmentId: rt.segmentId,
+    sequence,
+    hooked: true,
+    events: Array.from({ length: n }, (_, i) => ev(i === 0 && from === 0 ? "full_snapshot" : "incremental_snapshot", from + i)),
+  });
+  // a failed 15k batch (the base snapshot first), 10k captured behind it
+  for (let i = 0; i < 10_000; i += 1) rt.push(ev("custom", 100_000 + i));
+  assert.equal(rt.requeue(batch(15_000, 0, 1), rt.generation), true);
+  assert.equal(rt.carried[0].events.length, 15_000);
+  assert.equal(rt.carried[0].events[0].id, "full_snapshot-0");
+  let buf = rt.drain();
+  assert.equal(buf.length, MAX - 15_000, "the buffer fills what is left of the cap");
+  assert.deepEqual([buf[0].id, buf.at(-1).id], ["custom-100000", "custom-104999"], "its oldest events kept");
+  // a newer carried batch never sent (no number) past the cap is cut to its
+  // oldest events; the buffer goes
+  const base = rt.carried.shift();
+  rt.carried.push(batch(8_000, 50_000, undefined));
+  for (let i = 0; i < 1_000; i += 1) rt.push(ev("custom", 200_000 + i));
+  rt.requeue(base, rt.generation);
+  assert.deepEqual(rt.carried.map((c) => [c.sequence, c.events.length]), [[1, 15_000], [undefined, 5_000]]);
+  assert.equal(rt.carried[1].events.at(-1).id, "incremental_snapshot-54999");
+  assert.equal(rt.drain().length, 0);
+  // the oldest batch alone past the cap: kept whole, everything newer dropped
+  rt.carried.length = 0;
+  rt.carried.push(batch(10, 90_000, 4));
+  rt.push(ev("custom", 300_000));
+  rt.requeue(batch(MAX + 5, 0, 3), rt.generation);
+  assert.deepEqual(rt.carried.map((c) => [c.sequence, c.events.length]), [[3, MAX + 5]]);
+  assert.equal(rt.drain().length, 0);
+  // within the cap nothing is dropped
+  rt.carried.length = 0;
+  rt.push(ev("custom", 1));
+  rt.requeue(batch(10, 0, 5), rt.generation);
+  assert.deepEqual([rt.carried[0].events.length, rt.drain().length], [10, 1]);
+});
+
+test("the bound never cuts a batch already sent once: it is dropped whole, with everything newer", async () => {
+  installBrowser();
+  const { createSessionRuntime } = await load("runtime.ts");
+  const rt = createSessionRuntime(cfg());
+  const batch = (n, from, sequence) => ({
+    segmentId: rt.segmentId,
+    sequence,
+    events: Array.from({ length: n }, (_, i) => ev("incremental_snapshot", from + i)),
+  });
+  // an upload an earlier page left unfinished (it may have landed whole), then
+  // this page's leftovers; a 15k failed send goes in front of them
+  rt.carried.push(batch(8_000, 50_000, 2), batch(10, 90_000, undefined));
+  rt.push(ev("custom", 1));
+  rt.requeue(batch(15_000, 0, 1), rt.generation);
+  assert.deepEqual(rt.carried.map((c) => [c.sequence, c.events.length]), [[1, 15_000]], "never resent under seq 2 with less than it had");
+  assert.equal(rt.drain().length, 0);
 });
 
 test("unload batch: one request within the byte budget, most valuable first, rest kept", async () => {
@@ -209,12 +292,19 @@ test("a send that fails after a back/forward-cache restore stays under its own s
   const gen = rt.generation;
   const seg = rt.segmentId;
   const page = { ...rt.pageContext(), url: "https://app.test/before" };
+  const sequence = rt.nextSequence();
   const drained = rt.drain();
+  rt.push(ev("incremental_snapshot", 2)); // buffered after it, before the freeze
   assert.equal(rt.restoreFromBfcache(), true);
-  rt.push(ev("full_snapshot", 2));
-  assert.equal(rt.requeue(drained, gen, seg, page), true);
-  assert.deepEqual(rt.drain().map((e) => e.id), ["full_snapshot-2"], "the new page's batch holds only its own events");
-  assert.deepEqual(rt.carried.map((c) => [c.segmentId, c.page.url, c.events.map((e) => e.id)]), [[seg, "https://app.test/before", ["incremental_snapshot-1"]]]);
+  rt.push(ev("full_snapshot", 3));
+  assert.equal(rt.requeue({ segmentId: seg, events: drained, page, sequence, hooked: true }, gen), true);
+  assert.deepEqual(rt.drain().map((e) => e.id), ["full_snapshot-3"], "the new page's batch holds only its own events");
+  assert.deepEqual(
+    rt.carried.map((c) => [c.segmentId, c.sequence, c.events.map((e) => e.id)]),
+    [[seg, sequence, ["incremental_snapshot-1"]], [seg, undefined, ["incremental_snapshot-2"]]],
+    "the failed batch first, under its number, then what was buffered after it",
+  );
+  assert.equal(rt.carried[0].page.url, "https://app.test/before");
 });
 
 test("unload batch refused once (a beforeSend that grew it) is retried smaller, same sequence", async () => {
@@ -288,15 +378,109 @@ test("carryUnsent: an unfinished upload of this session is carried first, keepin
   const rt = createSessionRuntime(cfg());
   rt.carried.push({ segmentId: "seg_later", events: [ev("custom", 2)] });
   const page = rt.pageContext();
+  const hooked = { sessionId: rt.sessionId, segmentId: rt.segmentId, sequence: 7, sentAt: 1, sdk: rt.sdk, page, events: [ev("full_snapshot", 1)] };
   rt.carryUnsent([
-    { sessionId: rt.sessionId, segmentId: rt.segmentId, sequence: 7, sentAt: 1, sdk: rt.sdk, page, events: [ev("full_snapshot", 1)] },
+    hooked,
+    { sessionId: rt.sessionId, segmentId: rt.segmentId, sequence: 6, sentAt: 1, sdk: rt.sdk, page, events: [ev("custom", 5)] },
     { sessionId: "ses_other", segmentId: "x", sequence: 8, sentAt: 1, sdk: rt.sdk, page, events: [ev("custom", 9)] },
-  ]);
-  assert.deepEqual(rt.carried.map((c) => [c.segmentId, c.sequence]), [[rt.segmentId, 7], ["seg_later", undefined]]);
+  ], (e) => e === hooked);
+  assert.deepEqual(rt.carried.map((c) => [c.segmentId, c.sequence]), [[rt.segmentId, 7], [rt.segmentId, 6], ["seg_later", undefined]]);
+  // flagged only when beforeSend ran on what was sent (the caller knows)
+  assert.deepEqual(rt.carried.map((c) => c.hooked), [true, undefined, undefined]);
   // it survives the outbox with its number
   rt.stashForNextPage();
   const next = createSessionRuntime(cfg());
-  assert.deepEqual(next.carried.map((c) => c.sequence), [7, undefined]);
+  assert.deepEqual(next.carried.map((c) => [c.sequence, c.hooked]), [[7, true], [6, undefined], [undefined, undefined]]);
+});
+
+test("unload: a carried batch beforeSend already ran on is flagged, so the hook isn't run again", async () => {
+  installBrowser();
+  const { createSessionRuntime } = await load("runtime.ts");
+  const rt = createSessionRuntime(cfg());
+  rt.carried.push({ segmentId: rt.segmentId, events: [ev("custom", 1)], page: rt.pageContext(), sequence: 4, hooked: true });
+  rt.carried.push({ segmentId: "seg_outbox", events: [ev("custom", 2)] });
+  rt.push(ev("session_end", 3, { reason: "unload" }));
+  const sent = [];
+  rt.flushFinal((e, hooked) => (sent.push([e.segmentId, e.sequence, hooked]), true), () => 40_000, true);
+  assert.equal(sent.length, 3);
+  assert.deepEqual(sent[0], [rt.segmentId, 4, true], "resent under its number, as it is");
+  assert.equal(sent[1][2], false, "a batch not sent before goes through the hook");
+  assert.equal(sent[2][2], false, "and so does the tail");
+});
+
+test("tab switch: a held failed batch also goes as a copy under its number, and stays carried", async () => {
+  installBrowser();
+  const { createSessionRuntime } = await load("runtime.ts");
+  const rt = createSessionRuntime(cfg());
+  const held = { segmentId: rt.segmentId, events: [ev("incremental_snapshot", 1)], page: rt.pageContext(), sequence: 4, hooked: true };
+  rt.requeue(held, rt.generation);
+  rt.carried.push({ segmentId: "seg_outbox", events: [ev("custom", 2)] });
+  rt.push(ev("custom", 3));
+  const sent = [];
+  const record = (e, hooked) => (sent.push([e.segmentId, e.sequence, hooked, e.events.map((x) => x.id)]), true);
+  rt.flushFinal(record, () => 40_000, false);
+  assert.equal(sent.length, 2, "the copy, then the tail");
+  assert.deepEqual(sent[0], [rt.segmentId, 4, true, ["incremental_snapshot-1"]]);
+  assert.deepEqual(sent[1][3], ["custom-3"]);
+  assert.deepEqual(rt.carried.map((c) => c.sequence), [4, undefined], "both stay carried for the regular flush");
+  // a carried batch never sent before isn't copied (it has no number yet)
+  rt.carried.shift();
+  rt.push(ev("custom", 5));
+  sent.length = 0;
+  rt.flushFinal(record, () => 40_000, false);
+  assert.deepEqual(sent.map((s) => s[3]), [["custom-5"]]);
+  assert.equal(rt.carried.length, 1);
+});
+
+test("unload: a failed send too big to go whole sends its priority events under a new number, and keeps the rest under its own", async () => {
+  installBrowser();
+  const { createSessionRuntime } = await load("runtime.ts");
+  const rt = createSessionRuntime(cfg());
+  const diff = (i) => ev("incremental_snapshot", i, { pad: big(10_000) });
+  const page = { ...rt.pageContext(), url: "https://app.test/old" };
+  const seq = rt.nextSequence(); // claimed when it was first sent
+  rt.requeue({ segmentId: "seg_old", page, sequence: seq, hooked: true, events: [ev("session_start", 1), diff(2), ev("error", 3), diff(4), ev("custom", 5)] }, rt.generation);
+  // an earlier page's leftovers, too big as well: whole or not at all, as before
+  rt.carried.push({ segmentId: "seg_outbox", events: [ev("custom", 6), diff(7)] });
+  rt.push(ev("session_end", 8, { reason: "unload" }));
+  const sent = [];
+  const record = (e, hooked) => (sent.push([e.segmentId, e.sequence, e.page.url, hooked, e.events.map((x) => x.id)]), true);
+  rt.flushFinal(record, () => 20_000, true);
+  assert.equal(sent.length, 2, "the priority part, then the tail");
+  const [part, tail] = sent;
+  assert.deepEqual(part.slice(0, 4), ["seg_old", part[1], "https://app.test/old", true]);
+  assert.ok(part[1] > seq, "a new number");
+  assert.deepEqual(part[4], ["session_start-1", "error-3", "custom-5"]);
+  assert.deepEqual(tail[4], ["session_end-8"]);
+  assert.ok(tail[1] > part[1]);
+  // what is left keeps its number and stays first; nothing else changed
+  assert.deepEqual(rt.carried.map((c) => [c.segmentId, c.sequence, c.events.map((e) => e.id)]), [
+    ["seg_old", seq, ["incremental_snapshot-2", "incremental_snapshot-4"]],
+    ["seg_outbox", undefined, ["custom-6", "incremental_snapshot-7"]],
+  ]);
+  // a tab switch later in the same backoff: the rest is still that failed send
+  rt.flushFinal(record, () => 40_000, false);
+  assert.equal(sent.length, 3);
+  assert.deepEqual(sent[2].slice(1), [seq, "https://app.test/old", true, ["incremental_snapshot-2", "incremental_snapshot-4"]]);
+});
+
+test("tab switch: a held failed batch goes out once per failed send, however often the tab is switched", async () => {
+  installBrowser();
+  const { createSessionRuntime } = await load("runtime.ts");
+  const rt = createSessionRuntime(cfg());
+  const failed = () => ({ segmentId: rt.segmentId, events: [ev("incremental_snapshot", 1)], page: rt.pageContext(), sequence: 4 });
+  rt.requeue(failed(), rt.generation);
+  const sent = [];
+  const record = (e) => (sent.push(e.sequence), true);
+  for (let i = 0; i < 3; i += 1) rt.flushFinal(record, () => 40_000, false);
+  assert.deepEqual(sent, [4], "one copy");
+  assert.equal(rt.carried.length, 1, "kept for the retry");
+  // the retry fails too: that send may go once more
+  rt.carried.shift();
+  rt.requeue(failed(), rt.generation);
+  rt.flushFinal(record, () => 40_000, false);
+  rt.flushFinal(record, () => 40_000, false);
+  assert.deepEqual(sent, [4, 4]);
 });
 
 test("outbox: another project's SDK on the same site never takes it", async () => {

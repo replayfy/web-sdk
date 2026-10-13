@@ -156,7 +156,7 @@ Only `apiKey` and `apiHost` are required.
 | `redactUrls` | `Array<string \| RegExp>` | — | Patterns whose matches are stripped from captured URLs. |
 | `excludeUrls` | `string[]` | — | Path globs (`*` = anything but `/`, `**` = anything), e.g. `["/settings/billing", "/admin/**"]`, that opt a page out of recording. On a matching page the SDK records and ships nothing — a per-page opt-out that beats any always-record override and the sample rate. |
 | `sdk` | `object` | — | Override SDK descriptor fields (name/version) reported with each batch. |
-| `beforeSend` | `(event) => event \| null` | — | Inspect or mutate each batch before it's sent, including the one sent when the tab is hidden or the page unloads. Must be synchronous. Return `null` (or a batch with no events) to drop it; if it throws or returns a Promise, the batch is dropped too, so nothing unscrubbed leaves the browser. |
+| `beforeSend` | `(event) => event \| null` | — | Inspect or mutate each batch before it's sent, including the one sent when the tab is hidden or the page unloads. Must be synchronous. Return `null` (or a batch with no events) to drop it; if it throws or returns a Promise, the batch is dropped too, so nothing unscrubbed leaves the browser. What is sent never goes through it twice: a batch retried after a failed upload is resent as the hook first returned it, under the same sequence (the hook is called again, on a copy, only to let it drop the batch by returning `null`). |
 | `fetchImpl` | `typeof fetch` | `window.fetch` | Custom `fetch` implementation (advanced/testing). |
 
 ## API

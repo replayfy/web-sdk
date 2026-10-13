@@ -9,7 +9,7 @@
     "web-vitals",
     "replayfy"
   ],
-  "license": "BSD-3-Clause",
+  "license": "MIT",
   "author": "Replayfy",
   "homepage": "https://replayfy.app",
   "repository": {

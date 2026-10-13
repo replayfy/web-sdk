@@ -174,6 +174,336 @@ test("5xx: events are kept and delivered once after a backoff", async () => {
   await ctrl.stop();
 });
 
+// Answers 504 (a proxy timeout: the server may have stored the batch anyway)
+// to the next `n` requests once armed; a regular send makes three attempts.
+const failNext = () => {
+  let left = 0;
+  const respond = () => (left > 0 ? ((left -= 1), json(504, {})) : ok());
+  respond.arm = (n = 3) => { left = n; };
+  return respond;
+};
+// A beforeSend that isn't idempotent (like one that hashes a value): it wraps
+// every track() name, and records the names it was given.
+const wrapNames = (seen) => ({ envelope }) => {
+  for (const e of envelope.events) if (e.data?.name) seen.push(e.data.name);
+  const events = envelope.events.map((e) => (e.data?.name ? { ...e, data: { ...e.data, name: `h(${e.data.name})` } } : e));
+  return { envelope: { ...envelope, events } };
+};
+// Every event id mapped to the batch numbers it was sent under.
+const sequencesById = (f) => {
+  const m = new Map();
+  for (const { envelope } of f.calls) {
+    for (const e of envelope.events) m.set(e.id, new Set([...(m.get(e.id) ?? []), envelope.sequence]));
+  }
+  return m;
+};
+
+test("a batch that fails every attempt is resent whole, under the same sequence and segment", async () => {
+  const respond = failNext();
+  const seen = [];
+  const { f, ctrl } = await start({ respond, config: { flushIntervalMs: 100, beforeSend: wrapNames(seen) } });
+  const n = f.calls.length;
+  respond.arm(3);
+  ctrl.track("a");
+  await ctrl.flush();
+  const failed = f.calls.slice(n).map((c) => c.envelope);
+  assert.equal(failed.length, 3, "three attempts, all failed");
+  ctrl.track("b"); // captured during the backoff
+  await sleep(700);
+  const after = f.calls.slice(n + 3).map((c) => c.envelope);
+  assert.ok(after.length >= 2, `resent, then the newer events (${after.length})`);
+  const [resend] = after;
+  assert.deepEqual([resend.sequence, resend.segmentId], [failed[0].sequence, failed[0].segmentId]);
+  assert.deepEqual(resend.events, failed[0].events, "the same batch, nothing merged into it");
+  const newer = after.find((e) => e.events.some((x) => x.data?.name === "h(b)"));
+  assert.ok(newer && newer.sequence > resend.sequence, "newer events under a later number");
+  // the hook ran on it once; on the resend it was only asked (on a copy)
+  assert.deepEqual(seen.filter((s) => ["a", "h(a)"].includes(s)), ["a", "h(a)"]);
+  assert.ok(!all(f).some((e) => e.data?.name?.startsWith("h(h(")), "never sent through the hook twice");
+  for (const [id, seqs] of sequencesById(f)) assert.equal(seqs.size, 1, `${id} sent under one number`);
+  await ctrl.stop();
+});
+
+test("a carried batch whose send fails keeps the number it was first sent under", async () => {
+  const storage = new Map();
+  const { p1, conf } = await overflowingPage1(storage);
+  const seg1 = p1.f.calls[0].envelope.segmentId;
+  let fails = 3;
+  const respond = () => (fails-- > 0 ? json(503, {}) : ok());
+  const p2 = await start({ storage, respond, config: { ...conf, flushIntervalMs: 100 }, href: "https://app.test/product" });
+  await sleep(1_400); // three attempts (~0.9s), the backoff, the resend
+  const sent = p2.f.calls.map((c) => c.envelope);
+  const page1 = sent.filter((e) => e.segmentId === seg1);
+  assert.ok(page1.length >= 4, `three failed attempts, then the resend (${page1.length})`);
+  assert.equal(new Set(page1.map((e) => e.sequence)).size, 1, "one number for every attempt");
+  assert.match(page1.at(-1).page.url, /\/landing\?utm_source=google/, "still under page 1's URL");
+  const own = sent.find((e) => e.segmentId !== seg1);
+  assert.ok(own && own.sequence > page1[0].sequence, "page 2's own events after it");
+  await p2.ctrl.stop();
+});
+
+test("a failed batch still held at close goes in the unload batch, under its number and as the hook left it", async () => {
+  const respond = failNext();
+  const seen = [];
+  const { b, f, ctrl } = await start({ respond, config: { beforeSend: wrapNames(seen) } });
+  const n = f.calls.length;
+  respond.arm(3);
+  ctrl.track("a");
+  await ctrl.flush();
+  const failed = f.calls[n].envelope;
+  b.pagehide(false);
+  await sleep(20);
+  const out = f.calls.slice(n + 3);
+  assert.ok(out.length >= 2, `the held batch, then the tail (${out.length})`);
+  assert.equal(out[0].keepalive, true);
+  assert.deepEqual([out[0].envelope.sequence, out[0].envelope.segmentId], [failed.sequence, failed.segmentId]);
+  assert.deepEqual(out[0].envelope.events, failed.events);
+  assert.deepEqual(seen.filter((s) => ["a", "h(a)"].includes(s)), ["a", "h(a)"], "asked again, on a copy");
+  assert.ok(!all(f).some((e) => e.data?.name?.startsWith("h(h(")), "never sent through the hook twice");
+  const tail = out.at(-1).envelope;
+  assert.ok(types(tail).includes("session_end") && tail.sequence > failed.sequence);
+  await ctrl.stop();
+});
+
+test("a tab switch while a failed batch is held sends a copy under its number, and keeps it for the retry", async () => {
+  const respond = failNext();
+  const { b, f, ctrl } = await start({ respond });
+  const n = f.calls.length;
+  respond.arm(3);
+  ctrl.track("a");
+  await ctrl.flush();
+  const failed = f.calls[n].envelope;
+  ctrl.track("b");
+  b.hide(); // the page may be discarded in the background with no other event
+  await sleep(20);
+  const hidden = f.calls.slice(n + 3);
+  assert.equal(hidden.length, 2, "the copy, then the tail");
+  assert.deepEqual([hidden[0].envelope.sequence, hidden[0].envelope.segmentId], [failed.sequence, failed.segmentId]);
+  assert.deepEqual(hidden[0].envelope.events, failed.events);
+  assert.ok(hidden[1].envelope.events.some((e) => e.data?.name === "b") && hidden[1].envelope.sequence > failed.sequence);
+  // the page lives on: the regular retry resends it under the same number
+  b.show();
+  await ctrl.stop();
+  const resent = f.calls.slice(n + 5).filter((c) => c.envelope.sequence === failed.sequence);
+  assert.equal(resent.length, 1);
+  for (const [id, seqs] of sequencesById(f)) assert.equal(seqs.size, 1, `${id} sent under one number`);
+});
+
+test("stop() during an upload that fails delivers it under its number, then the session end", async () => {
+  const respond = failNext();
+  const { f, ctrl } = await start({ respond });
+  const n = f.calls.length;
+  respond.arm(3);
+  ctrl.track("a");
+  void ctrl.flush();
+  await sleep(50); // in flight
+  await ctrl.stop();
+  const out = f.calls.slice(n).map((c) => c.envelope);
+  assert.equal(out.length, 5, "three failed attempts, the resend, the closing batch");
+  assert.equal(out[3].sequence, out[0].sequence);
+  assert.deepEqual(out[3].events, out[0].events);
+  assert.ok(types(out[4]).includes("session_end") && out[4].sequence > out[0].sequence);
+});
+
+test("stop() while an earlier page's batch fails under it still sends the session end before resolving", async () => {
+  const storage = new Map();
+  const { conf } = await overflowingPage1(storage);
+  let fails = 3;
+  const p2 = await start({ storage, config: conf, respond: () => (fails-- > 0 ? json(503, {}) : ok()) });
+  assert.ok(p2.f.calls.length >= 1, "page 1's batch is in flight");
+  await p2.ctrl.stop();
+  assert.deepEqual(ends(p2.f).map((e) => e.data.reason), ["manual"]);
+});
+
+// A big rrweb diff from the stubbed recorder (an incremental snapshot).
+const bigDiff = (n) => globalThis.__rrweb.emit({ type: 3, timestamp: Date.now(), data: { source: 0, pad: "x".repeat(n) } });
+
+test("a failed batch too big for the unload request still sends its error and custom events at close; the rest keeps its number", async () => {
+  const storage = new Map();
+  const conf = { sessionInactivityMs: 60_000 };
+  const respond = failNext();
+  const p1 = await start({ storage, respond, config: conf });
+  const n = p1.f.calls.length;
+  respond.arm(3);
+  p1.ctrl.captureException(new Error("boom"));
+  p1.ctrl.track("checkout_clicked");
+  for (let i = 0; i < 6; i += 1) bigDiff(12_000);
+  await p1.ctrl.flush();
+  assert.equal(p1.f.calls.length, n + 3, "three failed attempts");
+  const failed = p1.f.calls[n].envelope;
+  p1.b.pagehide(false); // closed during the backoff
+  await sleep(20);
+  const out = p1.f.calls.slice(n + 3).map((c) => c.envelope);
+  const part = out.find((e) => types(e).includes("error"));
+  assert.ok(part, "the error left with the page");
+  assert.deepEqual(types(part).sort(), ["custom", "error"], "only its priority events");
+  assert.ok(part.segmentId === failed.segmentId && part.sequence > failed.sequence, "under its segment, a new number");
+  assert.equal(part.page.url, failed.page.url);
+  assert.ok(!out.some((e) => e.sequence === failed.sequence), "too big to go whole");
+  assert.ok(types(out.at(-1)).includes("session_end"));
+  // a same-tab navigation: the rest (its replay stream) goes under its number
+  const p2 = await start({ storage, config: conf });
+  const rest = p2.f.calls.find((c) => c.envelope.sequence === failed.sequence)?.envelope;
+  assert.ok(rest, "resent by page 2 under its number");
+  assert.deepEqual(rest.events.map((e) => e.id), failed.events.filter((e) => !["error", "custom"].includes(e.type)).map((e) => e.id));
+  for (const [id, seqs] of sequencesById({ calls: [...p1.f.calls.slice(n + 3), ...p2.f.calls] })) {
+    assert.equal(seqs.size, 1, `${id} sent under one number after the failed attempts`);
+  }
+  await p2.ctrl.stop();
+});
+
+test("a tab switch while a failed batch too big to copy is held sends its error now; the retry sends the rest under its number", async () => {
+  const respond = failNext();
+  const { b, f, ctrl } = await start({ respond });
+  const n = f.calls.length;
+  respond.arm(3);
+  ctrl.captureException(new Error("boom"));
+  for (let i = 0; i < 4; i += 1) bigDiff(9_000);
+  await ctrl.flush();
+  const failed = f.calls[n].envelope;
+  ctrl.track("after");
+  b.hide(); // a hidden page can be discarded with no further event
+  await sleep(20);
+  const hidden = f.calls.slice(n + 3).map((c) => c.envelope);
+  const part = hidden.find((e) => types(e).includes("error"));
+  assert.ok(part, "its error went on hide");
+  assert.deepEqual(types(part), ["error"]);
+  assert.ok(part.segmentId === failed.segmentId && part.sequence > failed.sequence);
+  assert.ok(!hidden.some((e) => e.sequence === failed.sequence), "too big to copy whole");
+  b.show();
+  await ctrl.stop();
+  const retried = f.calls.slice(n + 3).map((c) => c.envelope).filter((e) => e.sequence === failed.sequence);
+  assert.equal(retried.length, 1);
+  assert.deepEqual(retried[0].events.map((e) => e.id), failed.events.filter((e) => e.type !== "error").map((e) => e.id));
+  for (const [id, seqs] of sequencesById({ calls: f.calls.slice(n + 3) })) assert.equal(seqs.size, 1, `${id} under one number`);
+});
+
+test("tab switches during one backoff send the held batch once, not once per switch", async () => {
+  const respond = failNext();
+  const { b, f, ctrl } = await start({ respond });
+  const n = f.calls.length;
+  respond.arm(3);
+  ctrl.track("a");
+  await ctrl.flush();
+  const failed = f.calls[n].envelope;
+  for (let i = 0; i < 3; i += 1) {
+    b.hide();
+    await sleep(10);
+    b.show();
+  }
+  const copies = f.calls.slice(n + 3).filter((c) => c.envelope.sequence === failed.sequence);
+  assert.equal(copies.length, 1);
+  await ctrl.stop();
+});
+
+test("a held batch goes again only if beforeSend still lets it: a hook that now returns null drops it", async () => {
+  const respond = failNext();
+  let consent = true;
+  const { b, f, ctrl } = await start({ respond, config: { beforeSend: (ctx) => (consent ? ctx : null) } });
+  const n = f.calls.length;
+  respond.arm(3);
+  ctrl.track("while_consented");
+  await ctrl.flush();
+  consent = false; // the user withdrew consent
+  b.hide(); // no copy on the tab switch
+  await sleep(20);
+  b.show();
+  await ctrl.stop(); // nor when stop() delivers what is left
+  assert.equal(f.calls.length, n + 3, "nothing sent after the withdrawal");
+});
+
+test("a failed batch of a page without beforeSend goes through the hook of the next page that has one", async () => {
+  const storage = new Map();
+  const respond = failNext();
+  const p1 = await start({ storage, respond, config: { sessionInactivityMs: 60_000 } });
+  const n = p1.f.calls.length;
+  respond.arm(3);
+  for (let i = 0; i < 6; i += 1) bigDiff(12_000); // too big for the unload request
+  await p1.ctrl.flush();
+  const failed = p1.f.calls[n].envelope;
+  p1.b.pagehide(false);
+  await sleep(20);
+  const scrub = ({ envelope }) => ({ envelope: { ...envelope, events: envelope.events.map((e) => ({ ...e, data: { ...e.data, scrubbed: true } })) } });
+  const p2 = await start({ storage, config: { sessionInactivityMs: 60_000, beforeSend: scrub } });
+  const again = p2.f.calls.find((c) => c.envelope.sequence === failed.sequence)?.envelope;
+  assert.ok(again, "resent by page 2 under its number");
+  assert.ok(again.events.length > 0 && again.events.every((e) => e.data.scrubbed), "through page 2's hook");
+  await p2.ctrl.stop();
+});
+
+test("an upload in flight at navigation from a page without beforeSend goes through the next page's hook", async () => {
+  const storage = new Map();
+  const respond = (req) => (req.keepalive ? ok() : new Promise(() => {}));
+  const p1 = await start({ storage, config: { sessionInactivityMs: 60_000 }, respond });
+  for (let i = 0; i < 20; i += 1) {
+    const props = {};
+    for (let k = 0; k < 20; k += 1) props[`k${k}`] = randomBytes(150).toString("base64");
+    p1.ctrl.track(`big${i}`, props);
+  }
+  void p1.ctrl.flush();
+  await sleep(150);
+  const pending = p1.f.calls.find((c) => !c.keepalive);
+  assert.ok(pending, "a big normal fetch is in flight");
+  p1.b.pagehide(false);
+  await sleep(20);
+  const p2 = await start({ storage, config: { sessionInactivityMs: 60_000, beforeSend: wrapNames([]) } });
+  const again = p2.f.calls.find((c) => c.envelope.sequence === pending.envelope.sequence)?.envelope;
+  assert.ok(again, "resent by page 2 under the same sequence");
+  const names = again.events.filter((e) => e.type === "custom").map((e) => e.data.name);
+  assert.ok(names.length > 0 && names.every((x) => /^h\(big\d+\)$/.test(x)), "scrubbed by page 2's hook");
+  await p2.ctrl.stop();
+});
+
+test("stop() waits for every send it starts: a held batch's resend fails once under it, then the session end", async () => {
+  const respond = failNext();
+  const { f, ctrl } = await start({ respond });
+  respond.arm(3);
+  ctrl.track("a");
+  await ctrl.flush(); // fails 3x: held, in backoff
+  respond.arm(3); // the first delivery under stop() fails as well
+  await ctrl.stop();
+  assert.equal(ends(f).length, 1, "the session end went before stop() resolved");
+  const count = f.calls.length;
+  await sleep(100);
+  assert.equal(f.calls.length, count, "nothing sent after stop() resolved");
+});
+
+// A beforeSend that edits events in place, like one that hashes a value; with
+// `grow` set it also pads the batch past the keepalive budget.
+const hashInPlace = (state) => ({ envelope }) => {
+  for (const e of envelope.events) if (e.data?.name) e.data.name = `h(${e.data.name})`;
+  if (!state.grow) return { envelope };
+  const pad = { ...envelope.events[0], id: "pad", type: "console", data: { pad: "x".repeat(60_000) } };
+  if (state.grow === "once") state.grow = false;
+  return { envelope: { ...envelope, events: [...envelope.events, pad] } };
+};
+const customNames = (calls) => calls.flatMap((c) => c.envelope.events).filter((e) => e.type === "custom").map((e) => e.data.name);
+
+test("an unload batch retried smaller doesn't run an in-place beforeSend twice on its events", async () => {
+  const state = { grow: false };
+  const { b, f, ctrl } = await start({ config: { beforeSend: hashInPlace(state) } });
+  const n = f.calls.length;
+  ctrl.track("a");
+  state.grow = "once"; // the first try no longer fits; the smaller retry does
+  b.pagehide(false);
+  await sleep(20);
+  assert.deepEqual(customNames(f.calls.slice(n)), ["h(a)"]);
+  await ctrl.stop();
+});
+
+test("an unload batch refused on every try goes back to the buffer as it was, not as an in-place beforeSend left it", async () => {
+  const state = { grow: false };
+  const { b, f, ctrl } = await start({ config: { beforeSend: hashInPlace(state) } });
+  const n = f.calls.length;
+  ctrl.track("a");
+  state.grow = true; // no try fits the keepalive budget
+  b.hide(); // the events stay buffered; the regular flush after it sends them
+  await sleep(50);
+  state.grow = false;
+  await ctrl.stop();
+  assert.deepEqual(customNames(f.calls.slice(n)), ["h(a)"]);
+});
+
 test("inactivity rotation: a failed send of the ended session never lands in the new one", async () => {
   let holdSid = null;
   let releaseHeld;
@@ -435,6 +765,31 @@ test("a large upload still in flight at navigation reaches the next page under i
   const again = p2.f.calls.find((c) => c.envelope.sequence === pending.envelope.sequence);
   assert.ok(again, "resent by page 2 under the same sequence");
   assert.equal(again.envelope.segmentId, pending.envelope.segmentId);
+  await p2.ctrl.stop();
+});
+
+test("an upload carried to the next page goes out as it was sent, not through beforeSend again", async () => {
+  const storage = new Map();
+  const seen = [];
+  const conf = { sessionInactivityMs: 60_000, beforeSend: wrapNames(seen) };
+  const respond = (req) => (req.keepalive ? ok() : new Promise(() => {}));
+  const p1 = await start({ storage, config: conf, respond });
+  for (let i = 0; i < 20; i += 1) {
+    const props = {};
+    for (let k = 0; k < 20; k += 1) props[`k${k}`] = randomBytes(150).toString("base64");
+    p1.ctrl.track(`big${i}`, props);
+  }
+  void p1.ctrl.flush();
+  await sleep(150);
+  const pending = p1.f.calls.find((c) => !c.keepalive);
+  assert.ok(pending, "a big normal fetch is in flight");
+  p1.b.pagehide(false);
+  await sleep(20);
+  const p2 = await start({ storage, config: conf });
+  const again = p2.f.calls.find((c) => c.envelope.sequence === pending.envelope.sequence);
+  assert.ok(again, "resent by page 2 under the same sequence");
+  assert.deepEqual(again.envelope.events, pending.envelope.events, "the same events");
+  assert.ok(!all(p2.f).some((e) => e.data?.name?.startsWith("h(h(")), "never sent through the hook twice");
   await p2.ctrl.stop();
 });
 

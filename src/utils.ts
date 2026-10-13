@@ -312,6 +312,40 @@ export function applyBeforeSend(
     : null;
 }
 
+/**
+ * `applyBeforeSend` on a copy of the batch, for events the SDK keeps when they
+ * aren't sent (the hide/unload batch: a try that doesn't fit is retried
+ * smaller, and what is refused goes back to the buffer). A hook that edits the
+ * events in place then never runs on its own output when they go out later.
+ * The copy costs one serialization of the batch: a hide/unload batch fits the
+ * keepalive budget, and a resend (recheckBeforeSend) only follows a failure.
+ */
+export function applyBeforeSendToCopy(
+  hook: WebReplayConfig["beforeSend"],
+  envelope: ReplayBatchEnvelope,
+): ReplayBatchEnvelope | null {
+  if (!hook) return envelope;
+  // The events are plain JSON (they are sent as JSON), so this is a deep copy.
+  const copy = JSON.parse(JSON.stringify(envelope)) as ReplayBatchEnvelope;
+  return applyBeforeSend(hook, copy);
+}
+
+/**
+ * `beforeSend` for a batch the hook already ran on, resent under the same
+ * sequence (a failed upload's retry). The hook still decides WHETHER it goes —
+ * one that now returns null (consent withdrawn, an opt-out) drops it — but not
+ * what goes: the batch is resent exactly as first sent, since a hook that
+ * isn't idempotent (one that hashes a value) would change it under a number
+ * the server may already hold. The hook gets a copy, so editing it in place
+ * can't change the held batch either.
+ */
+export function recheckBeforeSend(
+  hook: WebReplayConfig["beforeSend"],
+  envelope: ReplayBatchEnvelope,
+): ReplayBatchEnvelope | null {
+  return applyBeforeSendToCopy(hook, envelope) ? envelope : null;
+}
+
 function warnBeforeSend(message: string): void {
   if (beforeSendWarned) return;
   beforeSendWarned = true;
