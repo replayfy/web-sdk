@@ -34,6 +34,7 @@ import {
   applyBeforeSend,
   redactUrlForStorage,
   dashboardHostFromApiHost,
+  truncate,
 } from "./utils";
 import type { ReplayController, WebReplayConfig } from "./types";
 
@@ -1178,7 +1179,7 @@ export function initReplay(config: WebReplayConfig): ReplayController {
   // Persisted so it survives reloads.
   const setAnonymousId: ReplayController["setAnonymousId"] = (id) => {
     if (!id || typeof id !== "string") return;
-    const trimmed = id.trim().slice(0, 200);
+    const trimmed = truncate(id.trim(), 200);
     if (!trimmed) return;
     setStoredFingerprint(trimmed);
     sendBatch.setFingerprint(trimmed);
@@ -1193,8 +1194,8 @@ export function initReplay(config: WebReplayConfig): ReplayController {
       type: "custom",
       data: {
         kind: "session_metadata",
-        key: key.trim().slice(0, 80),
-        value: typeof value === "string" ? value.slice(0, 500) : String(value),
+        key: truncate(key.trim(), 80),
+        value: typeof value === "string" ? truncate(value, 500) : String(value),
       },
     });
     void flush();
@@ -1206,7 +1207,7 @@ export function initReplay(config: WebReplayConfig): ReplayController {
   // consumers that already match `kind: "rage_click" | "dead_click"`.
   const track: ReplayController["track"] = (name, properties) => {
     if (!name || typeof name !== "string") return;
-    const safeName = name.trim().slice(0, 80);
+    const safeName = truncate(name.trim(), 80);
     if (!safeName) return;
     markMeaningful(); // a tracked event is engagement — revives an idle session
     emit({
@@ -1306,10 +1307,10 @@ function safeProps(p: Record<string, unknown>): Record<string, unknown> {
     if (v === null || typeof v === "boolean" || typeof v === "number") {
       out[k] = v;
     } else if (typeof v === "string") {
-      out[k] = v.slice(0, 200);
+      out[k] = truncate(v, 200);
     } else if (Array.isArray(v)) {
       out[k] = v.slice(0, 20).map((x) =>
-        typeof x === "string" ? x.slice(0, 200) : x,
+        typeof x === "string" ? truncate(x, 200) : x,
       );
     } else if (v && typeof v === "object") {
       // Flatten one level — { from: "free", to: "pro" } is the
@@ -1317,7 +1318,7 @@ function safeProps(p: Record<string, unknown>): Record<string, unknown> {
       try {
         out[k] = JSON.parse(JSON.stringify(v));
       } catch {
-        out[k] = String(v).slice(0, 200);
+        out[k] = truncate(String(v), 200);
       }
     }
   }

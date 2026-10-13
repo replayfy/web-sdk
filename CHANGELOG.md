@@ -69,6 +69,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A session switched back on by always-record-errors / identified-users takes a
   fresh full snapshot, so its replay doesn't wait for the next checkout.
 
+## [0.1.17]
+
+### Fixed
+
+- **Text is never cut through an emoji.** Click labels were capped with a plain
+  `slice(0, 100)`; when an emoji straddled the cut, half of it (a lone UTF-16
+  surrogate) went out with the batch and the ingest stores rejected the whole
+  batch over that one character. A new `truncate()` helper cuts on whole
+  characters and is used for click labels, CSS paths, network request and
+  response bodies (fetch, XHR, beacon), `track()` names and properties,
+  `setMetadata()` keys and values, and `setAnonymousId()`.
+- The CSS-escape fallback (used where `CSS.escape` is unavailable) escapes a
+  whole emoji instead of inserting a backslash between its two halves.
+
 ## [0.1.16]
 
 ### Fixed
