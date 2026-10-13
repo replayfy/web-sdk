@@ -4,7 +4,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
-import { installBrowser, load, makeFetch, ok, json, sleep, types, TEST_SDK_VERSION } from "./helpers.mjs";
+import { installBrowser, load, makeFetch, ok, json, sleep, types, readOutbox, TEST_SDK_VERSION } from "./helpers.mjs";
 
 const remoteCfg = (o = {}) => ({
   workspaceId: 1,
@@ -278,43 +278,209 @@ test("a regular send still pending at pagehide is re-delivered (same sequence)",
   assert.equal(again[0].envelope.segmentId, pending.envelope.segmentId);
 });
 
-test("minimum duration: the first page of a multi-page visit is kept, a bounce is not", async () => {
-  const storage = new Map();
-  const remote = remoteCfg({ minDurationMs: 1500 });
+test("a short visit is uploaded at once, whatever the minimum duration (the server judges it)", async () => {
+  const { b, f } = await start({ remote: remoteCfg({ minDurationMs: 60_000 }) });
+  assert.ok(f.calls.length >= 1 && types(f.calls[0].envelope).includes("full_snapshot"), "first batch right away");
+  globalThis.__emitError({ message: "boom" });
+  b.pagehide(false);
+  await sleep(20);
+  const t = all(f).map((e) => e.type);
+  assert.ok(t.includes("error") && t.includes("session_end"), t.join(","));
+});
+
+test("stop() before the first show or a slow remote config leaves nothing recording", async () => {
+  // a tab loaded hidden, stopped, then shown
+  const b = installBrowser({ visible: false });
+  const f = makeFetch();
+  const { initReplay } = await load("initReplay.ts", { stub: true });
+  const ctrl = initReplay({ apiKey: "k", apiHost: "https://api.test", flushIntervalMs: 1e9, fetchImpl: f });
+  await ctrl.stop();
+  assert.equal(b.document.count("visibilitychange"), 0);
+  b.show();
+  await sleep(450);
+  assert.ok(!globalThis.__rrweb.recording, "rrweb never started");
+  assert.equal(f.calls.length, 0);
+
+  // stop() while the remote config is slower than the 300ms race, then it arrives
+  installBrowser();
+  let deliver;
+  globalThis.__remoteConfig = () => new Promise((r) => { deliver = r; });
+  const f2 = makeFetch();
+  const { initReplay: init2 } = await load("initReplay.ts", { stub: true });
+  const c2 = init2({ apiKey: "k", apiHost: "https://api.test", flushIntervalMs: 1e9, fetchImpl: f2 });
+  await sleep(50);
+  await c2.stop();
+  await sleep(350); // the race's timeout branch runs now
+  deliver(remoteCfg());
+  await sleep(50);
+  assert.ok(!globalThis.__rrweb.recording, "neither the timeout branch nor the late config re-installs rrweb");
+});
+
+// Page 1 buffers more than the unload budget, then a same-tab navigation.
+async function overflowingPage1(storage) {
   const conf = { sessionInactivityMs: 60_000 };
-  // page 1: under the minimum the whole time, then a same-tab navigation
-  const p1 = await start({ storage, remote, config: conf });
-  p1.ctrl.track("on-page-1");
-  assert.equal(p1.f.calls.length, 0, "held: under the minimum duration");
+  const p1 = await start({ storage, config: conf, href: "https://app.test/landing?utm_source=google" });
+  for (let i = 0; i < 160; i += 1) p1.ctrl.track(`t${i}`, { v: randomBytes(300).toString("base64") });
   p1.b.pagehide(false);
   await sleep(20);
-  assert.equal(p1.f.calls.length, 0, "nothing uploaded on the way out");
-  const outbox = JSON.parse(storage.get("replay:outbox"));
-  const seg1 = outbox.batches[0].segmentId;
-  // page 2 continues the session; once past the minimum, page 1 goes first
-  const p2 = await start({ storage, remote, config: conf });
-  await sleep(1200);
-  await p2.ctrl.flush();
-  await p2.ctrl.flush();
-  const [first, second] = p2.f.calls.map((c) => c.envelope);
-  assert.equal(first.segmentId, seg1, "page 1's events under page 1's segment");
-  assert.ok(types(first).includes("full_snapshot"));
-  assert.ok(first.events.some((e) => e.data?.name === "on-page-1"));
-  assert.deepEqual(first.events.filter((e) => e.type === "session_end").map((e) => e.data.reason), ["unload"]);
-  assert.notEqual(second.segmentId, seg1);
-  assert.equal(second.sessionId, first.sessionId);
-  await p2.ctrl.stop();
+  const sentNames = all(p1.f).filter((e) => e.type === "custom").map((e) => e.data.name);
+  return { p1, conf, sentNames };
+}
 
-  // a bounce: under the minimum and no page continues the session
-  const bounce = await start({ remote, config: conf });
-  bounce.ctrl.track("x");
-  bounce.b.pagehide(false);
+test("what doesn't fit the unload budget on a navigation reaches the next page, under its own page", async () => {
+  const storage = new Map();
+  const { p1, conf, sentNames } = await overflowingPage1(storage);
+  assert.ok(sentNames.length > 0 && sentNames.length < 160, `unload batch carried ${sentNames.length}`);
+  const seg1 = p1.f.calls[0].envelope.segmentId;
+  const p2 = await start({ storage, config: conf, href: "https://app.test/product" });
+  const first = p2.f.calls[0].envelope;
+  assert.equal(first.segmentId, seg1, "page 1's leftovers under page 1's segment");
+  assert.match(first.page.url, /\/landing\?utm_source=google/, "and page 1's URL");
+  const late = first.events.filter((e) => e.type === "custom").map((e) => e.data.name);
+  assert.equal(new Set([...sentNames, ...late]).size, 160, "nothing lost");
+  await p2.ctrl.stop();
+});
+
+test("a page 2 that leaves before its snapshot hands page 1's leftovers on", async () => {
+  const storage = new Map();
+  const { p1, conf } = await overflowingPage1(storage);
+  const seg1 = p1.f.calls[0].envelope.segmentId;
+  // page 2: a redirect, gone before rrweb even started
+  const b2 = installBrowser({ storage });
+  const { initReplay } = await load("initReplay.ts", { stub: true });
+  initReplay({ apiKey: "k", apiHost: "https://api.test", flushIntervalMs: 1e9, fetchImpl: makeFetch(), ...conf });
+  b2.pagehide(false);
+  const outbox = readOutbox(storage);
+  assert.equal(outbox.batches[0].segmentId, seg1, "page 1's leftovers first");
+  assert.equal(outbox.batches.length, 2, "then the redirect page's own events (its page view)");
+  assert.notEqual(outbox.batches[1].segmentId, seg1);
+});
+
+test("a redirect before the first snapshot keeps the landing page's session_start, URL and UTM tags", async () => {
+  const storage = new Map();
+  const conf = { sessionInactivityMs: 60_000 };
+  const b1 = installBrowser({ storage, href: "https://app.test/landing?utm_source=google" });
+  globalThis.__remoteConfig = () => new Promise(() => {}); // slow config: rrweb waits for the 300ms race
+  const { initReplay } = await load("initReplay.ts", { stub: true });
+  initReplay({ apiKey: "k", apiHost: "https://api.test", flushIntervalMs: 1e9, fetchImpl: makeFetch(), ...conf });
+  await sleep(50); // before the 300ms remote-config race → no snapshot yet
+  b1.pagehide(false);
+  const p2 = await start({ storage, config: conf, href: "https://app.test/home" });
+  const first = p2.f.calls[0].envelope;
+  assert.match(first.page.url, /\/landing\?utm_source=google/);
+  assert.ok(types(first).includes("session_start"), types(first).join(","));
+  await p2.ctrl.stop();
+});
+
+test("leftovers are handed on when the page goes into the back/forward cache too", async () => {
+  const storage = new Map();
+  const conf = { sessionInactivityMs: 60_000 };
+  const p1 = await start({ storage, config: conf });
+  for (let i = 0; i < 160; i += 1) p1.ctrl.track(`t${i}`, { v: randomBytes(300).toString("base64") });
+  p1.b.pagehide(true);
   await sleep(20);
-  assert.equal(bounce.f.calls.length, 0);
-  // the tab is gone (its sessionStorage with it); a new tab never sends it
-  const other = await start({ remote, config: conf });
-  await sleep(1200);
-  await other.ctrl.flush();
-  assert.ok(other.f.calls.every((c) => !c.envelope.events.some((e) => e.data?.name === "x")));
-  await other.ctrl.stop();
+  const sent = all(p1.f).filter((e) => e.type === "custom").map((e) => e.data.name);
+  const p2 = await start({ storage, config: conf });
+  await p2.ctrl.flush();
+  const late = all(p2.f).filter((e) => e.type === "custom").map((e) => e.data.name);
+  assert.equal(new Set([...sent, ...late]).size, 160, "nothing lost");
+  await p2.ctrl.stop();
+});
+
+test("a page that doesn't record still hands an earlier page's leftovers on", async () => {
+  const storage = new Map();
+  const conf = { sessionInactivityMs: 60_000 };
+  const p1 = await start({ storage, config: conf });
+  for (let i = 0; i < 160; i += 1) p1.ctrl.track(`t${i}`, { v: randomBytes(300).toString("base64") });
+  p1.b.pagehide(false);
+  await sleep(20);
+  const seg1 = p1.f.calls[0].envelope.segmentId;
+  const p2 = await start({ storage, config: { ...conf, excludeUrls: ["/a"] } });
+  p2.b.pagehide(false);
+  const outbox = readOutbox(storage);
+  assert.deepEqual(outbox.batches.map((x) => x.segmentId), [seg1]);
+});
+
+test("an earlier page's batch doesn't delay this page's first snapshot", async () => {
+  const storage = new Map();
+  const conf = { sessionInactivityMs: 60_000 };
+  const p1 = await start({ storage, config: conf });
+  for (let i = 0; i < 160; i += 1) p1.ctrl.track(`t${i}`, { v: randomBytes(300).toString("base64") });
+  p1.b.pagehide(false);
+  await sleep(20);
+  const p2 = await start({ storage, config: conf });
+  const segs = p2.f.calls.map((c) => c.envelope.segmentId);
+  assert.equal(segs.length, 2, "page 1's leftovers, then page 2's snapshot batch, without waiting a flush interval");
+  assert.ok(types(p2.f.calls[1].envelope).includes("full_snapshot"));
+  await p2.ctrl.stop();
+});
+
+test("a large upload still in flight at navigation reaches the next page under its own sequence", async () => {
+  const storage = new Map();
+  const conf = { sessionInactivityMs: 60_000 };
+  const respond = (req) => (req.keepalive ? ok() : new Promise(() => {}));
+  const p1 = await start({ storage, config: conf, respond });
+  for (let i = 0; i < 20; i += 1) {
+    const props = {};
+    for (let k = 0; k < 20; k += 1) props[`k${k}`] = randomBytes(150).toString("base64");
+    p1.ctrl.track(`big${i}`, props);
+  }
+  void p1.ctrl.flush();
+  await sleep(150);
+  const pending = p1.f.calls.find((c) => !c.keepalive);
+  assert.ok(pending, "a big normal fetch is in flight");
+  p1.b.pagehide(false);
+  await sleep(20);
+  const p2 = await start({ storage, config: conf });
+  const again = p2.f.calls.find((c) => c.envelope.sequence === pending.envelope.sequence);
+  assert.ok(again, "resent by page 2 under the same sequence");
+  assert.equal(again.envelope.segmentId, pending.envelope.segmentId);
+  await p2.ctrl.stop();
+});
+
+test("track() after stop() doesn't rotate an idle session", async () => {
+  const { b, ctrl } = await start({ config: { sessionInactivityMs: 300 } });
+  await sleep(600); // ended for inactivity
+  const before = JSON.parse(b.store.get("replay:ses")).sid;
+  await ctrl.stop();
+  ctrl.track("after-stop");
+  assert.equal(JSON.parse(b.store.get("replay:ses")).sid, before);
+});
+
+test("back/forward-cache restore into a new session records a page view", async () => {
+  const { b, f, ctrl } = await start({ config: { sessionInactivityMs: 400 } });
+  const sid = f.calls[0].envelope.sessionId;
+  b.pagehide(true);
+  b.hide();
+  await sleep(700);
+  b.show();
+  b.pageshow(true);
+  await sleep(60);
+  const t = f.calls.map((c) => c.envelope).filter((e) => e.sessionId !== sid).flatMap(types);
+  assert.ok(t.includes("session_start") && t.includes("navigation") && t.includes("full_snapshot"), t.join(","));
+  await ctrl.stop();
+});
+
+test("tab switch then close while that batch is in flight: the close still sends its session_end", async () => {
+  const respond = () => new Promise(() => {}); // nothing ever completes
+  const { b, f, ctrl } = await start({ respond });
+  // many small events: the tab-switch batch fills the budget to within one of them
+  for (let i = 0; i < 160; i += 1) ctrl.track(`t${i}`, { v: randomBytes(300).toString("base64") });
+  b.hide();
+  await sleep(150);
+  b.pagehide(false);
+  await sleep(20);
+  assert.deepEqual(ends(f).map((e) => e.data.reason), ["unload"]);
+});
+
+test("a beforeSend that grows the unload batch still gets the session_end out", async () => {
+  const pad = ({ envelope }) => ({ envelope: { ...envelope, events: envelope.events.map((e) => ({ ...e, data: { ...e.data, pad: "p".repeat(1500) } })) } });
+  const { b, f, ctrl } = await start({ config: { beforeSend: pad } });
+  const n = f.calls.length;
+  for (let i = 0; i < 40; i += 1) ctrl.track(`t${i}`, { v: "x".repeat(300) });
+  b.pagehide(false);
+  await sleep(20);
+  const out = f.calls.slice(n);
+  assert.ok(out.length >= 1, "something was sent");
+  assert.deepEqual(ends(f).map((e) => e.data.reason), ["unload"]);
 });

@@ -34,8 +34,16 @@ interface SessionRuntime {
   /** Put un-sent events back at the FRONT of the buffer after a failed send, so
    *  the next flush retries them instead of dropping the batch. Bounded. Events
    *  drained under an older generation belong to a session that has since
-   *  ended: they are dropped (returns false), never shipped under the new id. */
-  requeue: (events: ReplayEvent[], generation: number) => boolean;
+   *  ended: they are dropped (returns false), never shipped under the new id.
+   *  Events drained under an older segment of the same session (the page came
+   *  back from the back/forward cache meanwhile) are carried under that
+   *  segment, never mixed into the new page's batches. */
+  requeue: (
+    events: ReplayEvent[],
+    generation: number,
+    segmentId: string,
+    page: ReplayBatchEnvelope["page"],
+  ) => boolean;
   /** Mark genuine USER activity (an interaction) so a subsequent reload within
    *  the inactivity window continues this session. Cheap + throttled — safe to
    *  call on every pointer/scroll/key event. */
@@ -61,20 +69,31 @@ interface SessionRuntime {
    *  just get the later ones rejected). It carries the most valuable events
    *  first (selectForFinalBatch); everything else goes back to the buffer, so
    *  if the page lives on (a tab switch, a back/forward-cache page) the next
-   *  regular flush sends it. `sendFinal` returns false when nothing was sent. */
+   *  regular flush sends it. With `withCarried` (the page is going away; a tab
+   *  switch leaves them to the regular flush, which retries), batches carried
+   *  from an earlier page load go out first, whole, while they leave
+   *  FINAL_TAIL_ROOM_BYTES for this one. `sendFinal` returns false when nothing
+   *  was sent. */
   flushFinal: (
     sendFinal: (envelope: ReplayBatchEnvelope) => boolean,
     roomFor: (shell: ReplayBatchEnvelope) => number,
+    withCarried: boolean,
   ) => void;
-  /** Batches an earlier page load of THIS session held back (minimum duration
-   *  not reached) when it went away; the next flushes send them first, each
-   *  under its own segment. Mutable: the caller takes from the front. */
+  /** Uploads of this session the page is leaving behind unfinished (too big to
+   *  re-send within the unload budget): carried, under their own segment, page
+   *  and sequence, ahead of everything else. Other sessions' are dropped. */
+  carryUnsent: (envelopes: ReplayBatchEnvelope[]) => void;
+  /** Batches an earlier page load of THIS session couldn't send before it went
+   *  away (past the unload budget), or a send that failed after a
+   *  back/forward-cache restore; the next flushes send them first, each under
+   *  its own segment and page. Mutable: the caller takes from the front. */
   carried: CarriedBatch[];
-  /** The page is going away while the session is still under its minimum
-   *  duration: hand the buffer (and anything still carried) to the next page
-   *  load of this session in this tab, through sessionStorage. Returns false
-   *  when there was nothing to keep or it didn't fit (then it's dropped). */
-  stashForNextPage: () => boolean;
+  /** The page is going away with events it couldn't send (past the unload
+   *  budget, or before its first snapshot): hand anything still carried, and
+   *  the buffer unless `carriedOnly`, to the next page load of this session in
+   *  this tab, through sessionStorage. Returns false when there was nothing to
+   *  keep or it didn't fit (then it's dropped). */
+  stashForNextPage: (carriedOnly?: boolean) => boolean;
   /** The page came back from the back/forward cache. Decide its identity the
    *  way a page load would (continue the tab's session when its last activity
    *  is within the inactivity window, else start a new one) and always start a
@@ -83,19 +102,43 @@ interface SessionRuntime {
   restoreFromBfcache: () => boolean;
 }
 
-/** A page load's events waiting to be sent under that page load's segment. */
+/** How many times the hide/unload batch is tried, halving its room each time. */
+const FINAL_BATCH_TRIES = 4;
+
+/** Budget a carried batch must leave free on hide/unload for the current page's
+ *  own tail (its session end, errors and page view come first in it). */
+const FINAL_TAIL_ROOM_BYTES = 8 * 1024;
+
+/** A page load's events waiting to be sent under that page load's segment,
+ *  with that page's context: the server takes a session's entry page, referrer
+ *  and UTM tags from its first batch, so a landing page's held events must not
+ *  go out under the next page's URL. */
 export interface CarriedBatch {
   segmentId: string;
   events: ReplayEvent[];
+  page?: ReplayBatchEnvelope["page"];
+  /** Set for a batch already sent once (an upload the page left before it
+   *  finished): resent under the same number, so a copy that did land is
+   *  deduped by the server instead of stored twice. */
+  sequence?: number;
 }
 
-/** Where a page leaves events it held back (the session hasn't reached its
- *  minimum duration yet) for the next page load of the same session in this
- *  tab: a same-tab navigation continues the session, so the first page's
- *  events must not be discarded as a "bounce". If no page continues the
- *  session (tab closed, session expired), they're discarded with the tab — a
- *  real bounce is still never uploaded. */
+/** Where a page that is going away leaves the events it couldn't send (past
+ *  the browser's unload budget) for the next page load of the same session in
+ *  this tab: a same-tab navigation continues the session, so they still reach
+ *  the server. If no page continues the session (tab closed, session expired),
+ *  they're discarded with the tab. One outbox per ingest host + key (see
+ *  outboxKey), so another project's SDK on the same site never sends them. */
 const OUTBOX_STORAGE_KEY = "replay:outbox";
+
+/** The outbox key for one ingest host + api key: a short hash, so the key
+ *  itself isn't repeated in storage. */
+function outboxKey(config: WebReplayConfig): string {
+  const owner = `${config.apiHost}|${config.apiKey}`;
+  let h = 5381;
+  for (let i = 0; i < owner.length; i += 1) h = ((h * 33) ^ owner.charCodeAt(i)) >>> 0;
+  return `${OUTBOX_STORAGE_KEY}:${h.toString(36)}`;
+}
 
 /** Cap on what the outbox may hold, in UTF-16 code units: sessionStorage is
  *  shared with the host page (quota ~5 MB), so a bigger hold is dropped. */
@@ -107,11 +150,11 @@ interface Outbox {
 }
 
 /** Read and always remove the outbox: it is for the very next page load. */
-function takeOutbox(): Outbox | null {
+function takeOutbox(key: string): Outbox | null {
   try {
-    const raw = sessionStorage.getItem(OUTBOX_STORAGE_KEY);
+    const raw = sessionStorage.getItem(key);
     if (raw === null) return null;
-    sessionStorage.removeItem(OUTBOX_STORAGE_KEY);
+    sessionStorage.removeItem(key);
     const o = JSON.parse(raw) as Partial<Outbox>;
     if (typeof o.sid !== "string" || !Array.isArray(o.batches)) return null;
     const batches = o.batches.filter(
@@ -119,7 +162,10 @@ function takeOutbox(): Outbox | null {
         !!b &&
         typeof b.segmentId === "string" &&
         Array.isArray(b.events) &&
-        b.events.length > 0,
+        b.events.length > 0 &&
+        (b.page === undefined || (typeof b.page === "object" && b.page !== null)) &&
+        (b.sequence === undefined ||
+          (Number.isInteger(b.sequence) && b.sequence > 0 && b.sequence <= MAX_SEQUENCE)),
     );
     return { sid: o.sid, batches };
   } catch {
@@ -326,10 +372,24 @@ const MAX_SEQUENCE = 2_147_483_647;
 /** Largest host-supplied sessionId the ingest accepts, in UTF-8 bytes. */
 const MAX_SESSION_ID_BYTES = 2000;
 
-/** Characters the ingest rejects in an id: C0 controls (incl. NUL) and lone
- *  UTF-16 surrogates. */
-const INVALID_ID_CHARS =
-  /[\u0000-\u001F\u007F]|[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+/** True when `id` holds a character the ingest rejects in an id: a C0 control
+ *  (incl. NUL), DEL, or a lone UTF-16 surrogate. A char-code scan, not a regex:
+ *  the lookbehind a regex needs for lone low surrogates is a syntax error in
+ *  Safari before 16.4, which would stop the whole bundle from loading there. */
+function hasInvalidIdChar(id: string): boolean {
+  for (let i = 0; i < id.length; i += 1) {
+    const c = id.charCodeAt(i);
+    if (c <= 0x1f || c === 0x7f) return true;
+    if (c >= 0xd800 && c <= 0xdbff) {
+      const next = i + 1 < id.length ? id.charCodeAt(i + 1) : 0;
+      if (next < 0xdc00 || next > 0xdfff) return true;
+      i += 1; // a valid pair: skip its low half
+    } else if (c >= 0xdc00 && c <= 0xdfff) {
+      return true;
+    }
+  }
+  return false;
+}
 
 /** Don't persist the last-activity marker on every pointer/scroll event — once
  *  every few seconds keeps the reload window accurate at negligible cost. The
@@ -351,7 +411,7 @@ function isUsableSessionId(id: unknown): id is string {
     typeof id === "string" &&
     id.length > 0 &&
     new TextEncoder().encode(id).length <= MAX_SESSION_ID_BYTES &&
-    !INVALID_ID_CHARS.test(id)
+    !hasInvalidIdChar(id)
   );
 }
 
@@ -452,7 +512,8 @@ export function createSessionRuntime(config: WebReplayConfig): SessionRuntime {
   let generation = 0;
   const buffer: ReplayEvent[] = [];
   // A previous page load of this session held events back for us.
-  const outbox = takeOutbox();
+  const stashKey = outboxKey(config);
+  const outbox = takeOutbox(stashKey);
   const carried: CarriedBatch[] =
     outbox && outbox.sid === sessionId && (resumed || !!hostSessionId)
       ? outbox.batches
@@ -506,7 +567,7 @@ export function createSessionRuntime(config: WebReplayConfig): SessionRuntime {
       return segmentId;
     },
     // Live getter — `beginFreshClock()` can re-anchor it at the visibility-gated
-    // start, and the emit()/minDuration reads must see the updated value.
+    // start, and the emit() reads must see the updated value.
     get startedAt() {
       return startedAt;
     },
@@ -543,9 +604,10 @@ export function createSessionRuntime(config: WebReplayConfig): SessionRuntime {
     get generation() {
       return generation;
     },
-    requeue: (events, gen) => {
+    requeue: (events, gen, segment, page) => {
       if (gen !== generation) return false;
-      requeueFront(events);
+      if (segment !== segmentId) carried.unshift({ segmentId: segment, events, page });
+      else requeueFront(events);
       return true;
     },
     touch: () => {
@@ -569,7 +631,29 @@ export function createSessionRuntime(config: WebReplayConfig): SessionRuntime {
     stopAutoFlush: () => {
       if (timer !== undefined) window.clearInterval(timer);
     },
-    flushFinal: (sendFinal, roomFor) => {
+    flushFinal: (sendFinal, roomFor, withCarried) => {
+      // Older page loads first, each whole and under its own segment and page.
+      while (withCarried && carried.length > 0) {
+        const c = carried[0];
+        const shell: ReplayBatchEnvelope = {
+          projectId: config.projectId,
+          sessionId,
+          segmentId: c.segmentId,
+          sequence: MAX_SEQUENCE,
+          sentAt: Date.now(),
+          sdk,
+          page: c.page ?? pageContext(),
+          events: [],
+        };
+        let size = 0;
+        for (let i = 0; i < c.events.length; i += 1) {
+          size += utf8Bytes(JSON.stringify(c.events[i])) + 1;
+        }
+        if (size > roomFor(shell) - FINAL_TAIL_ROOM_BYTES) break;
+        const sequence = c.sequence ?? claimSequence();
+        if (!sendFinal({ ...shell, sequence, events: c.events })) break;
+        carried.shift();
+      }
       if (buffer.length === 0) return;
       const events = buffer.splice(0, buffer.length);
       const shell: ReplayBatchEnvelope = {
@@ -583,32 +667,77 @@ export function createSessionRuntime(config: WebReplayConfig): SessionRuntime {
         page: pageContext(),
         events: [],
       };
-      const take = selectForFinalBatch(events, roomFor(shell));
-      const chosen: ReplayEvent[] = [];
-      const rest: ReplayEvent[] = [];
-      for (let i = 0; i < events.length; i += 1) {
-        (take[i] ? chosen : rest).push(events[i]);
+      // A batch that didn't go out (beforeSend made it bigger than the room, or
+      // the browser refused the beacon) is retried smaller, so the session end
+      // and errors (selected first) still leave. One sequence number for all
+      // tries: only one of them can be sent.
+      let room = roomFor(shell);
+      let sequenceForTry: number | undefined;
+      for (let attempt = 0; attempt < FINAL_BATCH_TRIES; attempt += 1) {
+        const take = selectForFinalBatch(events, room);
+        const chosen: ReplayEvent[] = [];
+        const rest: ReplayEvent[] = [];
+        for (let i = 0; i < events.length; i += 1) {
+          (take[i] ? chosen : rest).push(events[i]);
+        }
+        if (chosen.length === 0) break;
+        sequenceForTry ??= claimSequence();
+        if (sendFinal({ ...shell, sequence: sequenceForTry, events: chosen })) {
+          requeueFront(rest);
+          return;
+        }
+        room = Math.floor(room / 2);
       }
-      const sent =
-        chosen.length > 0 &&
-        sendFinal({ ...shell, sequence: claimSequence(), events: chosen });
-      requeueFront(sent ? rest : events);
+      requeueFront(events);
     },
     carried,
-    stashForNextPage: () => {
-      const batches = carried.slice();
-      if (buffer.length > 0)
-        batches.push({ segmentId, events: buffer.splice(0, buffer.length) });
-      carried.length = 0;
-      if (batches.length === 0) return false;
-      try {
-        const raw = JSON.stringify({ sid: sessionId, batches } satisfies Outbox);
-        if (raw.length > OUTBOX_MAX_CHARS) return false;
-        sessionStorage.setItem(OUTBOX_STORAGE_KEY, raw);
-        return true;
-      } catch {
-        return false; // storage full/blocked: dropped, as before
+    carryUnsent: (envelopes) => {
+      const mine = envelopes
+        .filter((e) => e.sessionId === sessionId && e.events.length > 0)
+        .map((e) => ({
+          segmentId: e.segmentId,
+          events: e.events,
+          page: e.page,
+          sequence: e.sequence,
+        }));
+      carried.unshift(...mine);
+    },
+    stashForNextPage: (carriedOnly) => {
+      const own: CarriedBatch | null =
+        !carriedOnly && buffer.length > 0
+          ? { segmentId, events: buffer.slice(), page: pageContext() }
+          : null;
+      const candidates = own ? [...carried, own] : carried.slice();
+      if (candidates.length === 0) return false;
+      // Oldest first; a batch that would push the outbox past its cap is left
+      // out (and stays in memory) without costing the ones that fit.
+      const kept: CarriedBatch[] = [];
+      let size = 64 + sessionId.length;
+      for (const b of candidates) {
+        const n = JSON.stringify(b).length + 1;
+        if (size + n > OUTBOX_MAX_CHARS) continue;
+        kept.push(b);
+        size += n;
       }
+      if (kept.length === 0) return false;
+      try {
+        sessionStorage.setItem(
+          stashKey,
+          JSON.stringify({ sid: sessionId, batches: kept } satisfies Outbox),
+        );
+      } catch {
+        // Storage full or blocked: everything stays in memory, so a page
+        // restored from the back/forward cache still sends it.
+        return false;
+      }
+      // Written: what went into the outbox leaves memory (the next page load,
+      // or this page once restored, takes it back from there).
+      const keptSet = new Set(kept);
+      const remaining = carried.filter((c) => !keptSet.has(c));
+      carried.length = 0;
+      carried.push(...remaining);
+      if (own && keptSet.has(own)) buffer.splice(0, own.events.length);
+      return true;
     },
     restoreFromBfcache: () => {
       const t = Date.now();
@@ -638,15 +767,19 @@ export function createSessionRuntime(config: WebReplayConfig): SessionRuntime {
         }
       }
       // Events still buffered from before the freeze (not sent yet: held by the
-      // minimum duration, or by the upload gate) belong to the OLD segment: send
+      // upload gate, or past the unload budget) belong to the OLD segment: send
       // them under it. If the session changed they belong to an ended one and
       // are dropped, like rotate() does.
       if (sessionId === before && buffer.length > 0) {
-        carried.push({ segmentId: beforeSegment, events: buffer.splice(0, buffer.length) });
+        carried.push({
+          segmentId: beforeSegment,
+          events: buffer.splice(0, buffer.length),
+          page: pageContext(),
+        });
       }
       buffer.length = 0;
       // Events a page shown in between left for this session.
-      const outbox = takeOutbox();
+      const outbox = takeOutbox(stashKey);
       if (outbox && outbox.sid === sessionId) carried.push(...outbox.batches);
       segmentId = shortId("seg_");
       lastActivityAt = t;

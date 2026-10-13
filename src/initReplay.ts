@@ -121,6 +121,13 @@ export function initReplay(config: WebReplayConfig): ReplayController {
   let idleTimer: number | undefined;
   // stop() ran: nothing is captured or sent any more.
   let stopped = false;
+  // stop() began (it is delivering its last batches): nothing may start or
+  // re-install a capture any more — not a first-visible start, not a late
+  // remote config.
+  let stopping = false;
+  // The deferred start of a tab that loaded hidden, until it first shows.
+  let onFirstVisible: (() => void) | undefined;
+  let stopRun: Promise<void> | undefined;
   // The session a session_end was already emitted for, so it is sent at most
   // once per session per page, whichever path ends it (unload, inactivity,
   // stop()). Cleared when a back/forward-cache restore continues the session.
@@ -261,13 +268,9 @@ export function initReplay(config: WebReplayConfig): ReplayController {
     // server-side session carries the full_snapshot — never a snapshot-less "no
     // replay" row — and that a not-yet-visible tab ships nothing at all.
     if (!started || (!snapshotReady && !rrwebFailed)) return;
-    // minDuration gate: hold (keep buffering, don't ship) until the session has
-    // lived past minDurationMs, so bounce sessions shorter than the minimum are
-    // never uploaded (they're discarded on unload). 0 disables. Bounded by the
-    // runtime buffer cap.
-    if (minDurationMs > 0 && Date.now() - session.startedAt < minDurationMs) {
-      return;
-    }
+    // No minimum-duration hold here: the server judges a short session when it
+    // settles (keeps it when identified or when it caught an error, deletes it
+    // otherwise), and it can only do that with the events it was sent.
     // One send at a time (keeps batches in order; a failed one is requeued in
     // front) and none during a backoff. The events stay buffered; no sequence
     // number is claimed until a batch is actually built.
@@ -282,10 +285,12 @@ export function initReplay(config: WebReplayConfig): ReplayController {
       projectId: config.projectId,
       sessionId: session.sessionId,
       segmentId: carried ? carried.segmentId : session.segmentId,
-      sequence: session.nextSequence(),
+      // A carried upload the previous page left unfinished keeps its number.
+      sequence: carried?.sequence ?? session.nextSequence(),
       sentAt: Date.now(),
       sdk: session.sdk,
-      page: session.pageContext(),
+      // A carried batch keeps the page it was recorded on (entry page, UTM).
+      page: carried?.page ?? session.pageContext(),
       events,
     };
     const nextEnvelope = applyBeforeSend(config.beforeSend, envelope);
@@ -305,13 +310,19 @@ export function initReplay(config: WebReplayConfig): ReplayController {
       // are dropped (requeue checks the generation). A batch the server
       // refused ("drop"/"stop") is never resent.
       if (outcome.kind === "retry") {
-        if (!carried) session.requeue(events, generation);
+        if (!carried) {
+          session.requeue(events, generation, envelope.segmentId, envelope.page);
+        }
         else if (session.generation === generation) session.carried.unshift(carried);
       }
       if (gate.end(outcome) === "halt") {
         haltUploads(
           outcome.kind === "stop" ? outcome.reason : "batches rejected",
         );
+      } else if (carried && outcome.kind === "ok") {
+        // An earlier page's batch went first: send this page's own (its base
+        // snapshot) now, not a whole flush interval later.
+        void flush();
       }
     })();
     inFlightSend = send;
@@ -371,7 +382,7 @@ export function initReplay(config: WebReplayConfig): ReplayController {
   // FullSnapshot (its base), and resume. Same anon/identified user (transport
   // identify/fingerprint state is untouched).
   const resumeFromIdle = () => {
-    if (!idle) return;
+    if (!idle || stopping) return;
     idle = false;
     session.rotate();
     sendBatch.retagSession(session.sessionId); // same person, new session id
@@ -456,7 +467,6 @@ export function initReplay(config: WebReplayConfig): ReplayController {
     alwaysRecordErrors: boolean;
     alwaysRecordIdentified: boolean;
   } | null = null;
-  let minDurationMs = 0;
 
   const installCaptures = (effective: {
     console: boolean;
@@ -765,7 +775,7 @@ export function initReplay(config: WebReplayConfig): ReplayController {
   // actually looks at it, and one closed while still hidden never creates a
   // session. Runs at most once (the `started` guard).
   const startCapture = () => {
-    if (started) return;
+    if (started || stopping) return;
     // excludeUrls is the host's own opt-out, so it applies even when the
     // remote config never arrives (applyRemoteConfig re-checks it too).
     if ((config.excludeUrls ?? []).some((g) => matchesGlob(g, window.location.href))) {
@@ -825,6 +835,7 @@ export function initReplay(config: WebReplayConfig): ReplayController {
       // background so it can still adjust mid-session — but start recording
       // NOW using local config as the source of truth.
       if (remote === null) {
+        if (stopping) return;
         installCaptures({
           console: config.captureConsole !== false,
           network: config.captureNetwork !== false,
@@ -850,7 +861,7 @@ export function initReplay(config: WebReplayConfig): ReplayController {
   ) {
     // Uploads were already halted (or stop() ran): a late config must not
     // re-install the captures.
-    if (blocked || stopped) return;
+    if (blocked || stopped || stopping) return;
     // ---- Hard cap gate ----------------------------------------------
     // The workspace has spent its plan's session allowance. Record NOTHING and
     // ship NOTHING — this beats every "always record" override below (a maxed
@@ -912,16 +923,12 @@ export function initReplay(config: WebReplayConfig): ReplayController {
       maskInputOptions[t] = true;
     }
 
-    // Set BEFORE installCaptures: installing rrweb takes the first snapshot and
-    // flushes it straight away, so a minimum duration applied after it never
-    // held that first batch back (every bounce uploaded its snapshot).
     // Remember the rules so identify()-triggered re-evaluation can flip
     // sampling on later when alwaysRecordIdentified=true.
     sampleOverrides = {
       alwaysRecordErrors: remote.sampling.alwaysRecordErrors,
       alwaysRecordIdentified: remote.sampling.alwaysRecordIdentified,
     };
-    minDurationMs = remote.capture.minDurationMs ?? 0;
 
     installCaptures({
       console: remote.capture.console,
@@ -990,37 +997,44 @@ export function initReplay(config: WebReplayConfig): ReplayController {
     if (stopped) return;
     if (!sampled || blocked) {
       session.drain();
+      // This page doesn't record, but an earlier one's leftovers still go on.
+      if (leaving) session.stashForNextPage(true);
       return;
     }
     // Never create a server-side session on the way out for a tab that never
     // visibly started, or whose snapshot never arrived (and rrweb didn't fail).
-    if (!started || (!snapshotReady && !rrwebFailed)) return;
-    // Under the minimum duration nothing is uploaded: a bounce is never stored.
-    // But leaving the page isn't necessarily the session's end — a same-tab
-    // navigation continues it on the next page (or this page comes back from
-    // the back/forward cache) — so on pagehide the held events are handed to
-    // whichever page load of this session runs next (stashForNextPage). If none
-    // does, they go with the tab. A tab switch keeps them in memory.
-    if (minDurationMs > 0 && Date.now() - session.startedAt < minDurationMs) {
-      if (leaving) {
-        if (endReason) emitSessionEnd(endReason);
-        session.stashForNextPage();
-      }
+    // Leaving, its events still go to the next page load of this session (a
+    // redirect must not lose the landing page's session_start, URL and UTM
+    // tags) — they're only sent if that page records — and so do earlier
+    // pages' leftovers. A tab that never showed hands on only the latter.
+    if (!started || (!snapshotReady && !rrwebFailed)) {
+      if (leaving) session.stashForNextPage(!started);
       return;
     }
     if (endReason) emitSessionEnd(endReason);
-    session.flushFinal((envelope) => {
-      const next = applyBeforeSend(config.beforeSend, envelope);
-      // Dropped by the hook: nothing to keep for later.
-      return next ? sendBatch.sendFinal(next) : true;
-    }, sendBatch.finalRoom);
+    session.flushFinal(
+      (envelope) => {
+        const next = applyBeforeSend(config.beforeSend, envelope);
+        // Dropped by the hook: nothing to keep for later.
+        return next ? sendBatch.sendFinal(next) : true;
+      },
+      // A tab switch leaves part of the budget free: the page may be closed
+      // before this batch is done, and that close must still fit its own.
+      (shell) => sendBatch.finalRoom(shell, !leaving),
+      leaving,
+    );
+    // Leaving (closed, or into the back/forward cache — the usual case for a
+    // same-tab navigation): what didn't fit goes to the next page load of this
+    // session in this tab, or back to this page if it is restored.
+    if (leaving) session.stashForNextPage();
   };
 
   const onPageHide = (e: PageTransitionEvent) => {
     unloading = true;
     // First the regular uploads the browser would cancel with the page: they
     // hold the older events, possibly this page's base snapshot.
-    sendBatch.redeliverPending();
+    // What can't be re-sent now goes with this page's leftovers.
+    session.carryUnsent(sendBatch.redeliverPending());
     if (e.persisted) {
       // Into the back/forward cache: it may come back, so the session isn't over.
       inBfcache = started;
@@ -1059,19 +1073,18 @@ export function initReplay(config: WebReplayConfig): ReplayController {
     idle = false;
     endedSessionId = null;
     lastMeaningfulAt = Date.now(); // Back/Forward is the user acting
-    if (continued) {
-      emit({
-        ts: Date.now(),
-        type: "navigation",
-        data: {
-          to: redactUrlForStorage(window.location.href),
-          title: document.title || undefined,
-          trigger: "load",
-        } satisfies NavigationEventData,
-      });
-    } else {
-      emitSessionStart();
-    }
+    // A new session opens like a fresh load: session_start, then the page view
+    // (the server counts page views from navigation events).
+    if (!continued) emitSessionStart();
+    emit({
+      ts: Date.now(),
+      type: "navigation",
+      data: {
+        to: redactUrlForStorage(window.location.href),
+        title: document.title || undefined,
+        trigger: "load",
+      } satisfies NavigationEventData,
+    });
     emitViewport();
     if (captures.rrweb) {
       snapshotReady = false;
@@ -1134,13 +1147,15 @@ export function initReplay(config: WebReplayConfig): ReplayController {
   if (document.visibilityState !== "hidden") {
     startCapture();
   } else {
-    const onFirstVisible = () => {
+    const deferredStart = () => {
       if (document.visibilityState !== "hidden") {
-        document.removeEventListener("visibilitychange", onFirstVisible);
+        document.removeEventListener("visibilitychange", deferredStart);
+        onFirstVisible = undefined;
         startCapture();
       }
     };
-    document.addEventListener("visibilitychange", onFirstVisible);
+    onFirstVisible = deferredStart;
+    document.addEventListener("visibilitychange", deferredStart);
   }
 
   const identify: ReplayController["identify"] = (idOrPayload, props) => {
@@ -1262,8 +1277,14 @@ export function initReplay(config: WebReplayConfig): ReplayController {
       session.sessionId
         ? `${dashboardHostFromApiHost(config.apiHost)}/recordings/${session.sessionId}`
         : null,
-    stop: async () => {
-      if (stopped) return;
+    // A second call while the first is still delivering waits for that run.
+    stop: () =>
+      (stopRun ??= (async () => {
+      stopping = true;
+      if (onFirstVisible) {
+        document.removeEventListener("visibilitychange", onFirstVisible);
+        onFirstVisible = undefined;
+      }
       if (idleTimer !== undefined) window.clearInterval(idleTimer);
       stopCaptures();
       for (const evt of activityEvents) {
@@ -1283,7 +1304,7 @@ export function initReplay(config: WebReplayConfig): ReplayController {
         await flush({ ignoreBackoff: true });
       }
       stopped = true;
-    },
+    })()),
   };
 }
 

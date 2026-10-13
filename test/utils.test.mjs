@@ -28,3 +28,13 @@ test("applyBeforeSend fails closed and warns once", async () => {
     console.warn = realWarn;
   }
 });
+
+test("the CDN bundle has no regex lookbehind (a parse error in Safari before 16.4)", async () => {
+  const { build } = await import("esbuild");
+  const out = await build({
+    entryPoints: [new URL("../src/cdn.ts", import.meta.url).pathname],
+    bundle: true, write: false, format: "iife", platform: "browser", target: "es2017", logLevel: "silent",
+  });
+  const code = out.outputFiles[0].text;
+  assert.ok(!code.includes("(?<!") && !code.includes("(?<="), "lookbehind found in the bundle");
+});

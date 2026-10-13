@@ -76,8 +76,10 @@ export interface BatchSender {
    *  new session re-attaches it. */
   retagSession: (sessionId: string) => void;
   /** Bytes left for the EVENTS of a hide/unload batch shaped like `shell`
-   *  (its events are ignored), within this page's keepalive budget. */
-  finalRoom: (shell: ReplayBatchEnvelope) => number;
+   *  (its events are ignored), within this page's keepalive budget — less
+   *  UNLOAD_RESERVE_BYTES when `keepReserve` (a tab switch: a close may follow
+   *  while this batch is still in flight). */
+  finalRoom: (shell: ReplayBatchEnvelope, keepReserve?: boolean) => number;
   /** Unload-reliable send for the hide/unload batch: one keepalive fetch (it
    *  survives page teardown and carries the api-key header), falling back to
    *  sendBeacon. Fire-and-forget. Returns false, sending nothing, when the
@@ -86,8 +88,10 @@ export interface BatchSender {
   /** On pagehide: re-send, with keepalive, any regular send still pending
    *  WITHOUT keepalive (mid-gzip, in backoff, or a large body), using the same
    *  bytes and sequence — the browser would otherwise cancel it with the page.
-   *  The server dedupes a copy that also landed (same session/segment/sequence). */
-  redeliverPending: () => void;
+   *  The server dedupes a copy that also landed (same session/segment/sequence).
+   *  Returns the pending envelopes too big to re-send now, so the caller can
+   *  hand them to the next page load; those sends stop retrying either way. */
+  redeliverPending: () => ReplayBatchEnvelope[];
 }
 
 /**
@@ -203,6 +207,18 @@ const KEEPALIVE_BUDGET_BYTES = 48 * 1024;
  *  hide/unload batch. Bigger regular sends use a normal fetch. */
 const REGULAR_KEEPALIVE_MAX_BYTES = 16 * 1024;
 const REGULAR_KEEPALIVE_SHARE_BYTES = 24 * 1024;
+/** Kept free by a tab-switch batch and by pagehide's re-sends, so the closing
+ *  batch (session end, errors, page view first) always fits. */
+const UNLOAD_RESERVE_BYTES = 8 * 1024;
+/** sendBeacon reports no completion: its bytes count against the budget for
+ *  this long (browsers send a queued beacon within well under that). */
+const BEACON_HOLD_MS = 10_000;
+/** A regular upload with no response by then is aborted and retried, so one
+ *  hung request (a half-open mobile connection) can't block every later one.
+ *  Bigger bodies get longer, at an assumed floor of 1 KB/s, so a slow but
+ *  working connection still gets a large snapshot through. */
+const SEND_TIMEOUT_MS = 30_000;
+const MIN_UPLOAD_BYTES_PER_MS = 1;
 
 /** Firefox before 133 ignores `keepalive` (the request dies with the page), so
  *  the unload path uses sendBeacon there. */
@@ -211,6 +227,7 @@ const KEEPALIVE_SUPPORTED =
 
 /** A regular send that hasn't finished yet. */
 interface PendingSend {
+  envelope: ReplayBatchEnvelope;
   json: string;
   /** gzip bytes, once compression finished */
   gz?: ArrayBuffer;
@@ -310,6 +327,9 @@ export function createBatchSender(config: WebReplayConfig): BatchSender {
   // body bytes this sender has in flight (see KEEPALIVE_BUDGET_BYTES).
   const pending = new Set<PendingSend>();
   let keepaliveInflight = 0;
+  // Bytes of recent sendBeacon calls, still counted (see BEACON_HOLD_MS).
+  let beaconBytes = 0;
+  const budgetUsed = () => keepaliveInflight + beaconBytes;
   // Set once a keepalive request was refused but a plain retry right after got
   // a real HTTP response: this browser rejects keepalive here (some engines
   // can't combine it with a CORS preflight). Regular sends then skip it, and
@@ -332,7 +352,7 @@ export function createBatchSender(config: WebReplayConfig): BatchSender {
       identify: currentIdentify,
       fingerprint: currentFingerprint,
     });
-    const p: PendingSend = { json, keepaliveActive: false, superseded: false };
+    const p: PendingSend = { envelope, json, keepaliveActive: false, superseded: false };
     pending.add(p);
     try {
       const { body, gzip } = await compressBody(json);
@@ -356,18 +376,28 @@ export function createBatchSender(config: WebReplayConfig): BatchSender {
           !keepaliveBroken &&
           !keepaliveRefused &&
           bytes <= REGULAR_KEEPALIVE_MAX_BYTES &&
-          keepaliveInflight + bytes <= REGULAR_KEEPALIVE_SHARE_BYTES;
+          budgetUsed() + bytes <= REGULAR_KEEPALIVE_SHARE_BYTES;
         if (keepalive) {
           keepaliveInflight += bytes;
           p.keepaliveActive = true;
         }
         let outcome: SendOutcome;
+        const abort =
+          typeof AbortController === "function" ? new AbortController() : undefined;
+        let timedOut = false;
+        const timer = abort
+          ? setTimeout(() => {
+              timedOut = true;
+              abort.abort();
+            }, SEND_TIMEOUT_MS + Math.ceil(bytes / MIN_UPLOAD_BYTES_PER_MS))
+          : undefined;
         try {
           const response = await fetchImpl(endpoint, {
             method: "POST",
             headers,
             body,
             ...(keepalive ? { keepalive: true } : {}),
+            ...(abort ? { signal: abort.signal } : {}),
           });
           // A real response right after a refused keepalive: keepalive is
           // what failed, not the network.
@@ -377,16 +407,21 @@ export function createBatchSender(config: WebReplayConfig): BatchSender {
             await readJson(response),
           );
         } catch {
-          // Network/CORS rejection (or the browser refused the keepalive:
-          // budget full, old engine) → transient; retry without keepalive.
-          if (keepalive) keepaliveRefused = true;
+          // Network/CORS rejection, a timeout, or the browser refused the
+          // keepalive (budget full, old engine) → transient; retry, without
+          // keepalive unless it was only slow.
+          if (keepalive && !timedOut) keepaliveRefused = true;
           outcome = { kind: "retry" };
         } finally {
+          if (timer !== undefined) clearTimeout(timer);
           if (keepalive) {
             keepaliveInflight -= bytes;
             p.keepaliveActive = false;
           }
         }
+        // Handed to pagehide's re-send or to the next page load meanwhile: that
+        // copy delivers these events, so a failure here must not requeue them.
+        if (p.superseded && outcome.kind === "retry") return { kind: "ok" };
         if (outcome.kind !== "retry" || outcome.status === 429) return outcome;
         if (attempt < MAX_SEND_ATTEMPTS) {
           await new Promise((r) =>
@@ -407,10 +442,11 @@ export function createBatchSender(config: WebReplayConfig): BatchSender {
     body: string | ArrayBuffer,
     gzip: boolean,
     json: string,
+    reserve = 0,
   ): boolean => {
     const bytes = typeof body === "string" ? utf8Bytes(body) : body.byteLength;
-    if (keepaliveInflight + bytes > KEEPALIVE_BUDGET_BYTES) return false;
-    if (!KEEPALIVE_SUPPORTED || keepaliveBroken) return beacon(json);
+    if (budgetUsed() + bytes + reserve > KEEPALIVE_BUDGET_BYTES) return false;
+    if (!KEEPALIVE_SUPPORTED || keepaliveBroken) return beacon(json, reserve);
     keepaliveInflight += bytes;
     const release = () => {
       keepaliveInflight -= bytes;
@@ -429,7 +465,7 @@ export function createBatchSender(config: WebReplayConfig): BatchSender {
       return true;
     } catch {
       release();
-      return beacon(json);
+      return beacon(json, reserve);
     }
   };
 
@@ -438,14 +474,22 @@ export function createBatchSender(config: WebReplayConfig): BatchSender {
   // cross-origin beacon isn't preflighted — application/json would be, and
   // sendBeacon can't do a preflight, so the browser would CORS-block it. It
   // shares the 64 KiB budget, so only bodies that fit are tried.
-  const beacon = (json: string): boolean => {
+  const beacon = (json: string, reserve = 0): boolean => {
     try {
       if (typeof navigator === "undefined" || !navigator.sendBeacon) return false;
-      if (keepaliveInflight + utf8Bytes(json) > KEEPALIVE_BUDGET_BYTES) return false;
-      return navigator.sendBeacon(
+      const bytes = utf8Bytes(json);
+      if (budgetUsed() + bytes + reserve > KEEPALIVE_BUDGET_BYTES) return false;
+      const queued = navigator.sendBeacon(
         beaconUrl(),
         new Blob([json], { type: "text/plain" }),
       );
+      if (queued) {
+        beaconBytes += bytes;
+        setTimeout(() => {
+          beaconBytes -= bytes;
+        }, BEACON_HOLD_MS);
+      }
+      return queued;
     } catch {
       return false; // nothing left to try — the page is going away
     }
@@ -496,9 +540,10 @@ export function createBatchSender(config: WebReplayConfig): BatchSender {
     currentSessionId = sessionId;
     persistIdentify(sessionId, currentIdentify);
   };
-  send.finalRoom = (shell) =>
+  send.finalRoom = (shell, keepReserve) =>
     KEEPALIVE_BUDGET_BYTES -
-    keepaliveInflight -
+    budgetUsed() -
+    (keepReserve ? UNLOAD_RESERVE_BYTES : 0) -
     utf8Bytes(
       JSON.stringify({
         envelope: { ...shell, events: [] },
@@ -515,14 +560,20 @@ export function createBatchSender(config: WebReplayConfig): BatchSender {
     return fireUnloadSafe(json, false, json);
   };
   send.redeliverPending = () => {
+    const unsent: ReplayBatchEnvelope[] = [];
     for (const p of pending) {
       if (p.keepaliveActive || p.superseded) continue;
       // The gzip bytes when compression finished (smaller), else the JSON.
+      // Older events, but the closing batch after them must still fit.
       const sent = p.gz
-        ? fireUnloadSafe(p.gz, true, p.json)
-        : fireUnloadSafe(p.json, false, p.json);
-      if (sent) p.superseded = true;
+        ? fireUnloadSafe(p.gz, true, p.json, UNLOAD_RESERVE_BYTES)
+        : fireUnloadSafe(p.json, false, p.json, UNLOAD_RESERVE_BYTES);
+      // Too big to re-send now: handed back (same sequence) for the next page
+      // load, so this send must not requeue its events as well.
+      p.superseded = true;
+      if (!sent) unsent.push(p.envelope);
     }
+    return unsent;
   };
 
   return send;

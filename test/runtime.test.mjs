@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { installBrowser, load, TEST_SDK_VERSION } from "./helpers.mjs";
+import { installBrowser, load, outboxKeys, TEST_SDK_VERSION } from "./helpers.mjs";
 
 const cfg = (x = {}) => ({ apiKey: "k", apiHost: "https://api.test", ...x });
 const ev = (type, i, data = {}) => ({ id: `${type}-${i}`, ts: 1000 + i, offsetMs: i, source: "web", type, data });
@@ -26,11 +26,11 @@ test("a send drained before rotate() is never requeued into the new session", as
   const drained = rt.drain();
   rt.rotate();
   rt.push(ev("custom", 3));
-  assert.equal(rt.requeue(drained, gen), false);
+  assert.equal(rt.requeue(drained, gen, rt.segmentId, rt.pageContext()), false);
   assert.deepEqual(rt.drain().map((e) => e.id), ["custom-3"]);
   // same generation: back at the front, in order
   rt.push(ev("custom", 5));
-  assert.equal(rt.requeue([ev("custom", 4)], rt.generation), true);
+  assert.equal(rt.requeue([ev("custom", 4)], rt.generation, rt.segmentId, rt.pageContext()), true);
   assert.deepEqual(rt.drain().map((e) => e.id), ["custom-4", "custom-5"]);
 });
 
@@ -170,7 +170,7 @@ test("upload gate: one in flight, exponential backoff capped at 60s, halts", asy
   assert.equal(g2.end({ kind: "stop", reason: "unauthorized" }), "halt");
 });
 
-test("minimum-duration outbox: handed to the next page load of the same session only", async () => {
+test("outbox: handed to the next page load of the same session only", async () => {
   const b = installBrowser();
   const { createSessionRuntime } = await load("runtime.ts");
   const p1 = createSessionRuntime(cfg({ sessionInactivityMs: 60_000 }));
@@ -180,9 +180,9 @@ test("minimum-duration outbox: handed to the next page load of the same session 
   assert.equal(p1.drain().length, 0, "buffer handed over");
   const p2 = createSessionRuntime(cfg({ sessionInactivityMs: 60_000 }));
   assert.equal(p2.resumed, true);
-  assert.equal(b.store.has("replay:outbox"), false, "read once");
+  assert.deepEqual(outboxKeys(b.store), [], "read once");
   assert.deepEqual(p2.carried.map((c) => [c.segmentId, c.events.map((e) => e.id)]), [[p1.segmentId, ["full_snapshot-0", "custom-1"]]]);
-  // still under the minimum on page 2 → page 3 gets page 1's AND page 2's events
+  // page 2 leaves with events too → page 3 gets page 1's AND page 2's events
   p2.push(ev("custom", 2));
   assert.equal(p2.stashForNextPage(), true);
   const p3 = createSessionRuntime(cfg({ sessionInactivityMs: 60_000 }));
@@ -194,9 +194,144 @@ test("minimum-duration outbox: handed to the next page load of the same session 
   const fresh = createSessionRuntime(cfg({ sessionInactivityMs: 60_000 }));
   assert.equal(fresh.resumed, false);
   assert.equal(fresh.carried.length, 0);
-  assert.equal(b.store.has("replay:outbox"), false, "discarded");
+  assert.deepEqual(outboxKeys(b.store), [], "discarded");
   // too big for the shared storage → dropped, nothing written
   fresh.push(ev("full_snapshot", 9, { s: "x".repeat(1_100_000) }));
   assert.equal(fresh.stashForNextPage(), false);
-  assert.equal(b.store.has("replay:outbox"), false);
+  assert.deepEqual(outboxKeys(b.store), []);
+});
+
+test("a send that fails after a back/forward-cache restore stays under its own segment and page", async () => {
+  installBrowser();
+  const { createSessionRuntime } = await load("runtime.ts");
+  const rt = createSessionRuntime(cfg({ sessionInactivityMs: 10_000 }));
+  rt.push(ev("incremental_snapshot", 1));
+  const gen = rt.generation;
+  const seg = rt.segmentId;
+  const page = { ...rt.pageContext(), url: "https://app.test/before" };
+  const drained = rt.drain();
+  assert.equal(rt.restoreFromBfcache(), true);
+  rt.push(ev("full_snapshot", 2));
+  assert.equal(rt.requeue(drained, gen, seg, page), true);
+  assert.deepEqual(rt.drain().map((e) => e.id), ["full_snapshot-2"], "the new page's batch holds only its own events");
+  assert.deepEqual(rt.carried.map((c) => [c.segmentId, c.page.url, c.events.map((e) => e.id)]), [[seg, "https://app.test/before", ["incremental_snapshot-1"]]]);
+});
+
+test("unload batch refused once (a beforeSend that grew it) is retried smaller, same sequence", async () => {
+  installBrowser();
+  const { createSessionRuntime } = await load("runtime.ts");
+  const rt = createSessionRuntime(cfg());
+  for (let i = 0; i < 40; i += 1) rt.push(ev("incremental_snapshot", i, { s: big(800) }));
+  rt.push(ev("session_end", 99, { reason: "unload" }));
+  const tries = [];
+  rt.flushFinal((e) => {
+    tries.push(e);
+    return tries.length > 1;
+  }, () => 40_000);
+  assert.equal(tries.length, 2);
+  assert.ok(tries[1].events.length < tries[0].events.length);
+  assert.ok(tries[1].events.some((e) => e.type === "session_end"), "the session end goes first");
+  assert.equal(tries[1].sequence, tries[0].sequence);
+  const left = rt.drain();
+  assert.equal(left.length + tries[1].events.length, 41, "what didn't go stays buffered");
+});
+
+test("unload: carried page loads go first under their own segment and page, and leave room for the tail", async () => {
+  const b = installBrowser({ href: "https://app.test/landing?utm_source=google" });
+  const { createSessionRuntime } = await load("runtime.ts");
+  const p1 = createSessionRuntime(cfg({ sessionInactivityMs: 60_000 }));
+  p1.push(ev("full_snapshot", 0));
+  p1.stashForNextPage();
+  installBrowser({ href: "https://app.test/product", storage: b.store });
+  const p2 = createSessionRuntime(cfg({ sessionInactivityMs: 60_000 }));
+  assert.equal(p2.carried.length, 1);
+  p2.push(ev("session_end", 1, { reason: "unload" }));
+  const sent = [];
+  p2.flushFinal((e) => (sent.push(e), true), () => 40_000, false);
+  assert.deepEqual(sent.map((e) => e.segmentId), [p2.segmentId], "a tab switch leaves carried batches to the regular flush");
+  assert.equal(p2.carried.length, 1);
+  p2.push(ev("session_end", 1, { reason: "unload" }));
+  sent.length = 0;
+  p2.flushFinal((e) => (sent.push(e), true), () => 40_000, true);
+  assert.deepEqual(sent.map((e) => [e.segmentId, e.page.url]), [
+    [p1.segmentId, "https://app.test/landing?utm_source=google"],
+    [p2.segmentId, "https://app.test/product"],
+  ]);
+  assert.equal(p2.carried.length, 0);
+  // a carried batch that would eat the tail's room waits (and the tail goes)
+  p2.carried.push({ segmentId: "seg_old", events: [ev("full_snapshot", 2, { s: big(36_000) })] });
+  p2.push(ev("error", 3));
+  sent.length = 0;
+  p2.flushFinal((e) => (sent.push(e), true), () => 40_000, true);
+  assert.deepEqual(sent.map((e) => e.segmentId), [p2.segmentId]);
+  assert.equal(p2.carried.length, 1);
+});
+
+test("config.sessionId: lone surrogates and control characters are refused, real pairs kept", async () => {
+  installBrowser();
+  const { createSessionRuntime } = await load("runtime.ts");
+  const w = console.warn;
+  console.warn = () => {};
+  try {
+    for (const bad of ["a\uDC00b", "a\uD800", "\uD800x", "a\u0001b", "a\u007Fb"]) {
+      assert.notEqual(createSessionRuntime(cfg({ sessionId: bad })).sessionId, bad, JSON.stringify(bad));
+    }
+    assert.equal(createSessionRuntime(cfg({ sessionId: "u-😀-x" })).sessionId, "u-😀-x");
+  } finally {
+    console.warn = w;
+  }
+});
+
+test("carryUnsent: an unfinished upload of this session is carried first, keeping its sequence", async () => {
+  installBrowser();
+  const { createSessionRuntime } = await load("runtime.ts");
+  const rt = createSessionRuntime(cfg());
+  rt.carried.push({ segmentId: "seg_later", events: [ev("custom", 2)] });
+  const page = rt.pageContext();
+  rt.carryUnsent([
+    { sessionId: rt.sessionId, segmentId: rt.segmentId, sequence: 7, sentAt: 1, sdk: rt.sdk, page, events: [ev("full_snapshot", 1)] },
+    { sessionId: "ses_other", segmentId: "x", sequence: 8, sentAt: 1, sdk: rt.sdk, page, events: [ev("custom", 9)] },
+  ]);
+  assert.deepEqual(rt.carried.map((c) => [c.segmentId, c.sequence]), [[rt.segmentId, 7], ["seg_later", undefined]]);
+  // it survives the outbox with its number
+  rt.stashForNextPage();
+  const next = createSessionRuntime(cfg());
+  assert.deepEqual(next.carried.map((c) => c.sequence), [7, undefined]);
+});
+
+test("outbox: another project's SDK on the same site never takes it", async () => {
+  const b = installBrowser();
+  const { createSessionRuntime } = await load("runtime.ts");
+  const a = createSessionRuntime(cfg({ apiKey: "key_A", sessionInactivityMs: 60_000 }));
+  a.push(ev("custom", 1));
+  assert.equal(a.stashForNextPage(), true);
+  const other = createSessionRuntime(cfg({ apiKey: "key_B", sessionInactivityMs: 60_000 }));
+  assert.equal(other.carried.length, 0);
+  assert.equal(outboxKeys(b.store).length, 1, "still there for project A");
+  const again = createSessionRuntime(cfg({ apiKey: "key_A", sessionInactivityMs: 60_000 }));
+  assert.equal(again.carried.length, 1);
+});
+
+test("outbox: a failed or oversized stash keeps the events in memory", async () => {
+  const b = installBrowser();
+  const { createSessionRuntime } = await load("runtime.ts");
+  const rt = createSessionRuntime(cfg({ sessionInactivityMs: 60_000 }));
+  rt.carried.push({ segmentId: "seg_huge", events: [ev("full_snapshot", 0, { s: big(1_100_000) })] });
+  rt.push(ev("custom", 1));
+  // the oversized carried batch is left out; the small buffer still goes
+  assert.equal(rt.stashForNextPage(), true);
+  assert.deepEqual(rt.carried.map((c) => c.segmentId), ["seg_huge"], "kept in memory");
+  assert.equal(rt.drain().length, 0, "the buffer went to the outbox");
+  // storage throws: nothing leaves memory
+  rt.push(ev("custom", 2));
+  const real = globalThis.sessionStorage.setItem;
+  globalThis.sessionStorage.setItem = () => { throw new Error("QuotaExceededError"); };
+  try {
+    assert.equal(rt.stashForNextPage(), false);
+  } finally {
+    globalThis.sessionStorage.setItem = real;
+  }
+  assert.equal(rt.carried.length, 1);
+  assert.deepEqual(rt.drain().map((e) => e.id), ["custom-2"]);
+  assert.ok(b.store.size > 0);
 });

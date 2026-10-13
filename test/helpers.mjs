@@ -163,3 +163,13 @@ export const ok = () => json(201, { ok: true, data: { accepted: true, acceptedSe
 export const json = (status, body) => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
 export const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 export const types = (envelope) => envelope.events.map((e) => e.type);
+
+/** The SDK's outbox (held events for the next page load) in a fake storage:
+ *  its key is per ingest host + api key. */
+export function outboxKeys(store) {
+  return [...store.keys()].filter((k) => k.startsWith("replay:outbox"));
+}
+export function readOutbox(store) {
+  const k = outboxKeys(store)[0];
+  return k ? JSON.parse(store.get(k)) : null;
+}

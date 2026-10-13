@@ -168,3 +168,80 @@ test("retagSession re-tags the stored identity to the new session id", async () 
   send.retagSession("ses_B");
   assert.equal(JSON.parse(b.store.get("replay:identify")).sid, "ses_B");
 });
+
+test("a beacon counts against the unload budget; a tab-switch batch keeps a reserve", async () => {
+  const b = installBrowser();
+  const RealRequest = globalThis.Request;
+  globalThis.Request = class {}; // no keepalive: the unload path uses sendBeacon
+  try {
+    const f = makeFetch();
+    const send = await sender(f);
+    const full = send.finalRoom(env());
+    assert.equal(full - send.finalRoom(env(), true), 8 * 1024);
+    const fits = env({ events: [{ id: "e", ts: 1, offsetMs: 0, source: "web", type: "custom", data: { s: "x".repeat(30_000) } }] });
+    assert.equal(send.sendFinal(fits), true);
+    assert.equal(b.beacons.length, 1);
+    assert.ok(send.finalRoom(env()) < 20_000, "the beacon's bytes are still counted");
+    assert.equal(send.sendFinal(fits), false, "a second 30KB body doesn't fit");
+  } finally {
+    globalThis.Request = RealRequest;
+  }
+});
+
+test("a hung upload is aborted after 30s and retried, keepalive kept", async (t) => {
+  installBrowser();
+  let n = 0;
+  const f = makeFetch((req) => {
+    n += 1;
+    if (n > 1) return ok();
+    return new Promise((_, reject) =>
+      req.init.signal.addEventListener("abort", () => reject(new Error("aborted"))),
+    );
+  });
+  const send = await sender(f);
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const tick = async () => { for (let i = 0; i < 20; i += 1) await new Promise(setImmediate); };
+  const result = send(env());
+  for (let i = 0; i < 50 && f.calls.length === 0; i += 1) await tick();
+  assert.equal(f.calls.length, 1);
+  t.mock.timers.tick(29_000);
+  await tick();
+  assert.equal(f.calls.length, 1, "not before 30s (plus 1ms per body byte)");
+  t.mock.timers.tick(5_000);
+  await tick();
+  t.mock.timers.tick(10_000); // the retry backoff
+  await tick();
+  assert.equal(f.calls.length, 2);
+  assert.equal(f.calls[1].keepalive, true, "a timeout doesn't mark keepalive as broken");
+  assert.deepEqual(await result, { kind: "ok" });
+});
+
+test("redeliverPending hands back what it can't re-send, and that send stops", async () => {
+  installBrowser();
+  let release;
+  const f = makeFetch((req) => (req.keepalive ? ok() : new Promise((r) => { release = r; })));
+  const send = await sender(f);
+  const big = noisy(70_000);
+  const result = send(big);
+  await sleep(150);
+  assert.equal(f.calls.length, 1);
+  assert.equal(f.calls[0].keepalive, false);
+  const unsent = send.redeliverPending();
+  assert.equal(unsent.length, 1);
+  assert.equal(unsent[0].sequence, big.sequence);
+  assert.deepEqual(send.redeliverPending(), [], "handed back once");
+  release(json(503, { ok: false }));
+  assert.deepEqual(await result, { kind: "ok" }, "no retry, no requeue: the carried copy delivers it");
+});
+
+test("a send handed back by redeliverPending returns ok even when it then gets a 429", async () => {
+  installBrowser();
+  let release;
+  const f = makeFetch((req) => (req.keepalive ? ok() : new Promise((r) => { release = r; })));
+  const send = await sender(f);
+  const result = send(noisy(70_000));
+  await sleep(150);
+  assert.equal(send.redeliverPending().length, 1);
+  release(json(429, { ok: false }));
+  assert.deepEqual(await result, { kind: "ok" });
+});
