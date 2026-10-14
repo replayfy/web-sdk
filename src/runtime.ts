@@ -28,22 +28,20 @@ interface SessionRuntime {
   push: (event: ReplayEvent) => void;
   drain: () => ReplayEvent[];
   /** Bumped whenever the session identity changes in place (rotate(), or a
-   *  back/forward-cache restore that lands in another session). Read it with
-   *  drain() and pass it back to requeue(). */
+   *  back/forward-cache restore that lands in another session). Read it before
+   *  building a batch and pass it back to requeue(). */
   readonly generation: number;
-  /** Put un-sent events back at the FRONT of the buffer after a failed send, so
-   *  the next flush retries them instead of dropping the batch. Bounded. Events
-   *  drained under an older generation belong to a session that has since
-   *  ended: they are dropped (returns false), never shipped under the new id.
-   *  Events drained under an older segment of the same session (the page came
-   *  back from the back/forward cache meanwhile) are carried under that
-   *  segment, never mixed into the new page's batches. */
-  requeue: (
-    events: ReplayEvent[],
-    generation: number,
-    segmentId: string,
-    page: ReplayBatchEnvelope["page"],
-  ) => boolean;
+  /** Put a batch whose send failed back at the FRONT of `carried`, whole: its
+   *  segment, page, sequence and events as they went out (after beforeSend).
+   *  The next flush resends exactly that batch under the same number, so a copy
+   *  that did reach the server (the response was lost: a timeout, a proxy
+   *  504/524, a reset connection) is deduped there instead of stored twice
+   *  under two numbers. It stays under its own segment even when the page came
+   *  back from the back/forward cache meanwhile. A batch built under an older
+   *  generation belongs to a session that has since ended: it is dropped
+   *  (returns false), never shipped under the new id. Bounded with the buffer
+   *  (MAX_BUFFERED_EVENTS). */
+  requeue: (batch: CarriedBatch, generation: number) => boolean;
   /** Mark genuine USER activity (an interaction) so a subsequent reload within
    *  the inactivity window continues this session. Cheap + throttled — safe to
    *  call on every pointer/scroll/key event. */
@@ -70,23 +68,34 @@ interface SessionRuntime {
    *  first (selectForFinalBatch); everything else goes back to the buffer, so
    *  if the page lives on (a tab switch, a back/forward-cache page) the next
    *  regular flush sends it. With `withCarried` (the page is going away; a tab
-   *  switch leaves them to the regular flush, which retries), batches carried
-   *  from an earlier page load go out first, whole, while they leave
-   *  FINAL_TAIL_ROOM_BYTES for this one. `sendFinal` returns false when nothing
-   *  was sent. */
+   *  switch leaves them to the regular flush, which retries), carried batches
+   *  go out first, whole, while they leave FINAL_TAIL_ROOM_BYTES for this one.
+   *  A failed send waiting for its retry (requeue) that is too big to go whole
+   *  sends its priority events on their own (see sendPriorityPart); on a tab
+   *  switch it goes too, once per failed send: a copy that stays carried, or
+   *  that priority part.
+   *  `sendFinal` returns false when nothing was sent; `hooked` says beforeSend
+   *  already ran on the batch (see CarriedBatch.hooked). */
   flushFinal: (
-    sendFinal: (envelope: ReplayBatchEnvelope) => boolean,
+    sendFinal: (envelope: ReplayBatchEnvelope, hooked: boolean) => boolean,
     roomFor: (shell: ReplayBatchEnvelope) => number,
     withCarried: boolean,
   ) => void;
   /** Uploads of this session the page is leaving behind unfinished (too big to
    *  re-send within the unload budget): carried, under their own segment, page
-   *  and sequence, ahead of everything else. Other sessions' are dropped. */
-  carryUnsent: (envelopes: ReplayBatchEnvelope[]) => void;
-  /** Batches an earlier page load of THIS session couldn't send before it went
-   *  away (past the unload budget), or a send that failed after a
-   *  back/forward-cache restore; the next flushes send them first, each under
-   *  its own segment and page. Mutable: the caller takes from the front. */
+   *  and sequence, ahead of everything else, and resent as they are when
+   *  `hooked(envelope)` says beforeSend already ran on them. Other sessions'
+   *  are dropped. */
+  carryUnsent: (
+    envelopes: ReplayBatchEnvelope[],
+    hooked?: (envelope: ReplayBatchEnvelope) => boolean,
+  ) => void;
+  /** Batches waiting to be sent ahead of the buffer, oldest first: a regular
+   *  send that failed (requeue), or what an earlier page load of THIS session
+   *  couldn't send before it went away (past the unload budget) or left
+   *  buffered before a back/forward-cache restore. The next flushes send them
+   *  first, each under its own segment and page (and number, once it has one).
+   *  Mutable: the caller takes from the front. */
   carried: CarriedBatch[];
   /** The page is going away with events it couldn't send (past the unload
    *  budget, or before its first snapshot): hand anything still carried, and
@@ -117,10 +126,17 @@ export interface CarriedBatch {
   segmentId: string;
   events: ReplayEvent[];
   page?: ReplayBatchEnvelope["page"];
-  /** Set for a batch already sent once (an upload the page left before it
-   *  finished): resent under the same number, so a copy that did land is
-   *  deduped by the server instead of stored twice. */
+  /** Set for a batch already sent once (a send that failed, or an upload the
+   *  page left before it finished): resent under the same number, so a copy
+   *  that did land is deduped by the server instead of stored twice. */
   sequence?: number;
+  /** A beforeSend hook already ran on `events` and `page` (they are what was
+   *  sent): the batch is resent as it is, the hook only asked whether it may
+   *  go (recheckBeforeSend). Running the hook on its own output again could
+   *  change the batch under a number the server may already hold (a hook that
+   *  hashes a value would hash the hash). Unset when no hook ran, so a page
+   *  that has one still scrubs a batch sent by a page that had none. */
+  hooked?: boolean;
 }
 
 /** Where a page that is going away leaves the events it couldn't send (past
@@ -165,7 +181,8 @@ function takeOutbox(key: string): Outbox | null {
         b.events.length > 0 &&
         (b.page === undefined || (typeof b.page === "object" && b.page !== null)) &&
         (b.sequence === undefined ||
-          (Number.isInteger(b.sequence) && b.sequence > 0 && b.sequence <= MAX_SEQUENCE)),
+          (Number.isInteger(b.sequence) && b.sequence > 0 && b.sequence <= MAX_SEQUENCE)) &&
+        (b.hooked === undefined || typeof b.hooked === "boolean"),
     );
     return { sid: o.sid, batches };
   } catch {
@@ -336,8 +353,9 @@ function shortId(prefix: string): string {
   return `${prefix}${now}${jitter}${rnd}`;
 }
 
-/** Hard cap on buffered events so a sustained ingest outage (every flush failing
- *  and re-queuing) can't grow the buffer without bound. A few MB of rrweb. */
+/** Hard cap on held events — carried batches and the buffer together — so a
+ *  sustained ingest outage (every send failing and re-queuing) can't grow them
+ *  without bound. A few MB of rrweb. */
 const MAX_BUFFERED_EVENTS = 20000;
 
 /** Where a session's identity lives BETWEEN page loads. sessionStorage is
@@ -534,18 +552,48 @@ export function createSessionRuntime(config: WebReplayConfig): SessionRuntime {
   };
   let timer: number | undefined;
   let lastActivityPersist = now;
+  // Carried batches whose regular send failed, waiting for their retry
+  // (requeue), and those of them already sent on a tab switch (flushFinal).
+  // By identity: nothing is kept alive or stashed in the outbox for them.
+  const failedSends = new WeakSet<CarriedBatch>();
+  const sentOnHide = new WeakSet<CarriedBatch>();
+
+  // Bound memory during a sustained outage, while a failed batch waits in
+  // `carried` and new events pile up in the buffer behind it: keep the OLDEST
+  // MAX_BUFFERED_EVENTS events (carried batches in order, then the buffer) and
+  // drop the newest beyond the cap — the rrweb FullSnapshot lives in the oldest
+  // and losing it makes the whole recording unplayable. The first carried batch
+  // is always kept whole, even past the cap: it holds that base, and it is the
+  // one being resent under its number.
+  const boundBacklog = () => {
+    let room = MAX_BUFFERED_EVENTS;
+    for (let i = 0; i < carried.length; i += 1) {
+      const c = carried[i];
+      if (i > 0 && c.events.length > room) {
+        // Keep this batch's oldest events if any room is left — unless it was
+        // sent once: its number may already be stored with all its events,
+        // and a resend under it must be that same batch, so it is dropped
+        // whole. Every newer batch is dropped.
+        const cut = room > 0 && c.sequence === undefined;
+        if (cut) carried[i] = { ...c, events: c.events.slice(0, room) };
+        carried.length = cut ? i + 1 : i;
+        room = 0;
+        break;
+      }
+      room -= c.events.length;
+    }
+    if (buffer.length > Math.max(0, room)) buffer.length = Math.max(0, room);
+  };
 
   // Prepend un-sent (older) events ahead of anything captured since, preserving
   // order — without spreading a possibly-large array into unshift() (which can
-  // overflow the call stack). Bound memory during a sustained outage: keep the
-  // OLDEST events — the rrweb FullSnapshot lives there and losing it makes the
-  // whole recording unplayable — dropping the newest beyond the cap.
+  // overflow the call stack). Bounded with the carried batches (boundBacklog).
   const requeueFront = (events: ReplayEvent[]) => {
     if (events.length === 0) return;
     const tail = buffer.splice(0, buffer.length);
     for (let i = 0; i < events.length; i += 1) buffer.push(events[i]);
     for (let i = 0; i < tail.length; i += 1) buffer.push(tail[i]);
-    if (buffer.length > MAX_BUFFERED_EVENTS) buffer.length = MAX_BUFFERED_EVENTS;
+    boundBacklog();
   };
 
   const sdk: ReplaySdkDescriptor = {
@@ -604,10 +652,14 @@ export function createSessionRuntime(config: WebReplayConfig): SessionRuntime {
     get generation() {
       return generation;
     },
-    requeue: (events, gen, segment, page) => {
+    requeue: (batch, gen) => {
       if (gen !== generation) return false;
-      if (segment !== segmentId) carried.unshift({ segmentId: segment, events, page });
-      else requeueFront(events);
+      // At the front: one send is in flight at a time and carried batches go
+      // before the buffer, so the failed batch is older than anything carried
+      // since (a back/forward-cache restore's leftovers, another page's outbox).
+      carried.unshift(batch);
+      failedSends.add(batch);
+      boundBacklog();
       return true;
     },
     touch: () => {
@@ -632,27 +684,78 @@ export function createSessionRuntime(config: WebReplayConfig): SessionRuntime {
       if (timer !== undefined) window.clearInterval(timer);
     },
     flushFinal: (sendFinal, roomFor, withCarried) => {
-      // Older page loads first, each whole and under its own segment and page.
-      while (withCarried && carried.length > 0) {
-        const c = carried[0];
-        const shell: ReplayBatchEnvelope = {
-          projectId: config.projectId,
-          sessionId,
-          segmentId: c.segmentId,
-          sequence: MAX_SEQUENCE,
-          sentAt: Date.now(),
-          sdk,
-          page: c.page ?? pageContext(),
-          events: [],
-        };
+      // A carried batch's envelope, under its own segment and page, measured
+      // with the widest number (the real one is set on send).
+      const shellFor = (c: CarriedBatch): ReplayBatchEnvelope => ({
+        projectId: config.projectId,
+        sessionId,
+        segmentId: c.segmentId,
+        sequence: MAX_SEQUENCE,
+        sentAt: Date.now(),
+        sdk,
+        page: c.page ?? pageContext(),
+        events: [],
+      });
+      // Send one carried batch whole, if it still leaves FINAL_TAIL_ROOM_BYTES
+      // for the tail. False when not sent.
+      const sendCarried = (c: CarriedBatch): boolean => {
+        const shell = shellFor(c);
         let size = 0;
         for (let i = 0; i < c.events.length; i += 1) {
           size += utf8Bytes(JSON.stringify(c.events[i])) + 1;
         }
-        if (size > roomFor(shell) - FINAL_TAIL_ROOM_BYTES) break;
+        if (size > roomFor(shell) - FINAL_TAIL_ROOM_BYTES) return false;
         const sequence = c.sequence ?? claimSequence();
-        if (!sendFinal({ ...shell, sequence, events: c.events })) break;
+        return sendFinal({ ...shell, sequence, events: c.events }, c.hooked === true);
+      };
+      // The oldest carried batch is a failed send too big to go whole: its
+      // priority events (the errors, custom events and page views 0.1.18 sent
+      // from the buffer here) go on their own, newest first within the room,
+      // and leave it; it keeps its number for the rest (its replay stream).
+      // Under a NEW number: a part under the batch's own would be deduped
+      // against the whole batch, or overwrite it. The cost: if an earlier
+      // attempt did land, those few events are stored twice — never its rrweb
+      // diffs, which a duplicate breaks.
+      const sendPriorityPart = () => {
+        const c = carried[0];
+        const priority = c.events.filter((e) => FINAL_PRIORITY_TYPES.has(e.type));
+        if (priority.length === 0) return;
+        const shell = shellFor(c);
+        const take = selectForFinalBatch(priority, roomFor(shell) - FINAL_TAIL_ROOM_BYTES);
+        const part = priority.filter((_, i) => take[i]);
+        if (part.length === 0) return;
+        const sequence = claimSequence();
+        if (!sendFinal({ ...shell, sequence, events: part }, c.hooked === true)) return;
+        const sent = new Set(part);
+        const rest = c.events.filter((e) => !sent.has(e));
+        if (rest.length === 0) {
+          carried.shift();
+          return;
+        }
+        const kept: CarriedBatch = { ...c, events: rest };
+        carried[0] = kept;
+        failedSends.add(kept);
+        if (sentOnHide.has(c)) sentOnHide.add(kept);
+      };
+      // Going away: the oldest first, each leaving memory once sent.
+      while (withCarried && carried.length > 0 && sendCarried(carried[0])) {
         carried.shift();
+      }
+      const held = carried[0];
+      if (held !== undefined && failedSends.has(held)) {
+        if (withCarried) {
+          sendPriorityPart();
+        } else if (!sentOnHide.has(held)) {
+          // A tab switch leaves carried batches to the regular flush, which
+          // retries and sees the answer. But a hidden page can be discarded
+          // with no further event, so a failed send waiting for its retry
+          // also goes now: a copy under its number that stays carried (the
+          // server can dedupe it against the retry), or its priority part.
+          // Once per failed send, however often the tab is switched during
+          // its backoff: each copy is one more resend under that number.
+          sentOnHide.add(held);
+          if (!sendCarried(held)) sendPriorityPart();
+        }
       }
       if (buffer.length === 0) return;
       const events = buffer.splice(0, buffer.length);
@@ -682,7 +785,7 @@ export function createSessionRuntime(config: WebReplayConfig): SessionRuntime {
         }
         if (chosen.length === 0) break;
         sequenceForTry ??= claimSequence();
-        if (sendFinal({ ...shell, sequence: sequenceForTry, events: chosen })) {
+        if (sendFinal({ ...shell, sequence: sequenceForTry, events: chosen }, false)) {
           requeueFront(rest);
           return;
         }
@@ -691,14 +794,16 @@ export function createSessionRuntime(config: WebReplayConfig): SessionRuntime {
       requeueFront(events);
     },
     carried,
-    carryUnsent: (envelopes) => {
+    carryUnsent: (envelopes, hooked) => {
+      // The transport holds what it sent: after beforeSend, if one ran.
       const mine = envelopes
         .filter((e) => e.sessionId === sessionId && e.events.length > 0)
-        .map((e) => ({
+        .map((e): CarriedBatch => ({
           segmentId: e.segmentId,
           events: e.events,
           page: e.page,
           sequence: e.sequence,
+          ...(hooked?.(e) ? { hooked: true } : {}),
         }));
       carried.unshift(...mine);
     },

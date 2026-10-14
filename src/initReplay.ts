@@ -32,6 +32,8 @@ import { fetchRemoteConfig } from "./remote-config";
 import { getBrowserFingerprint, setStoredFingerprint } from "./fingerprint";
 import {
   applyBeforeSend,
+  applyBeforeSendToCopy,
+  recheckBeforeSend,
   redactUrlForStorage,
   dashboardHostFromApiHost,
   truncate,
@@ -140,6 +142,9 @@ export function initReplay(config: WebReplayConfig): ReplayController {
   // the server says nothing from this page will be accepted.
   const gate = createUploadGate(config.flushIntervalMs ?? 3000);
   let inFlightSend: Promise<void> | null = null;
+  // Regular sends whose events are a beforeSend hook's output (see
+  // CarriedBatch.hooked), so an upload carried on at pagehide keeps the flag.
+  const hookedEnvelopes = new WeakSet<ReplayBatchEnvelope>();
 
   if (config.distinctId)
     sendBatch.setIdentify({ distinctId: config.distinctId });
@@ -276,8 +281,8 @@ export function initReplay(config: WebReplayConfig): ReplayController {
     // number is claimed until a batch is actually built.
     if (!gate.canSend(opts?.ignoreBackoff)) return;
     const generation = session.generation;
-    // Batches an earlier page load of this session held back go first, each
-    // under its own page load's segment.
+    // Carried batches go first, each under its own segment: a failed send
+    // being retried, or what an earlier page load of this session held back.
     const carried = session.carried.shift();
     const events = carried ? carried.events : session.drain();
     if (events.length === 0) return;
@@ -285,7 +290,8 @@ export function initReplay(config: WebReplayConfig): ReplayController {
       projectId: config.projectId,
       sessionId: session.sessionId,
       segmentId: carried ? carried.segmentId : session.segmentId,
-      // A carried upload the previous page left unfinished keeps its number.
+      // A batch sent before (a failed send, an upload the previous page left
+      // unfinished) keeps its number.
       sequence: carried?.sequence ?? session.nextSequence(),
       sentAt: Date.now(),
       sdk: session.sdk,
@@ -293,8 +299,14 @@ export function initReplay(config: WebReplayConfig): ReplayController {
       page: carried?.page ?? session.pageContext(),
       events,
     };
-    const nextEnvelope = applyBeforeSend(config.beforeSend, envelope);
+    // A batch that already went through the hook is resent as it went out;
+    // the hook only decides whether it still may go.
+    const nextEnvelope = carried?.hooked
+      ? recheckBeforeSend(config.beforeSend, envelope)
+      : applyBeforeSend(config.beforeSend, envelope);
     if (!nextEnvelope) return;
+    const hooked = carried?.hooked === true || config.beforeSend !== undefined;
+    if (hooked) hookedEnvelopes.add(nextEnvelope);
     gate.begin();
     const send = (async () => {
       let outcome: SendOutcome;
@@ -303,25 +315,38 @@ export function initReplay(config: WebReplayConfig): ReplayController {
       } catch {
         outcome = { kind: "retry" };
       }
-      // Transient failure: put the events back for the next flush (after the
-      // backoff) rather than drop them — dropping the first batch loses the
-      // rrweb FullSnapshot and makes the recording unplayable. Unless the
-      // session rotated meanwhile: then they belong to the ended session and
-      // are dropped (requeue checks the generation). A batch the server
-      // refused ("drop"/"stop") is never resent.
+      // Transient failure: keep the batch for the next flush (after the
+      // backoff) rather than drop it — dropping the first batch loses the
+      // rrweb FullSnapshot and makes the recording unplayable. It is kept
+      // WHOLE, as it was sent (after beforeSend), and resent under the same
+      // segment and sequence: an attempt may have reached the server with
+      // only the response lost (a timeout, a proxy 504/524, a reset
+      // connection), and the server can dedupe a resend under the same
+      // number — under a new one it stores the events twice, and duplicate rrweb
+      // incrementals can break the replay. Unless the session rotated
+      // meanwhile: then the batch belongs to the ended session and is dropped
+      // (requeue checks the generation). A batch the server refused
+      // ("drop"/"stop") is never resent.
       if (outcome.kind === "retry") {
-        if (!carried) {
-          session.requeue(events, generation, envelope.segmentId, envelope.page);
-        }
-        else if (session.generation === generation) session.carried.unshift(carried);
+        session.requeue(
+          {
+            segmentId: nextEnvelope.segmentId,
+            events: nextEnvelope.events,
+            page: nextEnvelope.page,
+            sequence: nextEnvelope.sequence,
+            ...(hooked ? { hooked: true } : {}),
+          },
+          generation,
+        );
       }
       if (gate.end(outcome) === "halt") {
         haltUploads(
           outcome.kind === "stop" ? outcome.reason : "batches rejected",
         );
       } else if (carried && outcome.kind === "ok") {
-        // An earlier page's batch went first: send this page's own (its base
-        // snapshot) now, not a whole flush interval later.
+        // A carried batch went first: send the next one (or this page's own
+        // events, its base snapshot among them) now, not a whole flush
+        // interval later.
         void flush();
       }
     })();
@@ -1013,8 +1038,13 @@ export function initReplay(config: WebReplayConfig): ReplayController {
     }
     if (endReason) emitSessionEnd(endReason);
     session.flushFinal(
-      (envelope) => {
-        const next = applyBeforeSend(config.beforeSend, envelope);
+      (envelope, hooked) => {
+        // A carried batch the hook already ran on goes out as it is, if the
+        // hook still lets it. Anything else: the hook gets a copy, since what
+        // isn't sent stays held (a smaller retry, the buffer, the outbox).
+        const next = hooked
+          ? recheckBeforeSend(config.beforeSend, envelope)
+          : applyBeforeSendToCopy(config.beforeSend, envelope);
         // Dropped by the hook: nothing to keep for later.
         return next ? sendBatch.sendFinal(next) : true;
       },
@@ -1034,7 +1064,7 @@ export function initReplay(config: WebReplayConfig): ReplayController {
     // First the regular uploads the browser would cancel with the page: they
     // hold the older events, possibly this page's base snapshot.
     // What can't be re-sent now goes with this page's leftovers.
-    session.carryUnsent(sendBatch.redeliverPending());
+    session.carryUnsent(sendBatch.redeliverPending(), (e) => hookedEnvelopes.has(e));
     if (e.persisted) {
       // Into the back/forward cache: it may come back, so the session isn't over.
       inBfcache = started;
@@ -1297,11 +1327,15 @@ export function initReplay(config: WebReplayConfig): ReplayController {
       window.removeEventListener("pageshow", onPageShow);
       session.stopAutoFlush();
       emitSessionEnd("manual");
-      // Deliver what is left, even during a backoff: carried batches from an
-      // earlier page load, then the buffer — one batch per flush.
+      // Deliver what is left, even during a backoff: carried batches, then the
+      // buffer — one batch per flush. Counted once the send in flight is done:
+      // if it fails, its batch is carried and goes first. A carried batch that
+      // goes through sends the next one at once (flush's own `void flush()`):
+      // that send is waited for too, so nothing leaves after stop() resolves.
+      if (inFlightSend) await inFlightSend;
       for (let i = session.carried.length; i >= 0; i -= 1) {
-        if (inFlightSend) await inFlightSend;
         await flush({ ignoreBackoff: true });
+        while (inFlightSend) await inFlightSend;
       }
       stopped = true;
     })()),

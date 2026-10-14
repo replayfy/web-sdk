@@ -5,6 +5,55 @@ All notable changes to `@replayfyapp/browser` are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.19]
+
+### Fixed
+
+- **A failed upload is retried under its own batch number.** When a batch
+  failed all three attempts, its events were put back into the buffer and sent
+  again with the next batch under a new `sequence`. If an attempt had reached
+  the server and only the response was lost (a timeout, a proxy 504/524, a
+  connection reset after the body was read), the server stored the same events
+  twice under two numbers, and duplicate rrweb incrementals can break the
+  replay. The failed batch is now kept whole and resent first, as it was sent:
+  same segment, page and `sequence`, so the server can dedupe a copy that did
+  land. Newer events go in later batches. A batch carried over from an earlier
+  page load no longer loses its number when its send fails either.
+- **A failed batch still waiting when the tab is hidden or closed still sends
+  its errors.** At page close it goes in the unload request under its number
+  if it fits, else to the next page load. If it doesn't fit, its errors,
+  `track()` events and page views go in a request of their own under a new
+  number, as they did in 0.1.18; the rest, its replay stream, keeps the
+  failed batch's number. On a tab switch (a hidden page can be discarded with
+  no further event) it goes the same way, as a copy under its number that is
+  still retried, once per failed send however often the tab is switched.
+- **What is sent never goes through `beforeSend` twice.** An upload still
+  unfinished when the page went away was resent by the next page load through
+  the hook again, on what the hook had already returned, so a hook that isn't
+  idempotent (one that hashes a value, for example) changed it under a number
+  the server might already hold. That batch, and now a retried one, goes out
+  as the hook returned it; the hook is still called, on a copy, and can drop
+  it by returning `null` (consent withdrawn, for example). A batch sent by a
+  page with no hook still goes through the next page's hook. The hide/unload
+  batch now hands the hook a copy too: a hook that edits events in place was
+  applied again to the same events when that batch was retried smaller, or
+  when it was refused and its events were sent later.
+- **`stop()` waits for everything it sends.** If an upload failed while
+  `stop()` was delivering what was left (a batch carried over from an earlier
+  page load, or a failed batch waiting for its retry), `stop()` could resolve
+  with the session end unsent, or send it after resolving.
+- **The 20,000-event cap covers waiting batches too.** During a long outage it
+  counts the batches waiting to be sent (a failed one, an earlier page load's
+  leftovers) together with the buffer and drops the newest events beyond it.
+  The oldest batch, which holds the base snapshot, is kept whole, and a batch
+  already sent once is never cut (it is dropped whole), so a resend under its
+  number is always the same batch.
+
+### Changed
+
+- The package declares the MIT license, matching its `LICENSE` file (it said
+  BSD-3-Clause).
+
 ## [0.1.18]
 
 ### Fixed

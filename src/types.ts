@@ -61,7 +61,12 @@ export interface WebReplayConfig extends ReplayPrivacyConfig {
   /** Inspect or rewrite every batch before it leaves the browser — including
    *  the batch sent when the tab is hidden or the page unloads. Must be
    *  synchronous. Return null (or no events) to drop the batch; a hook that
-   *  throws or returns a Promise also drops it, so nothing unscrubbed is sent. */
+   *  throws or returns a Promise also drops it, so nothing unscrubbed is sent.
+   *  What is sent never goes through it twice: a batch retried after a failed
+   *  upload is resent under the same sequence as the hook first returned it
+   *  (the hook is called again, on a copy, only to let it drop the batch by
+   *  returning null), and the hide/unload batch hands it a copy, so editing
+   *  events in place is safe. */
   beforeSend?: (event: WebReplayEventContext) => WebReplayEventContext | null;
   fetchImpl?: typeof fetch;
   /** Don't start recording at all when the browser sends Do-Not-Track
