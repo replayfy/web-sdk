@@ -24,9 +24,14 @@ export interface SdkRemoteConfig {
     trigger: "always" | "identified" | "sample";
   };
   privacy: {
+    /** Dashboard force: true masks every input value. It can only add
+     *  masking; false leaves the app's own maskAllInputs (default true). */
     maskAllInputs: boolean;
+    /** Combined with the host's maskTextSelector (both apply). */
     maskSelectors: string[];
+    /** Input types always masked, whatever maskAllInputs says. */
     maskInputTypes: string[];
+    /** Combined with the host's blockSelector; invalid entries are dropped. */
     blockSelectors: string[];
     redactUrlPatterns: string[];
     blockCreditCardText: boolean;

@@ -15,9 +15,11 @@ const remoteCfg = (o = {}) => ({
   retentionDays: 30,
 });
 
-async function start({ respond, config = {}, href, storage, remote } = {}) {
-  const b = installBrowser({ href, storage });
-  if (remote !== undefined) globalThis.__remoteConfig = () => remote;
+async function start({ respond, config = {}, href, storage, remote, local } = {}) {
+  const b = installBrowser({ href, storage, local });
+  // `remote` is the config itself, or a function called when the SDK fetches it
+  // (to answer late).
+  if (remote !== undefined) globalThis.__remoteConfig = typeof remote === "function" ? remote : () => remote;
   const f = makeFetch(respond);
   const { initReplay } = await load("initReplay.ts", { stub: true });
   const ctrl = initReplay({ apiKey: "k", apiHost: "https://api.test", flushIntervalMs: 1e9, sessionInactivityMs: 0, fetchImpl: f, ...config });
@@ -838,4 +840,206 @@ test("a beforeSend that grows the unload batch still gets the session_end out", 
   const out = f.calls.slice(n);
   assert.ok(out.length >= 1, "something was sent");
   assert.deepEqual(ends(f).map((e) => e.data.reason), ["unload"]);
+});
+
+// ── Privacy: text, input and selector masking ───────────────────────────────
+
+const withPrivacy = (p = {}) => {
+  const r = remoteCfg();
+  return { ...r, privacy: { ...r.privacy, ...p } };
+};
+/** A remote config that answers `ms` after the SDK asks for it. */
+const later = (value, ms) => () => new Promise((r) => setTimeout(() => r(value), ms));
+const rr = () => globalThis.__rrweb;
+const captureWarns = () => {
+  const w = console.warn;
+  const list = [];
+  console.warn = (...a) => list.push(a.map(String).join(" "));
+  return { list, restore: () => { console.warn = w; } };
+};
+/** A fake element in the recorded document; `seen` collects closest() selectors. */
+const fakeEl = (seen = [], { tag = "p", priv = false } = {}) => ({
+  localName: tag,
+  tagName: tag.toUpperCase(),
+  closest: (s) => { seen.push(s); return priv ? {} : null; },
+  getRootNode: () => globalThis.document,
+  ownerDocument: globalThis.document,
+  getAttribute: () => null,
+  hasAttribute: () => false,
+});
+const fakeInput = (type, attrs = {}, priv = false) => ({
+  ...fakeEl([], { tag: type === "textarea" ? "textarea" : "input", priv }),
+  type,
+  getAttribute: (n) => (n === "type" ? type : n in attrs ? attrs[n] : null),
+  hasAttribute: (n) => n in attrs,
+});
+const RRWEB_INPUT_TYPES = ["color", "date", "datetime-local", "email", "month", "number", "range", "search", "tel", "text", "time", "url", "week", "textarea", "select", "password"];
+
+test("privacy defaults: all text goes through the masker, comments are dropped, inputs are masked", async () => {
+  const { ctrl } = await start();
+  const o = rr().opts;
+  assert.equal(o.maskTextSelector, "*");
+  assert.equal(typeof o.maskTextFn, "function");
+  assert.deepEqual(o.slimDOMOptions, { comment: true });
+  assert.equal(o.maskAllInputs, true);
+  assert.equal(typeof o.maskInputFn, "function");
+  assert.equal(o.maskTextFn("Contact jane.doe@example.com", fakeEl()), "Contact ********@*******.***");
+  assert.equal(o.maskInputFn("hunter2", fakeInput("password")), "", "a password sends no value and no length");
+  assert.equal(o.maskInputFn("hunter2", fakeInput("text", { "data-rr-is-password": "true" })), "", "show-password toggle");
+  assert.equal(o.maskInputFn("hello", fakeInput("text")), "*****");
+  await ctrl.stop();
+});
+
+test("input masking is the app's setting OR the dashboard's force; the dashboard never unmasks", async () => {
+  const cases = [
+    // [case, remote config, app's maskAllInputs, expected]
+    ["no remote config, app unset", undefined, undefined, true],
+    ["dashboard off, app unset", withPrivacy({ maskAllInputs: false }), undefined, true],
+    ["dashboard off, app opted out", withPrivacy({ maskAllInputs: false }), false, false],
+    ["dashboard forces, app opted out", withPrivacy({ maskAllInputs: true }), false, true],
+    ["dashboard off, app on", withPrivacy({ maskAllInputs: false }), true, true],
+  ];
+  for (const [name, remote, maskAllInputs, want] of cases) {
+    const { ctrl } = await start({ remote, config: maskAllInputs === undefined ? {} : { maskAllInputs } });
+    const o = rr().opts;
+    assert.equal(o.maskAllInputs, want, name);
+    assert.equal(typeof o.maskInputFn, "function", name);
+    if (want) {
+      assert.equal(o.maskInputOptions, undefined, `${name}: rrweb builds its own full map`);
+      assert.equal(o.maskInputFn("hello", fakeInput("text")), "*****", name);
+    } else {
+      // Every type reaches maskInputFn, which decides per value.
+      assert.deepEqual(Object.keys(o.maskInputOptions).sort(), [...RRWEB_INPUT_TYPES].sort(), name);
+      assert.equal(o.maskInputFn("hello", fakeInput("text")), "hello", name);
+    }
+    await ctrl.stop();
+  }
+});
+
+test("an app that opts out still gets the reference tracker's plain-mode masks", async () => {
+  const { ctrl } = await start({
+    remote: withPrivacy({ maskAllInputs: false, maskSelectors: ["[data-private]"], maskInputTypes: ["password", "tel"] }),
+    config: { maskAllInputs: false },
+  });
+  const f = rr().opts.maskInputFn;
+  assert.equal(f("hunter2", fakeInput("password")), "");
+  assert.equal(f("hello", fakeInput("text")), "hello");
+  assert.equal(f("me@x.io", fakeInput("text")), "*******", "email-like");
+  assert.equal(f("abc", fakeInput("email")), "***", "type=email");
+  assert.equal(f("card 4111", fakeInput("text")), "*********", "4+ digits");
+  assert.equal(f("2024-01-01", fakeInput("date")), "2024-01-01", "dates are not numbers");
+  assert.equal(f("555", fakeInput("tel")), "***", "a type the workspace masks");
+  assert.equal(f("hello", fakeInput("text", {}, true)), "*****", "inside a private region");
+  await ctrl.stop();
+
+  const { ctrl: c2 } = await start({
+    remote: withPrivacy({ maskAllInputs: false }),
+    config: { maskAllInputs: false, maskInputEmails: false, maskInputNumbers: false },
+  });
+  const g = rr().opts.maskInputFn;
+  assert.equal(g("me@x.io", fakeInput("text")), "me@x.io");
+  assert.equal(g("4111", fakeInput("text")), "4111");
+  assert.equal(g("hunter2", fakeInput("password")), "", "passwords whatever the flags");
+  await c2.stop();
+});
+
+test("host and workspace selectors are combined; an invalid block entry is dropped with one warning", async () => {
+  const w = captureWarns();
+  try {
+    const { ctrl } = await start({
+      remote: withPrivacy({ maskSelectors: ["[data-private]"], blockSelectors: ["[[", ".no-replay"] }),
+      config: { maskTextSelector: ".rpf-mask", blockSelector: ".card" },
+    });
+    const o = rr().opts;
+    const seen = [];
+    o.maskTextFn("some text", fakeEl(seen));
+    assert.deepEqual(seen, [".rpf-mask, [data-private], .rr-mask"]);
+    assert.ok(o.blockSelector.startsWith(".card, .no-replay, "), o.blockSelector);
+    assert.ok(!o.blockSelector.includes("[["), o.blockSelector);
+    // Media inside a private region is recorded as a placeholder.
+    assert.ok(o.blockSelector.includes(":is([data-private]) :is(img, canvas, video, iframe)"), o.blockSelector);
+    assert.equal(w.list.filter((m) => m.includes("block selector")).length, 1);
+    await ctrl.stop();
+  } finally {
+    w.restore();
+  }
+});
+
+test("an invalid mask selector masks all page text, with one warning", async () => {
+  const w = captureWarns();
+  try {
+    const { ctrl } = await start({ remote: withPrivacy({ maskSelectors: ["[["] }), config: { maskTextSelector: ".ok" } });
+    const o = rr().opts;
+    assert.equal(o.maskTextFn("plain words", fakeEl()), "***** *****");
+    assert.equal(o.maskTextFn(".a{b:c}", fakeEl([], { tag: "style" })), ".a{b:c}", "CSS is never altered");
+    assert.equal(o.maskInputFn("hello", fakeInput("text")), "*****");
+    assert.equal(w.list.filter((m) => m.includes("mask selector")).length, 1);
+    await ctrl.stop();
+  } finally {
+    w.restore();
+  }
+});
+
+test("maskTextEmails:false keeps ordinary emails but still wipes private text", async () => {
+  const { ctrl } = await start({ config: { maskTextEmails: false, maskTextSelector: ".s" } });
+  const o = rr().opts;
+  assert.equal(o.maskTextSelector, "*");
+  assert.equal(o.maskTextFn("mail bob@x.io", fakeEl()), "mail bob@x.io");
+  assert.equal(o.maskTextFn("secret", fakeEl([], { priv: true })), "******");
+  await ctrl.stop();
+});
+
+test("late dashboard rules that add masking restart the recorder; the same rules arriving late don't", async () => {
+  const forced = await start({ remote: later(withPrivacy({ maskAllInputs: true }), 400), config: { maskAllInputs: false } });
+  await sleep(100);
+  assert.equal(rr().installs, 2, "restarted for the force");
+  assert.equal(rr().opts.maskAllInputs, true);
+  await forced.ctrl.stop();
+
+  const region = await start({ remote: later(withPrivacy({ maskAllInputs: false, maskSelectors: [".new"] }), 400) });
+  await sleep(100);
+  assert.equal(rr().installs, 2, "restarted for the new private region");
+  const seen = [];
+  rr().opts.maskTextFn("x", fakeEl(seen));
+  assert.deepEqual(seen, [".new, .rr-mask"]);
+  await region.ctrl.stop();
+
+  const same = await start({ remote: later(withPrivacy({ maskAllInputs: false }), 400) });
+  await sleep(100);
+  assert.equal(rr().installs, 1, "nothing changed: no restart");
+  assert.equal(rr().opts.maskAllInputs, true);
+  await same.ctrl.stop();
+});
+
+test("the last dashboard rules are kept per key and applied when the config is late", async () => {
+  const local = new Map();
+  const rules = withPrivacy({ maskAllInputs: true, maskSelectors: ["[data-private]"] });
+  const p1 = await start({ local, remote: rules, config: { maskAllInputs: false } });
+  await p1.ctrl.stop();
+  assert.equal([...local.keys()].filter((k) => k.startsWith("replay:privacy:")).length, 1);
+
+  // The next page's config is slower than the 300ms race: its first snapshot
+  // already has the dashboard's rules.
+  const p2 = await start({ local, remote: later(rules, 2000), config: { maskAllInputs: false } });
+  assert.equal(rr().installs, 1);
+  assert.equal(rr().opts.maskAllInputs, true);
+  const seen = [];
+  rr().opts.maskTextFn("x", fakeEl(seen));
+  assert.deepEqual(seen, ["[data-private], .rr-mask"]);
+  await p2.ctrl.stop();
+
+  // Another key gets nothing from it.
+  const p3 = await start({ local, remote: later(rules, 2000), config: { apiKey: "other", maskAllInputs: false } });
+  assert.equal(rr().opts.maskAllInputs, false);
+  await p3.ctrl.stop();
+
+  // Storage that throws just means no cached rules.
+  const broken = new Map();
+  broken.get = () => { throw new Error("blocked"); };
+  broken.has = () => { throw new Error("blocked"); };
+  broken.set = () => { throw new Error("blocked"); };
+  const p4 = await start({ local: broken, remote: later(rules, 2000), config: { maskAllInputs: false } });
+  assert.equal(rr().installs, 1);
+  assert.equal(rr().opts.maskAllInputs, false);
+  await p4.ctrl.stop();
 });

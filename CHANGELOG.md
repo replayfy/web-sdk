@@ -5,6 +5,79 @@ All notable changes to `@replayfyapp/browser` are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+Text and input masking now follow the usual session-replay defaults. Replays
+look different where they used to show private data: more `*`, and lines of
+masked text can wrap differently, since `*` is not as wide as the letters it
+replaces.
+
+### Fixed
+
+- **Private regions are private again.** Text inside a mask selector
+  (`maskTextSelector`, the workspace's mask selectors, `.rr-mask`) only had its
+  email addresses masked; everything else in it was sent as plain text,
+  because the default email masking replaced the recorder's own masking. It is
+  now replaced by `*` at the same length, spaces kept.
+- **Email addresses in page text are masked.** The email mask only ever ran
+  inside mask selectors, so emails anywhere else were recorded as shown. Every
+  email address in page text is now masked at the same length, keeping `@` and
+  the dots between domain labels (`jane.doe@example.com` →
+  `********@*******.***`); the `[email]` placeholder is gone. Opt out with
+  `maskTextEmails: false`.
+- **The dashboard can no longer unmask inputs.** The workspace's "mask all
+  inputs" setting (off by default) replaced the SDK's `maskAllInputs` default,
+  so most pages recorded what users typed. The app's `maskAllInputs` (default
+  `true`) now decides, and the dashboard can only force masking on: every
+  input, textarea and select value is `*`-masked unless the app sets
+  `maskAllInputs: false`.
+- **Passwords send nothing.** A password field, including one a "show
+  password" toggle switched to text, records an empty value: no characters and
+  no length.
+- **An invalid block selector no longer freezes the replay.** The recorder
+  threw on every DOM change and the replay stopped at its first snapshot. Each
+  host and workspace block selector is now checked, and one the browser can't
+  parse is ignored with a console warning.
+- **CSS is never altered.** Masking inside a private region could rewrite
+  `<style>` text (`url(icon@2x.png)`, `@media`) and break the replay's styling.
+- **Text directly under a shadow root** follows its host: wiped under a
+  private host, email-masked otherwise. Changes to it were sent raw.
+- **Click labels** (rage and dead clicks, heatmaps) are masked like page text:
+  wiped when the clicked element, its label or anything inside it is private,
+  emails masked otherwise. A `<select>` is no longer labelled with the option
+  the user chose.
+
+### Changed
+
+- **Opting out keeps a floor.** With `maskAllInputs: false`, values that look
+  like an email (`type="email"` or containing `@`), values with 4 or more
+  digits in a row (except date inputs), values inside a private region and
+  input types the workspace masks are still masked. The new `maskInputEmails`
+  and `maskInputNumbers` options (default `true`) turn off the first two.
+- **`maskTextNumbers` turns every digit into `0`**, keeping the length. It
+  used to replace runs of 5 or more digits with up to 12 `•`.
+- **Images, canvases, videos and iframes inside a private region** are
+  recorded as placeholders of the same size. A blocked or private iframe's
+  document is no longer recorded.
+- **Host and dashboard selectors are combined.** The workspace's mask and
+  block selectors used to replace the `maskTextSelector` / `blockSelector`
+  passed to `init()` as soon as the dashboard settings arrived, so a host
+  `.rpf-mask` stopped working. Both now apply.
+- **An invalid mask selector masks all page text** (except CSS), with a
+  console warning, instead of masking nothing.
+- **No longer recorded:** HTML comments, `<meta>` content (CSRF tokens and
+  similar), and `href` on HTML elements other than `<link>` (`mailto:` and
+  magic-link anchors replay without their target). Script and `<noscript>`
+  text, including SVG `<script>`, is replaced by `*`.
+- **Late dashboard settings.** The last dashboard privacy settings are kept in
+  `localStorage` per ingest host and key, and a page whose settings are slower
+  than the 300 ms start-up race records its first snapshot with them (they can
+  only add masking). Settings that change mid-page still restart the recorder
+  with a fresh snapshot.
+- **rrweb is pinned to exactly `2.0.0-alpha.20`.** The `^2.0.0-alpha.18` range
+  let npm consumers resolve other versions the masking was not checked
+  against.
+
 ## [0.1.19]
 
 ### Fixed

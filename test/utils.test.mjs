@@ -36,5 +36,7 @@ test("the CDN bundle has no regex lookbehind (a parse error in Safari before 16.
     bundle: true, write: false, format: "iife", platform: "browser", target: "es2017", logLevel: "silent",
   });
   const code = out.outputFiles[0].text;
+  // The text/input masker (src/text-mask.ts) is part of what is checked.
+  assert.ok(code.includes("replay privacy post-pass failed"), "masker missing from the bundle");
   assert.ok(!code.includes("(?<!") && !code.includes("(?<="), "lookbehind found in the bundle");
 });

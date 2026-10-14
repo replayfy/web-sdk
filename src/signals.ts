@@ -7,6 +7,7 @@ import type {
   StackFrame,
 } from "./schema";
 import type { WebReplayConfig } from "./types";
+import type { TextMasker } from "./text-mask";
 import {
   formatConsoleArg,
   redactHeaders,
@@ -366,7 +367,14 @@ type ClickEmit = (
       },
 ) => void;
 
-export function createRageDeadClickCapture(onEvent: ClickEmit): StopHandle {
+/** The part of the text masker a click label needs. */
+type LabelMasker = Pick<TextMasker, "labelFor">;
+
+export function createRageDeadClickCapture(
+  onEvent: ClickEmit,
+  // Read per click: the masker is replaced when the recorder is reinstalled.
+  getTextMasker?: () => LabelMasker | null | undefined,
+): StopHandle {
   const recent: Array<{ x: number; y: number; ts: number }> = [];
   const PROXIMITY_PX = 24;
   const RAGE_WINDOW_MS = 1000;
@@ -406,7 +414,9 @@ export function createRageDeadClickCapture(onEvent: ClickEmit): StopHandle {
     // Mirrors our mobile TapEventData (selector + label + content-normalized
     // coords 0..1e4 + a stable uiId bucket).
     if (isInteractiveEl(target)) {
-      const label = targetLabel(target);
+      // Masked like the replay's text: wiped for a private target, emails
+      // (and digits, if asked) masked otherwise.
+      const label = targetLabel(target, getTextMasker?.() ?? null);
       const nx = normCoord(
         ev.pageX,
         document.documentElement.scrollWidth || window.innerWidth,
@@ -962,10 +972,24 @@ function normSpaces(s: string): string {
 
 /** A human label for a clicked element — attribute label, input placeholder, or
  *  short trimmed text. NEVER an input's actual value (that's user data), except a
- *  submit button's caption. Capped at 100 chars. */
-function targetLabel(el: Element | null): string {
+ *  submit button's caption, and never a <select>'s chosen option (the reference
+ *  tracker doesn't label a select by its text either). Capped at 100 chars.
+ *  With a masker, the label is masked like the replay's text: wiped when the
+ *  target, the element it came from, or anything inside them is private;
+ *  emails (and digits, if asked) masked otherwise. Masked BEFORE the cut: a cut
+ *  through an address would leave a part the email masker no longer sees. */
+export function targetLabel(
+  el: Element | null,
+  masker?: LabelMasker | null,
+): string {
   if (!el) return "";
-  const cap = (s: string) => truncate(normSpaces(s), 100);
+  const mask = (s: string, from: Element | null): string => {
+    if (!masker) return s;
+    const own = from && from !== el ? masker.labelFor(s, from) : s;
+    return masker.labelFor(own, el);
+  };
+  const cap = (s: string, from: Element | null = el) =>
+    truncate(normSpaces(mask(s, from)), 100);
 
   // 1. Author-intent labels on the element itself. `name` is deliberately NOT
   //    here — it is rarely human-facing and used to win over visible text, so a
@@ -976,20 +1000,25 @@ function targetLabel(el: Element | null): string {
     el.getAttribute("title");
   if (direct && normSpaces(direct)) return cap(direct);
 
-  // 2. aria-labelledby → the referenced element(s') text.
+  // 2. aria-labelledby → the referenced element(s') text, each masked for
+  //    where it sits.
   const labelledby = el.getAttribute("aria-labelledby");
   if (labelledby) {
     const doc = el.ownerDocument;
     const txt = labelledby
       .split(/\s+/)
-      .map((id) => (doc ? doc.getElementById(id)?.textContent ?? "" : ""))
+      .map((id) => {
+        const ref = doc ? doc.getElementById(id) : null;
+        return ref ? mask(ref.textContent ?? "", ref) : "";
+      })
       .join(" ");
-    if (normSpaces(txt)) return cap(txt);
+    if (normSpaces(txt)) return truncate(normSpaces(txt), 100);
   }
 
   const tag = el.tagName;
 
-  // 3. Form controls — resolve their human label, NEVER the typed value.
+  // 3. Form controls — resolve their human label, NEVER the typed or chosen
+  //    value.
   if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") {
     const input = el as HTMLInputElement;
     const doc = el.ownerDocument;
@@ -997,9 +1026,9 @@ function targetLabel(el: Element | null): string {
       input.id && doc
         ? doc.querySelector(`label[for="${cssEscape(input.id)}"]`)
         : null;
-    const wrap = el.closest("label");
-    const lbl = (forLabel || wrap)?.textContent;
-    if (lbl && normSpaces(lbl)) return cap(lbl);
+    const labelEl = forLabel || el.closest("label");
+    const lbl = labelEl?.textContent;
+    if (lbl && normSpaces(lbl)) return cap(lbl, labelEl);
     const ph = el.getAttribute("placeholder");
     if (ph && normSpaces(ph)) return cap(ph);
     if (tag === "INPUT") {
@@ -1008,11 +1037,6 @@ function targetLabel(el: Element | null): string {
         return cap(input.value || type);
       if (type === "image")
         return cap(el.getAttribute("alt") || input.value || "image");
-    }
-    if (tag === "SELECT") {
-      const opt = (el as unknown as HTMLSelectElement).selectedOptions?.[0]
-        ?.textContent;
-      if (opt && normSpaces(opt)) return cap(opt);
     }
     // Never leak the typed value; fall back to the field name or control kind.
     return cap(el.getAttribute("name") || tag.toLowerCase());
@@ -1024,8 +1048,9 @@ function targetLabel(el: Element | null): string {
 
   // 5. Icon / image controls with no text: a descendant image's alt, a
   //    labelled descendant, or the element's own alt.
-  const imgAlt = el.querySelector("img[alt]")?.getAttribute("alt");
-  if (imgAlt && normSpaces(imgAlt)) return cap(imgAlt);
+  const img = el.querySelector("img[alt]");
+  const imgAlt = img?.getAttribute("alt");
+  if (imgAlt && normSpaces(imgAlt)) return cap(imgAlt, img);
   const descLabelled =
     el.querySelector("[aria-label]")?.getAttribute("aria-label") ||
     el.querySelector("[title]")?.getAttribute("title") ||

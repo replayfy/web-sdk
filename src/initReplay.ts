@@ -29,6 +29,13 @@ import {
   errorDataFromValue,
 } from "./signals";
 import { fetchRemoteConfig } from "./remote-config";
+import {
+  ALL_INPUT_TYPES,
+  createTextMasker,
+  selectorEntries,
+  validSelector,
+  type TextMasker,
+} from "./text-mask";
 import { getBrowserFingerprint, setStoredFingerprint } from "./fingerprint";
 import {
   applyBeforeSend,
@@ -149,6 +156,72 @@ export function initReplay(config: WebReplayConfig): ReplayController {
   if (config.distinctId)
     sendBatch.setIdentify({ distinctId: config.distinctId });
 
+  // Each invalid selector is reported once per page, however often the
+  // recorder is (re)installed.
+  const warnedSelectors = new Set<string>();
+  const warnSelectors = (bad: string[], what: string) => {
+    const fresh = bad.filter((s) => !warnedSelectors.has(s));
+    if (fresh.length === 0) return;
+    for (const s of fresh) warnedSelectors.add(s);
+    // eslint-disable-next-line no-console
+    console.warn(`[replay-sdk] ${what}:`, fresh);
+  };
+  const warnMaskSelectors = (bad: string[]) =>
+    warnSelectors(bad, "invalid mask selector(s), masking all page text");
+
+  // The masker rrweb's text/input hooks, the event post-pass and the click
+  // labels use. Built from the host config now, so the click capture installed
+  // before rrweb (phase 1) already masks its labels; replaced each time rrweb
+  // is (re)installed with the merged privacy settings.
+  let activeTextMasker: TextMasker = createTextMasker({
+    maskSelectors: [config.maskTextSelector],
+    maskEmails: config.maskTextEmails !== false,
+    maskNumbers: config.maskTextNumbers === true,
+    rootDoc: document,
+    warn: warnMaskSelectors,
+  });
+
+  // The last dashboard privacy rules seen for this ingest host + key, kept so a
+  // page whose remote config is slower than the 300ms race still records its
+  // first snapshot with them (they can only add masking). Per-browser
+  // localStorage; any failure just means no cached rules.
+  const privacyCacheKey = (() => {
+    const owner = `${config.apiHost}|${config.apiKey}`;
+    let h = 5381;
+    for (let i = 0; i < owner.length; i += 1) h = ((h * 33) ^ owner.charCodeAt(i)) >>> 0;
+    return `replay:privacy:${h.toString(36)}`;
+  })();
+  type CachedPrivacy = {
+    forceMaskAllInputs: boolean;
+    maskSelectors: string[];
+    blockSelectors: string[];
+    maskInputTypes: string[];
+  };
+  const strings = (v: unknown): string[] =>
+    Array.isArray(v) ? v.filter((s): s is string => typeof s === "string") : [];
+  const readCachedPrivacy = (): CachedPrivacy | null => {
+    try {
+      const raw = localStorage.getItem(privacyCacheKey);
+      if (!raw) return null;
+      const p = JSON.parse(raw) as Record<string, unknown>;
+      return {
+        forceMaskAllInputs: p.forceMaskAllInputs === true,
+        maskSelectors: strings(p.maskSelectors),
+        blockSelectors: strings(p.blockSelectors),
+        maskInputTypes: strings(p.maskInputTypes),
+      };
+    } catch {
+      return null;
+    }
+  };
+  const writeCachedPrivacy = (p: CachedPrivacy) => {
+    try {
+      localStorage.setItem(privacyCacheKey, JSON.stringify(p));
+    } catch {
+      /* storage blocked or full — the next page just races without it */
+    }
+  };
+
 
   const emit = <TData>(
     event: Omit<ReplayEvent<TData>, "id" | "offsetMs" | "source">,
@@ -213,6 +286,12 @@ export function initReplay(config: WebReplayConfig): ReplayController {
   // would have no base).
   let lastRrwebActivityAt = Date.now();
   const emitSnapshot = (rrwebEvent: eventWithTime) => {
+    // Privacy edits rrweb has no hook for (shadow-root text, href/meta,
+    // blocked iframes, select state), while its mirror still matches the page.
+    activeTextMasker.postProcess(
+      rrwebEvent,
+      (record as unknown as { mirror?: unknown }).mirror,
+    );
     lastRrwebActivityAt = Date.now();
     // The session becomes shippable the moment its first FULL snapshot (type 2)
     // is buffered — every later incremental is a diff against it, so a batch sent
@@ -502,11 +581,15 @@ export function initReplay(config: WebReplayConfig): ReplayController {
     performance?: boolean;
     captureHeaders: boolean;
     captureBodies?: boolean;
-    maskAllInputs?: boolean;
-    /** rrweb maskInputOptions — e.g. { password: true, email: true } */
-    maskInputOptions?: Record<string, boolean>;
-    maskTextSelector?: string;
-    blockSelector?: string;
+    /** The dashboard's "mask all inputs" force. It can only turn masking on:
+     *  the app's own maskAllInputs (default true) is never overridden to off. */
+    forceMaskAllInputs?: boolean;
+    /** Input types the workspace always masks, e.g. ["email", "tel"]. */
+    maskInputTypes?: string[];
+    /** Workspace mask/block selectors, one entry each. Combined with the host's
+     *  maskTextSelector / blockSelector (union), never replacing them. */
+    maskSelectors?: string[];
+    blockSelectors?: string[];
     recordCanvas?: boolean;
     recordCrossOriginIframes?: boolean;
     blockCreditCardText?: boolean;
@@ -556,8 +639,9 @@ export function initReplay(config: WebReplayConfig): ReplayController {
         }),
       );
       syncCapture("rageDead", true, () =>
-        createRageDeadClickCapture((d) =>
-          emit({ ts: Date.now(), type: "custom", data: d }),
+        createRageDeadClickCapture(
+          (d) => emit({ ts: Date.now(), type: "custom", data: d }),
+          () => activeTextMasker,
         ),
       );
       // Performance signals (LCP/CLS/FID/longtask/memory) — ride along
@@ -576,23 +660,69 @@ export function initReplay(config: WebReplayConfig): ReplayController {
       );
       return;
     }
+    // Input masking follows the reference tracker: every value is masked
+    // unless the app opts out in code (maskAllInputs: false). The dashboard
+    // flag can only force masking on; it never unmasks.
+    const maskAllInputs =
+      (config.maskAllInputs ?? true) || effective.forceMaskAllInputs === true;
+    // Password is not a forced type: the masker sends no value for it at all.
+    const forcedTypes = selectorEntries(
+      (effective.maskInputTypes ?? []).map((t) => String(t).toLowerCase()),
+    )
+      .filter((t) => t !== "password")
+      .sort();
+    const maskInputEmails = config.maskInputEmails !== false;
+    const maskInputNumbers = config.maskInputNumbers !== false;
+    // Host and workspace selectors are combined (union): either side can add a
+    // private region or a blocked element, neither can remove the other's.
+    const maskEntries = selectorEntries([
+      config.maskTextSelector,
+      ...(effective.maskSelectors ?? []),
+    ]);
+    // An invalid block selector makes rrweb throw on every DOM mutation (the
+    // replay freezes on its snapshot): drop bad entries one by one.
+    const blockCandidates = selectorEntries([
+      config.blockSelector,
+      ...(effective.blockSelectors ?? []),
+    ]);
+    const blockEntries = blockCandidates.filter((s) => validSelector(s, document));
+    if (blockEntries.length < blockCandidates.length) {
+      warnSelectors(
+        blockCandidates.filter((s) => blockEntries.indexOf(s) === -1),
+        "invalid block selector(s) ignored",
+      );
+    }
+    const textMasker = createTextMasker({
+      maskSelectors: maskEntries,
+      maskEmails: config.maskTextEmails !== false,
+      maskNumbers: config.maskTextNumbers === true,
+      rootDoc: document,
+      warn: warnMaskSelectors,
+      inputs: {
+        maskAll: maskAllInputs,
+        forcedTypes,
+        maskEmails: maskInputEmails,
+        maskNumbers: maskInputNumbers,
+      },
+      blockSelector: blockEntries.join(", ") || undefined,
+    });
+    // Images, canvas, video and iframes inside private regions are recorded
+    // as blocked placeholders.
+    if (textMasker.mediaBlockSelector) blockEntries.push(textMasker.mediaBlockSelector);
     const nextPrivacy = {
-      maskAllInputs: effective.maskAllInputs ?? config.maskAllInputs ?? true, // safe default
-      maskTextSelector: effective.maskTextSelector ?? config.maskTextSelector,
-      blockSelector: effective.blockSelector ?? config.blockSelector,
+      maskAllInputs,
+      // The real selectors (not rrweb's "*"), so a change restarts the recorder.
+      maskTextSelector: maskEntries.join(", ") || undefined,
+      blockSelector: blockEntries.join(", ") || undefined,
       // Host config can force these on without waiting for remote config.
       recordCanvas: effective.recordCanvas ?? config.recordCanvas ?? false,
       recordCrossOriginIframes:
         effective.recordCrossOriginIframes ??
         config.recordCrossOriginIframes ??
         false,
-      // Serialise input-type masks so the change-detection below can use a
-      // simple string equality check.
-      maskInputOptionsKey: Object.keys(
-        effective.maskInputOptions ?? { password: true },
-      )
-        .sort()
-        .join(","),
+      // Serialise the input-masking rules so the change-detection below can
+      // use a simple string equality check.
+      maskInputOptionsKey: `${forcedTypes.join(",")}|${maskInputEmails}|${maskInputNumbers}`,
     };
     const privacyChanged =
       installedPrivacy !== null &&
@@ -622,43 +752,29 @@ export function initReplay(config: WebReplayConfig): ReplayController {
       // them to. A periodic checkout self-heals a lost initial snapshot and lets
       // a live viewer join mid-session. Paired with the flush re-queue.
       rrwebOpts.checkoutEveryNms = 120000;
-      // Default privacy floor for VISIBLE TEXT: mask email addresses in every
-      // text node (opt out with maskTextEmails:false), and optionally long digit
-      // runs (maskTextNumbers). maskAllInputs already covers input VALUES; this
-      // covers free-text PII the reference tracker masks by default.
-      const maskEmails = config.maskTextEmails !== false;
-      if (maskEmails || config.maskTextNumbers) {
-        rrwebOpts.maskTextFn = (text: string): string => {
-          let t = text;
-          if (maskEmails)
-            t = t.replace(/[\w.+-]+@[\w-]+\.[\w.-]+/g, "[email]");
-          if (config.maskTextNumbers)
-            t = t.replace(/\b\d{5,}\b/g, (m) =>
-              "•".repeat(Math.min(m.length, 12)),
-            );
-          return t;
-        };
-      }
-      if (typeof nextPrivacy.maskAllInputs === "boolean")
-        rrwebOpts.maskAllInputs = nextPrivacy.maskAllInputs;
-      if (nextPrivacy.maskTextSelector)
-        rrwebOpts.maskTextSelector = nextPrivacy.maskTextSelector;
+      // Visible text. rrweb only calls maskTextFn for text it already decided
+      // to mask and then uses its result INSTEAD of its "*" wipe, so every
+      // text node is routed through it ("*") and the masker decides per
+      // element: private regions wiped, emails (and digits, if asked) masked
+      // everywhere else, CSS untouched.
+      activeTextMasker = textMasker;
+      rrwebOpts.maskTextSelector = "*";
+      rrwebOpts.maskTextFn = textMasker.maskTextFn;
+      // HTML comments are never recorded (the reference tracker drops them;
+      // rrweb would ship them raw, even inside private regions).
+      rrwebOpts.slimDOMOptions = { comment: true };
+      // Input values. With maskAllInputs rrweb hands every type to
+      // maskInputFn; with the app's opt-out it gets every type too, and the
+      // masker still hides passwords and masks emails, 4+ digit values,
+      // workspace-forced types and anything in a private region.
+      rrwebOpts.maskAllInputs = nextPrivacy.maskAllInputs;
+      if (!nextPrivacy.maskAllInputs) rrwebOpts.maskInputOptions = { ...ALL_INPUT_TYPES };
+      rrwebOpts.maskInputFn = textMasker.maskInputFn;
       if (nextPrivacy.blockSelector)
         rrwebOpts.blockSelector = nextPrivacy.blockSelector;
       if (nextPrivacy.recordCanvas) rrwebOpts.recordCanvas = true;
       if (nextPrivacy.recordCrossOriginIframes)
         rrwebOpts.recordCrossOriginIframes = true;
-      // Always-on input-type masks (password by default, plus anything the
-      // workspace's mask rules implied via `input[type="X"]` selectors).
-      // This wins even when maskAllInputs is false.
-      if (
-        effective.maskInputOptions &&
-        Object.keys(effective.maskInputOptions).length > 0
-      ) {
-        rrwebOpts.maskInputOptions = effective.maskInputOptions;
-      } else {
-        rrwebOpts.maskInputOptions = { password: true };
-      }
       let stop: (() => void) | undefined;
       let heartbeat: ReturnType<typeof setInterval> | undefined;
       try {
@@ -770,8 +886,9 @@ export function initReplay(config: WebReplayConfig): ReplayController {
     // Rage + dead-click detector emits as custom events; the persistence
     // worker counts these into session.rageCount / deadCount.
     syncCapture("rageDead", true, () =>
-      createRageDeadClickCapture((d) =>
-        emit({ ts: Date.now(), type: "custom", data: d }),
+      createRageDeadClickCapture(
+        (d) => emit({ ts: Date.now(), type: "custom", data: d }),
+        () => activeTextMasker,
       ),
     );
     // Performance signals — LCP/CLS/FID via PerformanceObserver,
@@ -843,7 +960,6 @@ export function initReplay(config: WebReplayConfig): ReplayController {
       // installCaptures call disables it.
       performance: true,
       captureHeaders: config.captureHeaders ?? false,
-      maskAllInputs: config.maskAllInputs ?? true,
       // Phase 1 deliberately skips rrweb — see installCaptures internals.
       skipRrweb: true,
     });
@@ -861,13 +977,17 @@ export function initReplay(config: WebReplayConfig): ReplayController {
       // NOW using local config as the source of truth.
       if (remote === null) {
         if (stopping) return;
+        // The workspace's last-seen privacy rules (force flag, selectors,
+        // forced types) apply now, so the first snapshot doesn't wait for a
+        // slow config to mask what the dashboard asked for.
+        const cached = readCachedPrivacy();
         installCaptures({
           console: config.captureConsole !== false,
           network: config.captureNetwork !== false,
           errors: config.captureErrors !== false,
           performance: true,
           captureHeaders: config.captureHeaders ?? false,
-          maskAllInputs: config.maskAllInputs ?? true,
+          ...(cached ?? {}),
         });
         const lateRemote = await remotePromise.catch(() => null);
         if (lateRemote) applyRemoteConfig(lateRemote);
@@ -933,20 +1053,17 @@ export function initReplay(config: WebReplayConfig): ReplayController {
     }
 
     // ---- Capture toggles --------------------------------------------
-    // maskSelectors/blockSelectors arrive as arrays of CSS selectors;
-    // rrweb takes a single comma-joined string for each.
-    const maskTextSelector =
-      (remote.privacy.maskSelectors ?? []).join(", ") || undefined;
-    const blockSelector =
-      (remote.privacy.blockSelectors ?? []).join(", ") || undefined;
-
-    // Build rrweb's maskInputOptions from the server-derived input-type
-    // list. `password` is always included even when the customer disables
-    // maskAllInputs — that's the security floor.
-    const maskInputOptions: Record<string, boolean> = {};
-    for (const t of remote.privacy.maskInputTypes ?? ["password"]) {
-      maskInputOptions[t] = true;
-    }
+    // maskSelectors/blockSelectors arrive as arrays of CSS selectors and stay
+    // arrays: installCaptures validates them one by one and combines them with
+    // the host's. maskAllInputs is the dashboard's force (it can only add
+    // masking); maskInputTypes lists the types the workspace always masks.
+    const privacy: CachedPrivacy = {
+      forceMaskAllInputs: remote.privacy.maskAllInputs === true,
+      maskSelectors: strings(remote.privacy.maskSelectors),
+      blockSelectors: strings(remote.privacy.blockSelectors),
+      maskInputTypes: strings(remote.privacy.maskInputTypes),
+    };
+    writeCachedPrivacy(privacy);
 
     // Remember the rules so identify()-triggered re-evaluation can flip
     // sampling on later when alwaysRecordIdentified=true.
@@ -962,10 +1079,7 @@ export function initReplay(config: WebReplayConfig): ReplayController {
       performance: remote.capture.performance,
       captureHeaders: remote.capture.networkHeaders ?? remote.capture.headers,
       captureBodies: remote.capture.networkBodies,
-      maskAllInputs: remote.privacy.maskAllInputs,
-      maskInputOptions,
-      maskTextSelector,
-      blockSelector,
+      ...privacy,
       recordCanvas: remote.capture.canvas,
       recordCrossOriginIframes: remote.capture.iframe,
       blockCreditCardText: remote.privacy.blockCreditCardText,

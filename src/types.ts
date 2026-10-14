@@ -78,12 +78,38 @@ export interface WebReplayConfig extends ReplayPrivacyConfig {
   /** Record nested CROSS-origin iframes (requires the SDK in the child frame).
    *  Off by default; host override for the remote-config flag. */
   recordCrossOriginIframes?: boolean;
-  /** Mask email addresses inside visible text nodes in the replay. On by default
-   *  (privacy floor); set false to keep raw text. */
+  /** Mask every input value in the replay ("*" per character). Default true.
+   *  Password fields never send a value or a length, whatever this says. With
+   *  false, values are recorded as typed except passwords, values inside a
+   *  private region (maskTextSelector / workspace mask selectors), and — unless
+   *  turned off below — email-like values and values with 4+ digits in a row.
+   *  The dashboard's "mask all inputs" can force masking on; it never turns it
+   *  off. */
+  maskAllInputs?: boolean;
+  /** CSS selector for private regions: their text is replaced by "*" at the
+   *  same length, their input values are masked, and their images, canvases,
+   *  videos and iframes are recorded as placeholders. Combined with the
+   *  workspace's mask selectors (both apply). An invalid selector masks ALL
+   *  page text (with a console warning) rather than none. */
+  maskTextSelector?: string;
+  /** CSS selector for elements to block entirely (a placeholder in the
+   *  replay). Combined with the workspace's block selectors; an invalid entry
+   *  is dropped with a console warning. */
+  blockSelector?: string;
+  /** Mask email addresses in all visible text: every character of the address
+   *  becomes "*" except "@" and the dots between domain labels. On by default;
+   *  set false to keep emails outside private regions readable. */
   maskTextEmails?: boolean;
-  /** Also mask long digit runs (≥5) in visible text (card/PII-looking numbers).
-   *  Off by default (avoids masking order ids / counts). */
+  /** Turn every digit in visible text into "0". Off by default (it hides order
+   *  ids, prices and counts too). */
   maskTextNumbers?: boolean;
+  /** With maskAllInputs: false, still mask input values that look like an
+   *  email (type=email, or containing "@"). Default true. */
+  maskInputEmails?: boolean;
+  /** With maskAllInputs: false, still mask input values with 4 or more digits
+   *  in a row (card, phone and account numbers), except date inputs. Default
+   *  true. */
+  maskInputNumbers?: boolean;
   /** "Don't record this screen" — a deny-list of URL PATH globs (`*` = anything
    *  but `/`, `**` = anything) matched against the current page, e.g.
    *  `["/settings/billing", "/admin/**"]`. An excluded page records nothing and

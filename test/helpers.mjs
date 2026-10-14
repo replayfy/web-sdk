@@ -15,14 +15,17 @@ const STUBS = {
     const full = () => ({ type: 2, timestamp: Date.now(), data: { node: { id: 1 } } });
     export const record = Object.assign(
       (opts) => {
-        r.emit = opts.emit; r.recording = true;
+        r.emit = opts.emit; r.recording = true; r.opts = opts; r.installs = (r.installs || 0) + 1;
         opts.emit(meta()); opts.emit(full()); r.snapshots += 1;
         return () => { r.recording = false; };
       },
       { takeFullSnapshot: () => {
           if (!r.recording) throw new Error("not recording");
           r.emit(meta()); r.emit(full()); r.snapshots += 1;
-        } },
+        },
+        // The SDK's event post-pass reads rrweb's mirror; the fake snapshot
+        // has no node it would look up.
+        mirror: { getNode: () => null } },
     );
     export const addCustomEvent = () => {};`,
   "./signals": `
@@ -78,7 +81,7 @@ export async function load(entry, { stub = false, define = true } = {}) {
 
 /** Install a fake browser: storage, window/document event targets, navigator
  *  (sendBeacon spy), location. Returns handles for driving it. */
-export function installBrowser({ href = "https://app.test/a?token=secret&utm_source=x", visible = true, storage } = {}) {
+export function installBrowser({ href = "https://app.test/a?token=secret&utm_source=x", visible = true, storage, local } = {}) {
   const mkTarget = () => {
     const map = new Map();
     return {
@@ -104,7 +107,13 @@ export function installBrowser({ href = "https://app.test/a?token=secret&utm_sou
     setInterval: (fn, ms) => { const t = setInterval(fn, ms); t.unref?.(); return t; },
     clearInterval: (t) => clearInterval(t),
   });
-  const doc = Object.assign(mkTarget(), { visibilityState: visible ? "visible" : "hidden", title: "Page", referrer: "" });
+  const doc = Object.assign(mkTarget(), {
+    visibilityState: visible ? "visible" : "hidden", title: "Page", referrer: "",
+    // Selector validation: this fake parser rejects anything containing "[[".
+    createDocumentFragment: () => ({
+      querySelector: (sel) => { if (String(sel).includes("[[")) throw new SyntaxError(`bad selector ${sel}`); return null; },
+    }),
+  });
   const beacons = [];
   const nav = {
     userAgent: "node-test",
@@ -113,7 +122,9 @@ export function installBrowser({ href = "https://app.test/a?token=secret&utm_sou
     sendBeacon: (u, blob) => { beacons.push({ url: u, blob }); return true; },
   };
   globalThis.sessionStorage = ss;
-  globalThis.localStorage = { getItem: () => null, setItem: () => {}, removeItem: () => {} };
+  globalThis.localStorage = local
+    ? { getItem: (k) => (local.has(k) ? local.get(k) : null), setItem: (k, v) => local.set(k, String(v)), removeItem: (k) => local.delete(k) }
+    : { getItem: () => null, setItem: () => {}, removeItem: () => {} };
   globalThis.window = win;
   globalThis.document = doc;
   Object.defineProperty(globalThis, "navigator", { value: nav, configurable: true, writable: true });
