@@ -56,6 +56,13 @@ replaces.
   the user chose, and a field's label no longer includes the content of a
   `<textarea>` or `<select>` inside it. Clicks before the replay starts already
   use the workspace's last-seen mask selectors.
+- **URL redaction patterns hide the value, everywhere in the URL.** A
+  workspace pattern such as `token=` replaced only its first match and only
+  the text `token=` itself, so the value after it was still stored. Every
+  match is now redacted, and a pattern ending in `=` also hides the value up
+  to the next `&` or `#`. A pattern that is not a valid regular expression is
+  skipped with a console warning; before, it stopped every dashboard privacy
+  setting from applying on the page.
 - **The page title is masked like page text.** `session_start`, navigation
   events and every batch sent `document.title` as is, so an address in the
   title (`Inbox – jane.doe@example.com`) was recorded in full.

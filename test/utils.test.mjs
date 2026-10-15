@@ -40,3 +40,28 @@ test("the CDN bundle has no regex lookbehind (a parse error in Safari before 16.
   assert.ok(code.includes("replay privacy post-pass failed"), "masker missing from the bundle");
   assert.ok(!code.includes("(?<!") && !code.includes("(?<="), "lookbehind found in the bundle");
 });
+
+test("URL redaction: key-only patterns hide every value, bad patterns are skipped", async () => {
+  const { withRedactedUrl, compileRedactPatterns, redactUrlForStorage } = await load("utils.ts");
+  const warns = [];
+  const realWarn = console.warn;
+  console.warn = (m) => warns.push(m);
+  try {
+    const rx = compileRedactPatterns(["token=", "api_key=", "([", "session-[0-9]+"]);
+    assert.equal(rx.length, 3, "the invalid pattern is skipped");
+    assert.equal(warns.length, 1, "one warning");
+    assert.equal(
+      withRedactedUrl("https://a.io/p?token=abc&x=1&token=def#h", rx),
+      "https://a.io/p?token=[REDACTED]&x=1&token=[REDACTED]#h",
+    );
+    assert.equal(withRedactedUrl("https://a.io/u/session-123/v", rx), "https://a.io/u/[REDACTED]/v");
+    assert.equal(withRedactedUrl("https://a.io/?q=1", [/x*/]), "https://a.io/?q=1", "empty matches change nothing");
+    assert.equal(withRedactedUrl("https://a.io/?a.b=1&acb=2", ["a.b"]), "https://a.io/?a.b[REDACTED]&acb=2", "string keys are literal");
+    assert.equal(
+      redactUrlForStorage("https://a.io/?API_KEY=s3cr3t&u=1", { patterns: compileRedactPatterns(["api_key="]) }),
+      "https://a.io/?API_KEY=[REDACTED]&u=1",
+    );
+  } finally {
+    console.warn = realWarn;
+  }
+});

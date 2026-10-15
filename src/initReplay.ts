@@ -40,6 +40,7 @@ import { getBrowserFingerprint, setStoredFingerprint } from "./fingerprint";
 import {
   applyBeforeSend,
   applyBeforeSendToCopy,
+  compileRedactPatterns,
   recheckBeforeSend,
   redactUrlForStorage,
   dashboardHostFromApiHost,
@@ -1097,9 +1098,7 @@ export function initReplay(config: WebReplayConfig): ReplayController {
       blockCreditCardText: remote.privacy.blockCreditCardText,
       stripQueryParams: remote.privacy.stripQueryParams,
       allowedQueryParams: remote.privacy.allowedQueryParams,
-      redactUrls: remote.privacy.redactUrlPatterns.map(
-        (p) => new RegExp(p, "i"),
-      ),
+      redactUrls: compileRedactPatterns(remote.privacy.redactUrlPatterns),
     });
   } // end applyRemoteConfig
 
