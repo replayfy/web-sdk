@@ -719,7 +719,10 @@ export function createPerformanceCapture(
                 : undefined,
             scriptSource: top?.sourceURL ? redactUrl(top.sourceURL) : undefined,
             scriptFunction: top?.sourceFunctionName || undefined,
-            scriptInvoker: top?.invoker || undefined,
+            // A classic or module script's invoker is its src URL, query
+            // included; an event listener's or callback's (BUTTON#pay.onclick,
+            // Window.setTimeout) has no query for the redaction to touch.
+            scriptInvoker: top?.invoker ? redactUrl(top.invoker) : undefined,
           },
         });
       }
@@ -1155,6 +1158,9 @@ export function createNetworkCapture(
     blockCC?: boolean;
     /** Host and workspace patterns; replaces the install-time host list. */
     patterns?: Array<string | RegExp>;
+    /** false: no request or response body is recorded (the workspace's
+     *  network-bodies setting). Read when the request ends. */
+    bodies?: boolean;
   },
 ): StopHandle {
   const originalFetch = (config.fetchImpl ?? window.fetch).bind(window);
@@ -1169,6 +1175,9 @@ export function createNetworkCapture(
     patterns: config.redactUrls,
     ...(getUrlPolicy?.() ?? {}),
   });
+  // Bodies are read only while the policy records them, so a page whose
+  // workspace doesn't never even clones a response.
+  const bodiesOn = () => getUrlPolicy?.().bodies !== false;
   // Apply the host body sanitizer, if any. null → drop the body.
   const redactBody = (
     body: string | undefined,
@@ -1218,9 +1227,10 @@ export function createNetworkCapture(
       const response = await originalFetch(input, init);
       // Clone the response so we can read the body without breaking the caller.
       let responseBody: string | undefined;
+      const withBodies = bodiesOn();
       try {
         const ct = response.headers.get("content-type") ?? "";
-        if (/json|text|xml|javascript|html/i.test(ct)) {
+        if (withBodies && /json|text|xml|javascript|html/i.test(ct)) {
           const clone = response.clone();
           const text = await clone.text();
           responseBody = truncate(text, MAX_BODY);
@@ -1252,8 +1262,8 @@ export function createNetworkCapture(
               config.redactHeaderNames,
             )
           : undefined,
-        requestBody: redactBody(requestBody, "request", request.url),
-        responseBody: redactBody(responseBody, "response", request.url),
+        requestBody: withBodies ? redactBody(requestBody, "request", request.url) : undefined,
+        responseBody: withBodies ? redactBody(responseBody, "response", request.url) : undefined,
         connectionRtt: conn.rtt,
         connectionEffectiveType: conn.effectiveType,
       });
@@ -1342,6 +1352,7 @@ export function createNetworkCapture(
         try {
           const ct = this.getResponseHeader("content-type") ?? "";
           if (
+            bodiesOn() &&
             /json|text|xml|javascript|html/i.test(ct) &&
             typeof this.responseText === "string"
           ) {
@@ -1384,7 +1395,7 @@ export function createNetworkCapture(
           responseHeaders: config.captureHeaders
             ? redactHeaders(responseHeaders, config.redactHeaderNames)
             : undefined,
-          responseBody,
+          responseBody: redactBody(responseBody, "response", meta.url),
           connectionRtt: conn.rtt,
           connectionEffectiveType: conn.effectiveType,
         });
@@ -1432,7 +1443,8 @@ export function createNetworkCapture(
       try {
         if (!isOwnIngest(urlStr)) {
           let body: string | undefined;
-          if (typeof data === "string") body = truncate(data, MAX_BODY);
+          if (!bodiesOn()) body = undefined;
+          else if (typeof data === "string") body = truncate(data, MAX_BODY);
           else if (data instanceof URLSearchParams)
             body = data.toString().slice(0, MAX_BODY);
           const at = Date.now();
@@ -1446,7 +1458,7 @@ export function createNetworkCapture(
             endedAt: at,
             durationMs: 0,
             ok,
-            requestBody: body,
+            requestBody: redactBody(body, "request", urlStr),
           });
         }
       } catch {

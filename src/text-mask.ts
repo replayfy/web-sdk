@@ -200,7 +200,8 @@ export interface TextMaskerOptions {
   /** Input masking; absent = mask every value. */
   inputs?: InputMaskOptions;
   /** The validated block selector rrweb gets: a blocked iframe's document is
-   *  not recorded (rrweb attaches it anyway). */
+   *  not recorded (rrweb attaches it anyway), and a click label on or holding
+   *  a blocked element is wiped (the replay shows a placeholder there). */
   blockSelector?: string;
 }
 
@@ -217,8 +218,9 @@ export interface TextMasker {
   maskTextFn(text: string, el: Element | null): string;
   /** rrweb maskInputFn. */
   maskInputFn(text: string, el: Element): string;
-  /** A click label: wiped for a private target (or one holding private
-   *  content), else email/number-masked like ordinary text. */
+  /** A click label: wiped for a private or blocked target (or one holding
+   *  private or blocked content), else email/number-masked like ordinary
+   *  text. */
   labelFor(label: string, el: Element | null): string;
   /** document.title, masked like the `<title>` text in the replay. */
   titleFor(title: string): string;
@@ -460,10 +462,27 @@ export function createTextMasker(opts: TextMaskerOptions): TextMasker {
     }
   };
 
+  // A blocked element is a placeholder in the replay: nothing in it is
+  // recorded, its text in a click label included.
+  const blockedLabel = (el: Element | null): boolean => {
+    const sel = opts.blockSelector;
+    if (!sel || !el) return false;
+    try {
+      return (
+        inPrivateRegion(el, sel, rootDoc) ||
+        (typeof el.querySelector === "function" && !!el.querySelector(sel))
+      );
+    } catch {
+      return true;
+    }
+  };
+
   const labelFor = (label: string, el: Element | null): string => {
     try {
       if (!label) return label;
-      return isPrivate(el) || holdsPrivate(el) ? wipeText(label) : scrub(label);
+      return isPrivate(el) || holdsPrivate(el) || blockedLabel(el)
+        ? wipeText(label)
+        : scrub(label);
     } catch {
       return wipeText(label);
     }

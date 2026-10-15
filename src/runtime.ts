@@ -83,12 +83,13 @@ interface SessionRuntime {
   ) => void;
   /** Uploads of this session the page is leaving behind unfinished (too big to
    *  re-send within the unload budget): carried, under their own segment, page
-   *  and sequence, ahead of everything else, and resent as they are when
-   *  `hooked(envelope)` says beforeSend already ran on them. Other sessions'
-   *  are dropped. */
+   *  and sequence, ahead of everything else. `about(envelope)` gives what the
+   *  caller knows of each: whether beforeSend already ran on it (resent as it
+   *  is) and the privacy rules it was recorded under. Other sessions' are
+   *  dropped. */
   carryUnsent: (
     envelopes: ReplayBatchEnvelope[],
-    hooked?: (envelope: ReplayBatchEnvelope) => boolean,
+    about?: (envelope: ReplayBatchEnvelope) => Pick<CarriedBatch, "hooked" | "rules">,
   ) => void;
   /** Batches waiting to be sent ahead of the buffer, oldest first: a regular
    *  send that failed (requeue), or what an earlier page load of THIS session
@@ -100,15 +101,25 @@ interface SessionRuntime {
   /** The page is going away with events it couldn't send (past the unload
    *  budget, or before its first snapshot): hand anything still carried, and
    *  the buffer unless `carriedOnly`, to the next page load of this session in
-   *  this tab, through sessionStorage. Returns false when there was nothing to
-   *  keep or it didn't fit (then it's dropped). */
+   *  this tab, through sessionStorage. A buffer too big for the outbox goes
+   *  without its replay stream (what stays behind is lost unless the page
+   *  comes back from the back/forward cache). Returns false when there was
+   *  nothing to keep or it didn't fit (then it's dropped). */
   stashForNextPage: (carriedOnly?: boolean) => boolean;
   /** The page came back from the back/forward cache. Decide its identity the
    *  way a page load would (continue the tab's session when its last activity
    *  is within the inactivity window, else start a new one) and always start a
-   *  NEW segment: the replay needs a fresh base snapshot for this page. Returns
-   *  true when the session continued. */
+   *  NEW segment: the replay needs a fresh base snapshot for this page. What
+   *  was buffered before the freeze is carried under the old segment, after
+   *  what the outbox gives back (older: stashed at pagehide). Returns true
+   *  when the session continued. */
   restoreFromBfcache: () => boolean;
+  /** Take what another page load of this session left in the outbox after
+   *  this one began (the page left by going back or forward to this one from
+   *  the back/forward cache: the browser can fire its pagehide only after the
+   *  restore), carried after what is already held. An outbox of another
+   *  session is left alone. */
+  adoptOutbox: () => void;
 }
 
 /** How many times the hide/unload batch is tried, halving its room each time. */
@@ -137,6 +148,11 @@ export interface CarriedBatch {
    *  hashes a value would hash the hash). Unset when no hook ran, so a page
    *  that has one still scrubs a batch sent by a page that had none. */
   hooked?: boolean;
+  /** The privacy rules its events were recorded under, as the caller (see
+   *  SessionRuntimeOptions.privacyTag) describes them: opaque here. The page
+   *  that sends the batch checks them against the rules it knows by then.
+   *  Unset for a batch an older SDK version left. */
+  rules?: Record<string, unknown>;
 }
 
 /** Where a page that is going away leaves the events it couldn't send (past
@@ -167,10 +183,20 @@ interface Outbox {
 
 /** Read and always remove the outbox: it is for the very next page load. */
 function takeOutbox(key: string): Outbox | null {
+  const o = readOutbox(key);
+  try {
+    sessionStorage.removeItem(key);
+  } catch {
+    /* storage blocked: nothing was read either */
+  }
+  return o;
+}
+
+/** Read the outbox and leave it in place. */
+function readOutbox(key: string): Outbox | null {
   try {
     const raw = sessionStorage.getItem(key);
     if (raw === null) return null;
-    sessionStorage.removeItem(key);
     const o = JSON.parse(raw) as Partial<Outbox>;
     if (typeof o.sid !== "string" || !Array.isArray(o.batches)) return null;
     const batches = o.batches.filter(
@@ -182,7 +208,8 @@ function takeOutbox(key: string): Outbox | null {
         (b.page === undefined || (typeof b.page === "object" && b.page !== null)) &&
         (b.sequence === undefined ||
           (Number.isInteger(b.sequence) && b.sequence > 0 && b.sequence <= MAX_SEQUENCE)) &&
-        (b.hooked === undefined || typeof b.hooked === "boolean"),
+        (b.hooked === undefined || typeof b.hooked === "boolean") &&
+        (b.rules === undefined || (typeof b.rules === "object" && b.rules !== null)),
     );
     return { sid: o.sid, batches };
   } catch {
@@ -200,6 +227,10 @@ const FINAL_PRIORITY_TYPES = new Set<string>([
   "custom",
   "viewport",
 ]);
+
+/** rrweb's stream: the full snapshot and every event applied on top of it. */
+const isReplayEvent = (e: ReplayEvent) =>
+  e.type === "full_snapshot" || e.type === "incremental_snapshot";
 
 /**
  * Pick which buffered events the hide/unload batch carries within `room`
@@ -222,17 +253,15 @@ function selectForFinalBatch(events: ReplayEvent[], room: number): boolean[] {
     left -= cost;
     return true;
   };
-  const isReplay = (e: ReplayEvent) =>
-    e.type === "full_snapshot" || e.type === "incremental_snapshot";
   for (let i = events.length - 1; i >= 0; i -= 1) {
     if (FINAL_PRIORITY_TYPES.has(events[i].type)) tryTake(i);
   }
   for (let i = 0; i < events.length; i += 1) {
-    if (isReplay(events[i]) && !tryTake(i)) break;
+    if (isReplayEvent(events[i]) && !tryTake(i)) break;
   }
   for (let i = 0; i < events.length && left > 256; i += 1) {
     const e = events[i];
-    if (!take[i] && !isReplay(e) && !FINAL_PRIORITY_TYPES.has(e.type)) tryTake(i);
+    if (!take[i] && !isReplayEvent(e) && !FINAL_PRIORITY_TYPES.has(e.type)) tryTake(i);
   }
   return take;
 }
@@ -487,6 +516,10 @@ function writeStoredSequence(n: number): void {
 export interface SessionRuntimeOptions {
   /** Masks document.title before it goes into a batch's page context. */
   maskTitle?: (title: string) => string;
+  /** The privacy rules the buffered events are recorded under, kept with them
+   *  when they leave the buffer for `carried` or the outbox
+   *  (CarriedBatch.rules). */
+  privacyTag?: () => Record<string, unknown> | undefined;
 }
 
 export function createSessionRuntime(
@@ -495,6 +528,11 @@ export function createSessionRuntime(
 ): SessionRuntime {
   const now = Date.now();
   const page = () => pageContext(options.maskTitle);
+  // The buffer as one carried batch of this page load's segment.
+  const bufferBatch = (events: ReplayEvent[]): CarriedBatch => {
+    const rules = options.privacyTag?.();
+    return { segmentId, events, page: page(), ...(rules ? { rules } : {}) };
+  };
   const inactivityMs = config.sessionInactivityMs ?? DEFAULT_INACTIVITY_MS;
 
   // Decide this page load's session identity:
@@ -806,37 +844,56 @@ export function createSessionRuntime(
       requeueFront(events);
     },
     carried,
-    carryUnsent: (envelopes, hooked) => {
+    carryUnsent: (envelopes, about) => {
       // The transport holds what it sent: after beforeSend, if one ran.
       const mine = envelopes
         .filter((e) => e.sessionId === sessionId && e.events.length > 0)
-        .map((e): CarriedBatch => ({
-          segmentId: e.segmentId,
-          events: e.events,
-          page: e.page,
-          sequence: e.sequence,
-          ...(hooked?.(e) ? { hooked: true } : {}),
-        }));
+        .map((e): CarriedBatch => {
+          const known = about?.(e) ?? {};
+          return {
+            segmentId: e.segmentId,
+            events: e.events,
+            page: e.page,
+            sequence: e.sequence,
+            ...(known.hooked ? { hooked: true } : {}),
+            ...(known.rules ? { rules: known.rules } : {}),
+          };
+        });
       carried.unshift(...mine);
     },
     stashForNextPage: (carriedOnly) => {
       const own: CarriedBatch | null =
-        !carriedOnly && buffer.length > 0
-          ? { segmentId, events: buffer.slice(), page: page() }
-          : null;
-      const candidates = own ? [...carried, own] : carried.slice();
-      if (candidates.length === 0) return false;
+        !carriedOnly && buffer.length > 0 ? bufferBatch(buffer.slice()) : null;
+      const mine = own ? [...carried, own] : carried.slice();
+      if (mine.length === 0) return false;
+      // An outbox of this session already there (this page's own stash at
+      // pagehide, then a stop() from the app's pagehide handler) keeps its
+      // batches, ahead: they are older.
+      const prior = readOutbox(stashKey);
+      const candidates = prior && prior.sid === sessionId ? [...prior.batches, ...mine] : mine;
       // Oldest first; a batch that would push the outbox past its cap is left
-      // out (and stays in memory) without costing the ones that fit.
+      // out (and stays in memory) without costing the ones that fit. The
+      // buffer's events then go without their replay stream (a big snapshot,
+      // most of the time): the session start, page views and errors still
+      // reach the next page load.
       const kept: CarriedBatch[] = [];
+      let ownKept: CarriedBatch | null = null;
       let size = 64 + sessionId.length;
       for (const b of candidates) {
-        const n = JSON.stringify(b).length + 1;
+        let batch = b;
+        let n = JSON.stringify(batch).length + 1;
+        if (size + n > OUTBOX_MAX_CHARS && batch === own) {
+          const rest = own.events.filter((e) => !isReplayEvent(e));
+          batch = { ...own, events: rest };
+          n = rest.length > 0 ? JSON.stringify(batch).length + 1 : Infinity;
+        }
         if (size + n > OUTBOX_MAX_CHARS) continue;
-        kept.push(b);
+        kept.push(batch);
+        if (b === own) ownKept = batch;
         size += n;
       }
-      if (kept.length === 0) return false;
+      // Nothing of this page's fits: the outbox stays as it is.
+      if (!kept.some((b) => b === ownKept || mine.indexOf(b) !== -1)) return false;
       try {
         sessionStorage.setItem(
           stashKey,
@@ -853,13 +910,21 @@ export function createSessionRuntime(
       const remaining = carried.filter((c) => !keptSet.has(c));
       carried.length = 0;
       carried.push(...remaining);
-      if (own && keptSet.has(own)) buffer.splice(0, own.events.length);
+      if (ownKept === own && own) {
+        buffer.splice(0, own.events.length);
+      } else if (ownKept) {
+        // Only the replay stream stays, in order.
+        const stashed = new Set(ownKept.events);
+        const left = buffer.splice(0, buffer.length);
+        for (let i = 0; i < left.length; i += 1) {
+          if (!stashed.has(left[i])) buffer.push(left[i]);
+        }
+      }
       return true;
     },
     restoreFromBfcache: () => {
       const t = Date.now();
       const before = sessionId;
-      const beforeSegment = segmentId;
       let continued = true;
       if (!hostSessionId) {
         // Another page in this tab may have refreshed the activity marker or
@@ -883,26 +948,31 @@ export function createSessionRuntime(
           continued = false;
         }
       }
-      // Events still buffered from before the freeze (not sent yet: held by the
-      // upload gate, or past the unload budget) belong to the OLD segment: send
-      // them under it. If the session changed they belong to an ended one and
-      // are dropped, like rotate() does.
-      if (sessionId === before && buffer.length > 0) {
-        carried.push({
-          segmentId: beforeSegment,
-          events: buffer.splice(0, buffer.length),
-          page: page(),
-        });
-      }
-      buffer.length = 0;
-      // Events a page shown in between left for this session.
+      // Events a page shown in between left for this session, this page's own
+      // stash from its pagehide among them.
       const outbox = takeOutbox(stashKey);
       if (outbox && outbox.sid === sessionId) carried.push(...outbox.batches);
+      // Events still buffered from before the freeze (not sent yet: held by the
+      // upload gate, past the unload budget, or recorded after the stash at
+      // pagehide) belong to the OLD segment: send them under it, after that
+      // segment's stashed events, which are older. If the session changed they
+      // belong to an ended one and are dropped, like rotate() does.
+      if (sessionId === before && buffer.length > 0) {
+        carried.push(bufferBatch(buffer.splice(0, buffer.length)));
+      }
+      buffer.length = 0;
       segmentId = shortId("seg_");
       lastActivityAt = t;
       lastActivityPersist = t;
       writePersistedSession({ sid: sessionId, st: startedAt, la: t });
       return continued;
+    },
+    adoptOutbox: () => {
+      const outbox = readOutbox(stashKey);
+      if (!outbox || outbox.sid !== sessionId) return;
+      takeOutbox(stashKey);
+      carried.push(...outbox.batches);
+      boundBacklog();
     },
   };
 }

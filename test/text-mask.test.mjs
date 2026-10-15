@@ -423,6 +423,18 @@ test("labelFor: private targets (or ones holding private content) are wiped, oth
   assert.equal(m.labelFor("Pay Jane", holder), "*** ****");
 });
 
+test("labelFor: a target on or holding a blocked element is wiped too", () => {
+  const m = masker({ maskSelectors: [".s"], blockSelector: ".no-replay, .card" });
+  const inBlock = el({ closest: (sel) => (sel === ".no-replay, .card" ? {} : null) });
+  assert.equal(m.labelFor("Refund Jane Doe $4,200", inBlock), "****** **** *** ******");
+  const holdsBlock = el({ querySelector: (sel) => (sel === ".no-replay, .card" ? {} : null) });
+  assert.equal(m.labelFor("Refund Jane", holdsBlock), "****** ****");
+  assert.equal(m.labelFor("Refund Jane", el()), "Refund Jane", "outside: as page text");
+  assert.equal(masker({ maskSelectors: [] }).labelFor("Refund Jane", inBlock), "Refund Jane", "no block selector");
+  const broken = el({ closest: (sel) => { if (sel.includes("card")) throw new Error("boom"); return null; } });
+  assert.equal(m.labelFor("Refund Jane", broken), "****** ****", "a failing check wipes it");
+});
+
 // ── postProcess ─────────────────────────────────────────────────────────────
 
 const mirrorOf = (map) => ({ getNode: (id) => map[id] ?? null });

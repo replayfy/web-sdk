@@ -252,13 +252,13 @@ masked. Tune redaction with these options:
 
 - **`maskAllInputs`** (default `true`) — masks the value of every input field in the replay. With `false`, values are recorded as typed, except passwords, values inside a private region, and (unless `maskInputEmails` / `maskInputNumbers` are set to `false`) email-like values and values with 4 or more digits in a row. Hidden, file, url, color, month, week, datetime-local and image inputs never send a value, whatever this says.
 - **`maskTextSelector`** — a CSS selector for private regions (e.g. `.pii, .account-number`). Their text is replaced by `*` at the same length, their input values are masked, and their images, canvases, videos and iframes render as placeholders.
-- **`blockSelector`** — a CSS selector for elements to block entirely; they render as a placeholder in playback.
+- **`blockSelector`** — a CSS selector for elements to block entirely; they render as a placeholder in playback, and a click on them carries no label text.
 - **`maskTextEmails`** (default `true`) — masks email addresses in all page text at the same length; `@` and the dots stay, so the replay still reads as an address.
 - **`maskTextNumbers`** (default `false`) — turns every digit in page text into `0`.
 - **`redactUrls`** — string/`RegExp` patterns stripped from captured network request and resource URLs, so tokens and ids never leave the page. Combined with the workspace's URL patterns (both apply). Page URLs always get the built-in sensitive-key scrub (`token`, `code`, `password`…).
 - **`captureHeaders`** (default `false`) — headers are only captured when explicitly enabled.
 - **`redactHeaderNames`** — additional header names whose values are masked, on top of the always-on built-in deny-list.
-- **`maxBodyBytes`** — caps how much of a request/response body is ever captured.
+- **`maxBodyBytes`** — caps how much of a request/response body is ever captured. Bodies are only captured when the dashboard's "Capture request / response bodies" setting is on (off by default).
 
 CSS text is never altered, script and `<noscript>` text is never sent readable,
 and HTML comments, `<meta>` content and link targets (`href` on HTML elements
@@ -312,12 +312,20 @@ Privacy settings are combined, so the dashboard can only add masking:
 - The dashboard's mask and block selectors apply together with
   `maskTextSelector` / `blockSelector`; neither replaces the other.
 - A page uploads nothing until the dashboard's privacy settings have arrived,
-  for up to 4 seconds. Recording starts at once, under the last settings seen
-  in this browser or, on a first visit, the dashboard's defaults
-  (`[data-private]` and `.sensitive` masked, `.no-replay` blocked). If the
+  for up to 4 seconds (a failed request for them is retried meanwhile). On a
+  fast connection they arrive before the first upload would go, so nothing
+  waits. Recording starts at once, under the last settings seen in this
+  browser or, on a first visit, the dashboard's defaults (`[data-private]`
+  and `.sensitive` masked, `.no-replay` blocked, no request bodies). If the
   settings that arrive hide more, what was recorded before them is discarded
-  and the replay starts from a fresh snapshot. A page closed during that wait
-  sends no replay. When the settings can't be fetched, the defaults apply.
+  and the replay starts from a fresh snapshot; events of a capture they turn
+  off (network, console, performance) are discarded too. A page closed,
+  stopped or put in the back/forward cache during that wait hands what it
+  recorded to the next page of the session in the same tab (or to itself,
+  when it comes back), which sends it once it has the settings (its replay
+  only if they hide nothing more); if no page follows, it is never sent. When
+  the settings can't be fetched, the last settings seen in this browser apply
+  or, on a first visit, the dashboard's defaults.
 
 ## Links
 

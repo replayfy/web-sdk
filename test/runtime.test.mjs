@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { installBrowser, load, outboxKeys, TEST_SDK_VERSION } from "./helpers.mjs";
+import { installBrowser, load, outboxKeys, readOutbox, TEST_SDK_VERSION } from "./helpers.mjs";
 
 const cfg = (x = {}) => ({ apiKey: "k", apiHost: "https://api.test", ...x });
 const ev = (type, i, data = {}) => ({ id: `${type}-${i}`, ts: 1000 + i, offsetMs: i, source: "web", type, data });
@@ -383,14 +383,59 @@ test("carryUnsent: an unfinished upload of this session is carried first, keepin
     hooked,
     { sessionId: rt.sessionId, segmentId: rt.segmentId, sequence: 6, sentAt: 1, sdk: rt.sdk, page, events: [ev("custom", 5)] },
     { sessionId: "ses_other", segmentId: "x", sequence: 8, sentAt: 1, sdk: rt.sdk, page, events: [ev("custom", 9)] },
-  ], (e) => e === hooked);
+  ], (e) => ({ hooked: e === hooked, rules: e === hooked ? { maskEntries: [".s"] } : undefined }));
   assert.deepEqual(rt.carried.map((c) => [c.segmentId, c.sequence]), [[rt.segmentId, 7], [rt.segmentId, 6], ["seg_later", undefined]]);
-  // flagged only when beforeSend ran on what was sent (the caller knows)
+  // flagged only when beforeSend ran on what was sent, and with the rules it
+  // was recorded under (the caller knows)
   assert.deepEqual(rt.carried.map((c) => c.hooked), [true, undefined, undefined]);
-  // it survives the outbox with its number
+  assert.deepEqual(rt.carried.map((c) => c.rules), [{ maskEntries: [".s"] }, undefined, undefined]);
+  // it survives the outbox with its number and rules
   rt.stashForNextPage();
   const next = createSessionRuntime(cfg());
-  assert.deepEqual(next.carried.map((c) => [c.sequence, c.hooked]), [[7, true], [6, undefined], [undefined, undefined]]);
+  assert.deepEqual(next.carried.map((c) => [c.sequence, c.hooked, c.rules]), [[7, true, { maskEntries: [".s"] }], [6, undefined, undefined], [undefined, undefined, undefined]]);
+});
+
+test("the buffer leaves with the privacy tag, and an outbox already there is kept ahead of it", async () => {
+  installBrowser();
+  const { createSessionRuntime } = await load("runtime.ts");
+  let tag = { rules: "a" };
+  const rt = createSessionRuntime(cfg({ sessionInactivityMs: 60_000 }), { privacyTag: () => tag });
+  rt.push(ev("custom", 1));
+  assert.equal(rt.stashForNextPage(), true);
+  // A stop() in the app's own pagehide handler stashes again: the first
+  // stash stays, in front.
+  tag = { rules: "b" };
+  rt.push(ev("session_end", 2));
+  assert.equal(rt.stashForNextPage(), true);
+  const next = createSessionRuntime(cfg({ sessionInactivityMs: 60_000 }));
+  assert.deepEqual(next.carried.map((c) => [c.events[0].type, c.rules]), [["custom", { rules: "a" }], ["session_end", { rules: "b" }]]);
+});
+
+test("a buffer too big for the outbox goes without its replay stream, which stays in memory", async () => {
+  const store = new Map();
+  installBrowser({ storage: store });
+  const { createSessionRuntime } = await load("runtime.ts");
+  const rt = createSessionRuntime(cfg({ sessionInactivityMs: 60_000 }));
+  rt.push(ev("session_start", 1));
+  rt.push({ ...ev("full_snapshot", 2), data: { pad: "x".repeat(1_100_000) } });
+  rt.push(ev("custom", 3));
+  assert.equal(rt.stashForNextPage(), true);
+  const outbox = readOutbox(store);
+  assert.deepEqual(outbox.batches[0].events.map((e) => e.type), ["session_start", "custom"]);
+  assert.deepEqual(rt.drain().map((e) => e.type), ["full_snapshot"], "the snapshot stays, for a back/forward-cache restore");
+});
+
+test("a back/forward-cache restore carries the old segment's buffer after what the outbox gives back", async () => {
+  installBrowser();
+  const { createSessionRuntime } = await load("runtime.ts");
+  const rt = createSessionRuntime(cfg({ sessionInactivityMs: 60_000 }), { privacyTag: () => ({ rules: "t" }) });
+  const seg = rt.segmentId;
+  rt.push(ev("session_start", 1));
+  rt.stashForNextPage(); // pagehide
+  rt.push(ev("custom", 2)); // recorded after it, before the freeze
+  rt.restoreFromBfcache();
+  assert.deepEqual(rt.carried.map((c) => [c.segmentId, c.events[0].type, c.rules]), [[seg, "session_start", { rules: "t" }], [seg, "custom", { rules: "t" }]]);
+  assert.notEqual(rt.segmentId, seg);
 });
 
 test("unload: a carried batch beforeSend already ran on is flagged, so the hook isn't run again", async () => {
@@ -518,4 +563,28 @@ test("outbox: a failed or oversized stash keeps the events in memory", async () 
   assert.equal(rt.carried.length, 1);
   assert.deepEqual(rt.drain().map((e) => e.id), ["custom-2"]);
   assert.ok(b.store.size > 0);
+});
+
+test("adoptOutbox takes an outbox of this session written after the page began, and leaves another session's", async () => {
+  const store = new Map();
+  installBrowser({ storage: store });
+  const { createSessionRuntime } = await load("runtime.ts");
+  const rt = createSessionRuntime(cfg({ sessionInactivityMs: 60_000 }));
+  rt.adoptOutbox();
+  assert.equal(rt.carried.length, 0, "no outbox: nothing changes");
+  // The outbox key is per ingest host + key: stash once to find it.
+  rt.push(ev("custom", 1));
+  rt.stashForNextPage();
+  const key = outboxKeys(store)[0];
+  rt.adoptOutbox();
+  assert.deepEqual(rt.carried.map((c) => c.events[0].id), ["custom-1"], "its own stash, taken back");
+  rt.carried.length = 0;
+  store.set(key, JSON.stringify({ sid: "ses_other", batches: [{ segmentId: "seg_o", events: [ev("custom", 2)] }] }));
+  rt.adoptOutbox();
+  assert.ok(store.has(key) && rt.carried.length === 0, "another session's outbox stays");
+  rt.carried.push({ segmentId: "seg_held", events: [ev("custom", 3)] });
+  store.set(key, JSON.stringify({ sid: rt.sessionId, batches: [{ segmentId: "seg_left", events: [ev("custom", 4)] }] }));
+  rt.adoptOutbox();
+  assert.equal(store.has(key), false, "taken");
+  assert.deepEqual(rt.carried.map((c) => c.segmentId), ["seg_held", "seg_left"], "after what was held");
 });

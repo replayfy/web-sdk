@@ -4,7 +4,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
-import { installBrowser, load, makeFetch, ok, json, sleep, types, readOutbox, TEST_SDK_VERSION } from "./helpers.mjs";
+import { installBrowser, load, makeFetch, ok, json, sleep, types, readOutbox, outboxKeys, TEST_SDK_VERSION } from "./helpers.mjs";
 
 const remoteCfg = (o = {}) => ({
   workspaceId: 1,
@@ -719,6 +719,21 @@ test("leftovers are handed on when the page goes into the back/forward cache too
   await p2.ctrl.stop();
 });
 
+test("a flush between pagehide and the freeze leaves the page's own outbox for the next page", async () => {
+  const storage = new Map();
+  const conf = { sessionInactivityMs: 60_000 };
+  const p1 = await start({ storage, config: conf });
+  for (let i = 0; i < 160; i += 1) p1.ctrl.track(`t${i}`, { v: randomBytes(300).toString("base64") });
+  p1.b.pagehide(true);
+  assert.ok(readOutbox(storage), "leftovers stashed");
+  await p1.ctrl.flush(); // a timer firing before the page is frozen
+  assert.ok(readOutbox(storage), "still there for the next page load");
+  p1.b.pageshow(true); // or back to this page: the restore takes it
+  await sleep(50);
+  assert.equal(readOutbox(storage), null);
+  await p1.ctrl.stop();
+});
+
 test("a page that doesn't record still hands an earlier page's leftovers on", async () => {
   const storage = new Map();
   const conf = { sessionInactivityMs: 60_000 };
@@ -1114,11 +1129,13 @@ test("before rrweb starts, click labels already use the cached dashboard selecto
 // ── Privacy hold: nothing leaves before the workspace's rules are known ─────
 
 /** initReplay without waiting for anything (start() waits out the race).
- *  `at(ms)` sleeps until `ms` after init. */
-async function boot({ remote, config = {}, storage, local, href } = {}) {
+ *  `at(ms)` sleeps until `ms` after init. `loading`: the document is still
+ *  loading (rrweb snapshots at the window's load event). */
+async function boot({ remote, config = {}, storage, local, href, respond, loading = false } = {}) {
   const b = installBrowser({ storage, local, href });
+  if (loading) globalThis.__rrweb.loading = true;
   if (remote !== undefined) globalThis.__remoteConfig = typeof remote === "function" ? remote : () => remote;
-  const f = makeFetch();
+  const f = makeFetch(respond);
   const { initReplay } = await load("initReplay.ts", { stub: true });
   const t0 = Date.now();
   const ctrl = initReplay({ apiKey: "k", apiHost: "https://api.test", flushIntervalMs: 1e9, sessionInactivityMs: 0, fetchImpl: f, ...config });
@@ -1127,27 +1144,31 @@ async function boot({ remote, config = {}, storage, local, href } = {}) {
 const { redactUrlForStorage: redactUrl } = await load("utils.ts");
 const RAW_URL = "https://cdn.test/x.js?sessref=s1&ok=1";
 /** What the page does: a DOM change tagged `tag`, a heatmap click (its label
- *  is page text), a rage click, a request and a resource load whose URL
- *  carries `sessref=s1`, as the real captures would record them now. */
+ *  is page text), a rage click, a request, a resource load and a long frame
+ *  whose script URL carries `sessref=s1`, as the real captures would record
+ *  them now. */
 function act(tag) {
   rr().emit({ type: 3, timestamp: Date.now(), data: { source: 0, tag } });
   globalThis.__emitClick({ kind: "click", selector: "button.pay", label: `Pay Jane ${tag}`, nx: 1, ny: 1, uiId: "u" });
   globalThis.__emitClick({ kind: "rage_click", x: 1, y: 1, selector: "button.pay", count: 3 });
   const { cfg, getUrlPolicy, emit } = globalThis.__netCapture;
   emit({ requestId: tag, transport: "fetch", method: "GET", url: redactUrl(RAW_URL, { patterns: cfg.redactUrls, ...getUrlPolicy() }), startedAt: Date.now() });
-  globalThis.__perfEmit({ kind: "perf", metric: "resource", value: 5, ts: Date.now(), detail: { name: globalThis.__perfOpts.redactUrl(RAW_URL) } });
+  const perfUrl = globalThis.__perfOpts.redactUrl(RAW_URL);
+  globalThis.__perfEmit({ kind: "perf", metric: "resource", value: 5, ts: Date.now(), detail: { name: perfUrl } });
+  globalThis.__perfEmit({ kind: "perf", metric: "long_animation_frame", value: 80, ts: Date.now(), detail: { scriptSource: perfUrl, scriptInvoker: perfUrl } });
 }
 const isReplay = (e) => e.type === "full_snapshot" || e.type === "incremental_snapshot";
 const tagged = (events, tag) => events.some((e) => e.data?.rrwebEvent?.data?.tag === tag);
 const clickLabels = (events) => events.filter((e) => e.type === "custom" && e.data.kind === "click").map((e) => e.data.label);
 /** Which recorder install took each full snapshot sent. */
 const fullInstalls = (events) => events.filter((e) => e.type === "full_snapshot").map((e) => e.data.rrwebEvent.data.install);
-/** The batch's replay stream starts at a full snapshot (rrweb's Meta event
- *  may come first): no diff without its base. */
+/** The batch's replay stream starts at a full snapshot (rrweb's Meta event,
+ *  and its DOMContentLoaded and Load events, may come first): no diff
+ *  without its base. */
 const snapshotLed = (envelope) => {
   const t = envelope.events.filter(isReplay).map((e) => e.data.rrwebEvent.type);
   const k = t.indexOf(2);
-  return k >= 0 && t.slice(0, k).every((x) => x === 4);
+  return k >= 0 && t.slice(0, k).every((x) => x === 4 || x === 0 || x === 1);
 };
 const maskSeen = () => {
   const seen = [];
@@ -1160,7 +1181,7 @@ test("privacy hold: a first visit whose config loses the race uploads nothing be
   // Click labels already use the defaults before rrweb starts.
   const seen0 = [];
   globalThis.__clickMasker().labelFor("x", fakeEl(seen0));
-  assert.deepEqual(seen0, [".rpf-mask, [data-private], .sensitive, .rr-mask"]);
+  assert.deepEqual(seen0, [".rpf-mask, [data-private], .sensitive, .rr-mask", ".no-replay"]);
   await at(450);
   assert.equal(rr().installs, 1, "rrweb started at the race's timeout");
   assert.deepEqual(maskSeen(), [".rpf-mask, [data-private], .sensitive, .rr-mask"]);
@@ -1208,6 +1229,12 @@ test("privacy hold: rules stricter than the provisional ones drop what was recor
   assert.ok(net && !net.data.url.includes("s1") && net.data.url.includes("ok=1"), net?.data.url);
   const res = sent.find((e) => e.type === "performance" && e.data.metric === "resource");
   assert.ok(res && !res.data.detail.name.includes("s1"), res?.data.detail.name);
+  // A long frame's script URL and its invoker (a script's src) too.
+  const loaf = sent.find((e) => e.type === "performance" && e.data.metric === "long_animation_frame");
+  assert.ok(loaf, "the long frame is kept");
+  for (const k of ["scriptSource", "scriptInvoker"]) {
+    assert.ok(!loaf.data.detail[k].includes("s1") && loaf.data.detail[k].includes("ok=1"), loaf.data.detail[k]);
+  }
   await ctrl.stop();
 });
 
@@ -1225,14 +1252,19 @@ test("privacy hold: no config (a 404) releases it, with the server's defaults ke
   await ctrl.stop();
 });
 
-test("privacy hold: stop() before the rules are known sends nothing recorded under the provisional ones", async () => {
-  const { f, ctrl, at } = await boot({ remote: later(withPrivacy({ maskSelectors: [".custom-secret"] }), 700) });
+test("privacy hold: stop() before the rules are known sends nothing; it hands it all on, with the rules it was recorded under", async () => {
+  const storage = new Map();
+  const { f, ctrl, at } = await boot({ storage, remote: later(withPrivacy({ maskSelectors: [".custom-secret"] }), 700) });
   await at(450);
   act("p");
   await ctrl.stop();
   await at(800);
   assert.equal(f.calls.length, 0);
   assert.equal(rr().installs, 1, "the late config doesn't restart the recorder");
+  const outbox = readOutbox(storage);
+  const held = outbox.batches.flatMap((x) => x.events);
+  assert.ok(tagged(held, "p") && held.some((e) => e.type === "session_end" && e.data.reason === "manual"), types({ events: held }).join(","));
+  assert.deepEqual(outbox.batches[0].rules.maskEntries, ["[data-private]", ".sensitive"], "recorded under the server's defaults");
 });
 
 test("privacy hold: a config that doesn't answer is waited for 4 s; when it comes later, what is not sent yet still gets its rules", async () => {
@@ -1253,38 +1285,318 @@ test("privacy hold: a config that doesn't answer is waited for 4 s; when it come
   await ctrl.stop();
 });
 
-test("privacy hold: a page closed before its rules are known sends no DOM event; the rest goes to the next page load", async () => {
-  const storage = new Map();
+/** Page 1 of a session: closed during its hold, with the config `remote`
+ *  answers late. */
+async function closedInHold(storage, remote, { local } = {}) {
   const conf = { sessionInactivityMs: 60_000 };
-  const rules = withPrivacy({ maskSelectors: [".custom-secret"] });
-  const p1 = await boot({ storage, config: conf, remote: later(rules, 3000), href: "https://app.test/landing?utm_source=google" });
+  const p1 = await boot({ storage, local, config: conf, remote: later(remote, 3000), href: "https://app.test/landing?utm_source=google" });
   await p1.at(450);
   act("p");
   p1.b.pagehide(false);
   p1.b.hide(); // the browser fires visibilitychange right after pagehide
   await sleep(20);
   assert.equal(p1.f.calls.length, 0, "nothing sent on the way out");
-  const outbox = readOutbox(storage);
-  const held = outbox.batches.flatMap((x) => x.events);
-  assert.ok(held.some((e) => e.type === "session_start"), "the landing page's session start is handed on");
-  for (const e of held) {
-    assert.ok(!isReplay(e) && e.type !== "network", e.type);
-    assert.ok(!(e.type === "custom" && e.data.kind === "click"), "no click label");
-    assert.ok(!(e.type === "performance" && e.data.metric === "resource"), "no resource URL");
-    assert.equal(e.data?.title, undefined, "no page title");
-  }
-  assert.ok(outbox.batches.every((x) => !x.page.title));
   await p1.ctrl.stop();
+  return { conf, outbox: readOutbox(storage) };
+}
+
+test("privacy hold: a page closed before its rules are known sends nothing; the next page load sends its replay only if the workspace's rules hide nothing more", async () => {
+  const strict = withPrivacy({ maskSelectors: [".custom-secret"], redactUrlPatterns: ["sessref="] });
+  const storage = new Map();
+  const { conf, outbox } = await closedInHold(storage, strict);
+  // Everything is handed on (it stays on the device), with its rules.
+  const held = outbox.batches.flatMap((x) => x.events);
+  assert.ok(tagged(held, "p") && held.some((e) => e.type === "session_start"), types({ events: held }).join(","));
   const seg1 = outbox.batches[0].segmentId;
-  const p2 = await start({ storage, config: conf, remote: rules, href: "https://app.test/home" });
+  const p2 = await start({ storage, config: conf, remote: strict, href: "https://app.test/home" });
   const fromP1 = p2.f.calls.map((c) => c.envelope).filter((e) => e.segmentId === seg1);
   assert.ok(fromP1.length >= 1, "page 1's events went out with page 2");
   assert.match(fromP1[0].page.url, /\/landing\?utm_source=google/);
   const sent = fromP1.flatMap((e) => e.events);
   assert.ok(types({ events: sent }).includes("session_start"));
-  assert.ok(!sent.some(isReplay) && clickLabels(sent).length === 0);
+  assert.ok(!sent.some(isReplay) && clickLabels(sent).length === 0, "no replay, no click label: those rules hide more");
+  assert.ok(sent.every((e) => e.data?.title === undefined) && fromP1.every((e) => !e.page.title), "nor a title");
+  const net = sent.find((e) => e.type === "network");
+  assert.ok(net && !net.data.url.includes("s1"), "request URLs get page 2's rules");
+  assert.ok(sent.some((e) => e.type === "custom" && e.data.kind === "rage_click"));
   assert.ok(p2.f.calls.some((c) => c.envelope.segmentId !== seg1 && snapshotLed(c.envelope)), "page 2's own replay");
   await p2.ctrl.stop();
+
+  // The same rules as the server's defaults: page 1's replay goes, whole.
+  const storage2 = new Map();
+  const same = withPrivacy(DEFAULT_RULES);
+  const r2 = await closedInHold(storage2, same);
+  const seg = r2.outbox.batches[0].segmentId;
+  const q2 = await start({ storage: storage2, config: r2.conf, remote: same, href: "https://app.test/home" });
+  const page1 = q2.f.calls.map((c) => c.envelope).filter((e) => e.segmentId === seg);
+  assert.ok(page1.length >= 1 && snapshotLed(page1[0]), "page 1's replay starts at its snapshot");
+  const sent2 = page1.flatMap((e) => e.events);
+  assert.ok(tagged(sent2, "p"));
+  assert.deepEqual(clickLabels(sent2), ["Pay Jane p"]);
+  await q2.ctrl.stop();
+});
+
+test("privacy hold: a returning visitor's page closed in its hold keeps its replay when the remembered rules were right", async () => {
+  const local = new Map();
+  const rules = withPrivacy({ maskSelectors: [".acct"] });
+  const p0 = await start({ local, remote: rules });
+  await p0.ctrl.stop();
+  const storage = new Map();
+  const { conf, outbox } = await closedInHold(storage, rules, { local });
+  const seg1 = outbox.batches[0].segmentId;
+  const p2 = await start({ storage, local, config: conf, remote: rules });
+  const page1 = p2.f.calls.map((c) => c.envelope).filter((e) => e.segmentId === seg1);
+  assert.ok(page1.length >= 1 && snapshotLed(page1[0]));
+  assert.ok(tagged(page1.flatMap((e) => e.events), "p"));
+  await p2.ctrl.stop();
+});
+
+test("privacy hold: a back/forward-cache round trip in the hold sends nothing the workspace's rules hide, in either segment", async () => {
+  const conf = { sessionInactivityMs: 60_000 };
+  const strict = withPrivacy({ maskSelectors: [".custom-secret"] });
+  const { b, f, ctrl, at } = await boot({ config: conf, remote: later(strict, 1500) });
+  await at(450);
+  act("pre");
+  b.pagehide(true);
+  act("post"); // recorded after pagehide, before the page froze
+  b.pageshow(true);
+  await at(700);
+  assert.equal(f.calls.length, 0, "still held");
+  await at(1700);
+  assert.ok(f.calls.length >= 1, "released when the config arrived");
+  const sent = all(f);
+  assert.ok(!tagged(sent, "pre") && !tagged(sent, "post"), "no DOM change recorded under the provisional rules");
+  assert.deepEqual(clickLabels(sent), []);
+  assert.ok(fullInstalls(sent).every((n) => n === 2), "only snapshots of the restarted recorder");
+  // Each segment's replay starts at a full snapshot, or has none.
+  const bySeg = new Map();
+  for (const env of f.batches()) bySeg.set(env.segmentId, [...(bySeg.get(env.segmentId) ?? []), ...env.events]);
+  for (const [seg, events] of bySeg) {
+    const t = events.filter(isReplay).map((e) => e.data.rrwebEvent.type).filter((x) => x !== 4);
+    assert.ok(t.length === 0 || t[0] === 2, `${seg}: ${t.join(",")}`);
+  }
+  assert.ok(bySeg.size >= 2, "the old segment's events and the restored page's");
+  await ctrl.stop();
+
+  // Restored, then left again in the hold: the outbox keeps the rules, and
+  // the next page load (which knows them) sends no DOM event of either.
+  const storage = new Map();
+  const p1 = await boot({ storage, config: conf, remote: later(strict, 3000) });
+  await p1.at(450);
+  act("pre");
+  p1.b.pagehide(true);
+  act("post");
+  p1.b.pageshow(true);
+  await sleep(20);
+  p1.b.pagehide(false);
+  assert.equal(p1.f.calls.length, 0);
+  const outbox = readOutbox(storage);
+  assert.ok(outbox.batches.every((x) => x.rules && x.rules.maskEntries.join() === "[data-private],.sensitive"), "each batch keeps the provisional rules");
+  await p1.ctrl.stop();
+  const p2 = await start({ storage, config: conf, remote: strict });
+  const sent2 = all(p2.f);
+  assert.ok(!tagged(sent2, "pre") && !tagged(sent2, "post"));
+  assert.deepEqual(clickLabels(sent2), []);
+  await p2.ctrl.stop();
+});
+
+test("privacy hold: a back/forward-cache round trip under rules that stay sends the old segment in order, from its snapshot", async () => {
+  const conf = { sessionInactivityMs: 60_000 };
+  const { b, f, ctrl, at } = await boot({ config: conf, remote: later(withPrivacy(DEFAULT_RULES), 1200) });
+  await at(450);
+  act("pre");
+  b.pagehide(true);
+  act("post");
+  b.pageshow(true);
+  await at(1400);
+  const envs = f.batches();
+  const old = envs.filter((e) => e.events.some((x) => x.data?.rrwebEvent?.data?.tag === "pre"));
+  assert.equal(old.length, 1);
+  const oldSeg = old[0].segmentId;
+  const oldEnvs = envs.filter((e) => e.segmentId === oldSeg).sort((a, b2) => a.sequence - b2.sequence);
+  assert.ok(snapshotLed(oldEnvs[0]), "the old segment's first batch starts at its snapshot");
+  const order = oldEnvs.flatMap((e) => e.events).filter((e) => e.type === "session_start" || e.data?.rrwebEvent?.data?.tag);
+  assert.deepEqual(order.map((e) => e.type === "session_start" ? "start" : e.data.rrwebEvent.data.tag), ["start", "pre", "post"]);
+  await ctrl.stop();
+});
+
+test("privacy hold: what the page shown in between leaves in the outbox after a back/forward-cache restore is sent by the restored page", async () => {
+  const storage = new Map();
+  const { b, f, ctrl, at } = await boot({ storage, config: { sessionInactivityMs: 60_000 }, remote: later(withPrivacy(DEFAULT_RULES), 1200) });
+  await at(450);
+  act("pre");
+  b.pagehide(true);
+  // The page shown next takes the outbox when it starts, and leaves (putting
+  // it back) only after this page is restored: the order Chrome fires them in.
+  const key = outboxKeys(storage)[0];
+  const stash = storage.get(key);
+  storage.delete(key);
+  b.pageshow(true);
+  storage.set(key, stash);
+  await at(1400);
+  const sent = all(f);
+  assert.ok(sent.some((e) => e.type === "session_start") && tagged(sent, "pre"), types({ events: sent }).join(","));
+  assert.equal(outboxKeys(storage).length, 0, "taken from the outbox");
+  await ctrl.stop();
+});
+
+test("privacy hold: a recorder still waiting for the load event when stricter rules arrive snapshots under them, once", async () => {
+  const { b, f, ctrl, at } = await boot({ remote: later(withPrivacy({ maskSelectors: [".custom-secret"] }), 600), loading: true });
+  await at(450);
+  assert.equal(rr().installs, 1);
+  assert.equal(rr().snapshots, 0, "no snapshot before the load event");
+  globalThis.__emitClick({ kind: "click", selector: "b", label: "early", nx: 1, ny: 1, uiId: "u" });
+  await at(700);
+  assert.equal(rr().installs, 2, "restarted under the workspace's rules");
+  assert.equal(f.calls.length, 0, "no base yet: nothing sent");
+  b.window.fire("load");
+  await sleep(30);
+  assert.ok(f.calls.length >= 1 && snapshotLed(f.calls[0].envelope), "the first batch starts at the snapshot taken at load");
+  const sent = all(f);
+  assert.deepEqual(fullInstalls(sent), [2], "by the restarted recorder only");
+  assert.deepEqual(clickLabels(sent), []);
+  await ctrl.stop();
+});
+
+test("privacy hold: channels the workspace turns off send nothing recorded before its config, and bodies follow its setting", async () => {
+  const base = withPrivacy(DEFAULT_RULES);
+  const off = { ...base, capture: { ...base.capture, network: false, console: false, performance: false } };
+  const { f, ctrl, at } = await boot({ remote: later(off, 700) });
+  // Before the config, bodies follow the server's default: off.
+  assert.equal(globalThis.__netCapture.getUrlPolicy().bodies, false);
+  await at(450);
+  act("p");
+  globalThis.__emitConsole({ level: "log", message: "hello jane@example.com" });
+  rr().emit({ type: 5, timestamp: Date.now(), data: { tag: "console", payload: { level: "log", message: "hello" } } });
+  await at(800);
+  const sent = all(f);
+  for (const t of ["network", "console", "performance"]) assert.ok(!sent.some((e) => e.type === t), t);
+  assert.ok(!sent.some((e) => e.data?.rrwebEvent?.data?.tag === "console"), "nor the console tee in the replay");
+  assert.ok(tagged(sent, "p") && snapshotLed(f.calls[0].envelope), "the replay is unaffected");
+  await ctrl.stop();
+
+  // Bodies: a workspace that records them (remembered), then turns them off.
+  const local = new Map();
+  const withBodies = { ...base, capture: { ...base.capture, networkBodies: true } };
+  const p0 = await start({ local, remote: withBodies });
+  assert.equal(globalThis.__netCapture.getUrlPolicy().bodies, true);
+  await p0.ctrl.stop();
+  const p1 = await boot({ local, remote: later(base, 700) });
+  assert.equal(globalThis.__netCapture.getUrlPolicy().bodies, true, "the remembered setting until the config");
+  await p1.at(450);
+  globalThis.__netCapture.emit({ requestId: "r", transport: "fetch", method: "POST", url: "https://app.test/api/me", startedAt: Date.now(), requestBody: '{"q":1}', responseBody: '{"email":"jane@example.com"}' });
+  await p1.at(800);
+  assert.equal(globalThis.__netCapture.getUrlPolicy().bodies, false, "off from the config on");
+  const net = all(p1.f).find((e) => e.type === "network");
+  assert.ok(net && net.data.requestBody === undefined && net.data.responseBody === undefined, JSON.stringify(net?.data));
+  await p1.ctrl.stop();
+});
+
+test("privacy hold: a failure worth retrying asks for the config again while the hold lasts", async () => {
+  let n = 0;
+  const strict = withPrivacy({ maskSelectors: [".custom-secret"] });
+  const { f, ctrl, at } = await boot({ remote: () => (++n <= 2 ? "retry" : strict) });
+  await at(1300);
+  assert.equal(globalThis.__configRequests, 2, "asked again after 500 ms");
+  assert.equal(f.calls.length, 0, "held meanwhile");
+  await at(1700);
+  assert.equal(globalThis.__configRequests, 3, "then after 1 s more");
+  assert.equal(rr().installs, 2, "its rules applied");
+  assert.deepEqual(fullInstalls(all(f)), [2]);
+  await ctrl.stop();
+
+  // A config that keeps failing: at most four requests in the hold, then the
+  // provisional rules are final.
+  const down = await boot({ remote: () => "retry" });
+  await down.at(4300);
+  assert.ok(down.f.calls.length >= 1, "released at the cap");
+  await down.at(5000);
+  assert.ok(globalThis.__configRequests <= 4, String(globalThis.__configRequests));
+  await down.ctrl.stop();
+});
+
+test("privacy hold: a send that fails after the cap is resent without what a late, stricter config hides", async () => {
+  // Fails every attempt of one send; the first answers only once the late
+  // config is in.
+  let failing = 0;
+  const gates = [];
+  const respond = () => {
+    if (failing === 0) return ok();
+    failing -= 1;
+    if (gates.length === 0) return new Promise((r) => gates.push(() => r(json(503, { ok: false }))));
+    return json(503, { ok: false });
+  };
+  const { f, ctrl, at } = await boot({ respond, remote: later(withPrivacy({ maskSelectors: [".custom-secret"], redactUrlPatterns: ["sessref="] }), 4400) });
+  await at(4100);
+  assert.ok(f.calls.length >= 1, "released at the cap");
+  act("late");
+  failing = 3;
+  void ctrl.flush();
+  await sleep(20);
+  const inFlight = f.calls.at(-1);
+  assert.ok(tagged(inFlight.envelope.events, "late"), "the send in flight has it (it left before the config)");
+  await at(4550);
+  assert.equal(rr().installs, 2, "the late config restarted the recorder");
+  gates[0]();
+  await sleep(1100); // the transport's own retries (300, 600 ms) fail too: the batch waits for its resend
+  const n = f.calls.length;
+  await ctrl.stop();
+  const resend = f.calls.slice(n).filter((c) => c.envelope.sequence === inFlight.envelope.sequence);
+  assert.equal(resend.length, 1, "resent under its number");
+  const ev = resend[0].envelope.events;
+  assert.ok(!tagged(ev, "late") && clickLabels(ev).length === 0, "without the DOM change and click label recorded under the defaults");
+  const net = ev.find((e) => e.type === "network");
+  assert.ok(net && !net.data.url.includes("s1"), "its request URL gets the late patterns");
+});
+
+test("privacy hold: a page's leftovers recorded under rules a failed config made final are checked by the page that knows the workspace's", async () => {
+  const storage = new Map();
+  const conf = { sessionInactivityMs: 60_000 };
+  const p1 = await boot({ storage, config: conf, remote: null }); // no config: the defaults are final
+  await p1.at(450);
+  assert.ok(p1.f.calls.length >= 1);
+  // More replay than the unload budget: what doesn't fit goes to the outbox.
+  for (let i = 0; i < 12; i += 1) rr().emit({ type: 3, timestamp: Date.now(), data: { source: 0, tag: `big${i}`, pad: "x".repeat(20000) } });
+  p1.b.pagehide(false);
+  await sleep(20);
+  const outbox = readOutbox(storage);
+  assert.ok(outbox && outbox.batches.some((x) => x.events.some(isReplay)), "replay left over");
+  const leftTags = outbox.batches.flatMap((x) => x.events).map((e) => e.data?.rrwebEvent?.data?.tag).filter(Boolean);
+  await p1.ctrl.stop();
+  const p2 = await start({ storage, config: conf, remote: withPrivacy({ maskSelectors: [".custom-secret"] }) });
+  const sent = all(p2.f);
+  for (const t of leftTags) assert.ok(!tagged(sent, t), `${t} is not sent by page 2`);
+  await p2.ctrl.stop();
+});
+
+test("privacy hold: stop() in the hold hands the previous page's leftovers and its own events on; the next page sends them", async () => {
+  const storage = new Map();
+  const conf = { sessionInactivityMs: 60_000 };
+  const same = withPrivacy(DEFAULT_RULES);
+  const { outbox } = await closedInHold(storage, same);
+  const seg1 = outbox.batches[0].segmentId;
+  // Page 2 takes page 1's outbox, and is stopped in its own hold.
+  const p2 = await boot({ storage, config: conf, remote: later(same, 3000) });
+  await p2.at(450);
+  act("p2");
+  await p2.ctrl.stop();
+  assert.equal(p2.f.calls.length, 0);
+  const segs = readOutbox(storage).batches.map((x) => x.segmentId);
+  assert.equal(segs[0], seg1, "page 1's leftovers first");
+  assert.ok(segs.length >= 2 && segs.at(-1) !== seg1, "then page 2's own");
+  const p3 = await start({ storage, config: conf, remote: same });
+  const sent = all(p3.f);
+  assert.ok(tagged(sent, "p") && tagged(sent, "p2"), "both pages' replay");
+  assert.ok(sent.some((e) => e.type === "session_end" && e.data.reason === "manual"), "and page 2's session end");
+  await p3.ctrl.stop();
+});
+
+test("privacy hold: click labels are wiped inside blocked elements, before rrweb starts too", async () => {
+  const { ctrl } = await boot({ remote: later(withPrivacy(DEFAULT_RULES), 2000) });
+  const blockedEl = { ...fakeEl(), closest: (s) => (s.includes(".no-replay") ? {} : null), querySelector: () => null };
+  assert.equal(globalThis.__clickMasker().labelFor("Refund Jane", blockedEl), "****** ****");
+  assert.equal(globalThis.__clickMasker().labelFor("Refund Jane", { ...fakeEl(), querySelector: () => null }), "Refund Jane");
+  await ctrl.stop();
 });
 
 test("privacy hold: remembered rules record the first snapshot and wait for the config; it releases them as recorded unless it hides more", async () => {

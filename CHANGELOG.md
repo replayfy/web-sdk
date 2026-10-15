@@ -89,12 +89,40 @@ replaces.
   `.sensitive`, or custom ones) readable, with the click labels and request
   URLs recorded before the settings arrived. Also in 0.1.19. Until the
   settings arrive, a page now records under the server's defaults (or the
-  remembered rules) and uploads nothing, for up to 4 s. If the workspace's
-  rules hide more, what was recorded is dropped and the replay starts at a
-  fresh snapshot taken under them; request and resource URLs and page titles
-  recorded meanwhile get the workspace's rules. A page closed before the
-  settings arrive sends no replay. Without settings (offline, an error) the
-  defaults stay.
+  remembered rules) and uploads nothing, for up to 4 s; a request for them
+  that fails for a reason worth retrying (offline, a timeout, 429, 5xx) is
+  retried within that time. If the workspace's rules hide more, what was
+  recorded is dropped and the replay starts at a fresh snapshot taken under
+  them; request and resource URLs and page titles recorded meanwhile get the
+  workspace's rules, and events of a channel it turns off (network, console,
+  performance) are dropped. A page closed, stopped or put in the
+  back/forward cache before the settings arrive sends nothing then: the next
+  page load of the session in the tab (or the page itself, back from the
+  cache) sends it once it has them, the replay and click labels only if they
+  hide nothing more (if no page follows, it is never sent). Batches held for
+  a later send (a failed upload, an earlier page's leftovers) are checked
+  against the rules known when they go. Without settings (none for the key,
+  or still failing after 4 s), the last settings seen in this browser apply,
+  or the dashboard's defaults on a first visit.
+- **Events held around a back/forward-cache restore go out in order, at
+  once.** A restored page sent what it recorded after its pagehide before
+  what it set aside at the pagehide (older), and what the page shown in
+  between left at its own pagehide waited for the next page load, since
+  Chrome fires that pagehide after the restore. The restored page now sends
+  both, oldest first.
+- **Request and response bodies follow the workspace's setting.** The network
+  capture recorded bodies (up to 8 KB) whatever the dashboard's "Capture
+  request / response bodies" setting said, and it is off by default. Bodies
+  are now recorded only when it is on (before the settings arrive: the last
+  setting seen in this browser, else off). The app's `sanitizeBody` now runs
+  on XHR response and `sendBeacon` bodies too.
+- **Click labels inside blocked elements are wiped.** A click on (or around)
+  an element matching a block selector (`blockSelector`, the workspace's
+  `.no-replay` or its own) sent the element's text as the click label, while
+  the replay showed a placeholder there.
+- **A long frame's script URL is redacted everywhere.** A long animation
+  frame named the script that caused it twice, and only one of them was
+  redacted: the invoker kept the script's full URL, query string included.
 
 ### Changed
 

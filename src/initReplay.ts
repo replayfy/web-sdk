@@ -17,7 +17,7 @@ import {
   type IdentifyPayload,
   type SendOutcome,
 } from "./transport";
-import { createSessionRuntime, createUploadGate } from "./runtime";
+import { createSessionRuntime, createUploadGate, type CarriedBatch } from "./runtime";
 import {
   createConsoleCapture,
   createErrorCapture,
@@ -28,7 +28,7 @@ import {
   createViewportCapture,
   errorDataFromValue,
 } from "./signals";
-import { fetchRemoteConfig } from "./remote-config";
+import { requestRemoteConfig, type SdkRemoteConfig } from "./remote-config";
 import {
   ALL_INPUT_TYPES,
   createTextMasker,
@@ -53,7 +53,8 @@ interface CaptureSlot {
 }
 
 /** A workspace's privacy rules, as /v1/sdk/config sends them: what the
- *  recorder masks and blocks, and how stored request URLs are redacted. */
+ *  recorder masks and blocks, how stored request URLs are redacted, and
+ *  whether request and response bodies are recorded. */
 interface WorkspacePrivacy {
   forceMaskAllInputs: boolean;
   maskSelectors: string[];
@@ -63,12 +64,14 @@ interface WorkspacePrivacy {
   blockCreditCardText: boolean;
   stripQueryParams: boolean;
   allowedQueryParams: string[];
+  networkBodies: boolean;
 }
 
 /** The rules of a workspace that changed nothing. They mirror the server's
  *  defaults (DEFAULT_MASKING in the ingest API's settings service, plus the
- *  password type its SDK config always adds): keep them in sync. A page with
- *  no remembered rules records under them until its own arrive. */
+ *  password type its SDK config always adds, and DEFAULT_RECORDING's
+ *  captureNetworkBodies): keep them in sync. A page with no remembered rules
+ *  records under them until its own arrive. */
 const DEFAULT_WORKSPACE_PRIVACY: WorkspacePrivacy = {
   forceMaskAllInputs: false,
   maskSelectors: ["[data-private]", ".sensitive"],
@@ -78,6 +81,7 @@ const DEFAULT_WORKSPACE_PRIVACY: WorkspacePrivacy = {
   blockCreditCardText: true,
   stripQueryParams: false,
   allowedQueryParams: ["utm_source", "utm_medium", "utm_campaign"],
+  networkBodies: false,
 };
 
 /** How long a page waits for its workspace's privacy rules before it uploads
@@ -86,8 +90,15 @@ const DEFAULT_WORKSPACE_PRIVACY: WorkspacePrivacy = {
  *  CORS preflight and the GET: five or six round trips, 2-3 s on a slow mobile
  *  link. Past 4 s the config is more likely blocked or offline than slow, and
  *  waiting longer only delays the first upload and grows what a page closed
- *  meanwhile loses (its replay is dropped then, never sent unconfirmed). */
+ *  meanwhile can only hand on to the next page load (never sent unconfirmed),
+ *  and loses if none follows. */
 const PRIVACY_HOLD_MAX_MS = 4000;
+
+/** First wait before /v1/sdk/config is asked again after a failure worth
+ *  retrying (offline, a timeout, 429, 5xx), doubled each time, while the
+ *  privacy hold lasts: at most four requests in it, so a blip doesn't leave a
+ *  first visit under the defaults, and an outage costs the endpoint little. */
+const CONFIG_RETRY_MS = 500;
 
 /** rrweb's stream: the full snapshot and every event applied on top of it. */
 const isReplayEvent = (e: ReplayEvent) =>
@@ -96,6 +107,13 @@ const isReplayEvent = (e: ReplayEvent) =>
 /** A heatmap click: its label is page text, masked by the rules in force. */
 const isClickLabel = (e: ReplayEvent) =>
   e.type === "custom" && (e.data as { kind?: unknown } | null)?.kind === "click";
+
+/** A console message teed into rrweb's stream (emitConsole). */
+const isConsoleTee = (e: ReplayEvent) => {
+  const r = (e.data as { rrwebEvent?: { type?: unknown; data?: { tag?: unknown } } } | null)
+    ?.rrwebEvent;
+  return !!r && r.type === 5 && r.data?.tag === "console";
+};
 
 export function initReplay(config: WebReplayConfig): ReplayController {
   if (typeof window === "undefined" || typeof document === "undefined") {
@@ -174,6 +192,7 @@ export function initReplay(config: WebReplayConfig): ReplayController {
         allowedQueryParams: Array.isArray(p.allowedQueryParams)
           ? strings(p.allowedQueryParams)
           : d.allowedQueryParams,
+        networkBodies: p.networkBodies === true,
       };
     } catch {
       return null;
@@ -200,11 +219,17 @@ export function initReplay(config: WebReplayConfig): ReplayController {
   // hide/unload batch. Then, if the workspace's rules hide anything the
   // provisional ones didn't, the replay and click labels recorded so far are
   // dropped and the recorder restarts under them (see applyRemoteConfig);
-  // URLs and titles get them too; and the hold is released. A config that
-  // wins the 300ms race releases it before the first upload would have gone
-  // anyway, so the usual page waits for nothing.
+  // URLs, titles and the capture settings get them too; and the hold is
+  // released. A config that wins the 300ms race releases it before the first
+  // upload would have gone anyway, so the usual page waits for nothing.
   let privacyKnown = false;
   let privacyHoldTimer: ReturnType<typeof setTimeout> | undefined;
+  // The rules the DOM events in the buffer (rrweb's stream, click labels)
+  // were recorded under: the provisional ones from the start, the final ones
+  // once the config arrived. Batches that leave the buffer keep them
+  // (CarriedBatch.rules), so whichever page sends a batch later can check
+  // them against the rules it knows (settleCarried).
+  let recordedUnder: RecorderRules | null = null;
 
   // The masker rrweb's text/input hooks, the event post-pass, the click labels
   // and the page titles use. Built from the host config and the provisional
@@ -217,12 +242,15 @@ export function initReplay(config: WebReplayConfig): ReplayController {
     maskNumbers: config.maskTextNumbers === true,
     rootDoc: document,
     warn: warnMaskSelectors,
+    blockSelector:
+      selectorEntries([config.blockSelector, ...provisionalPrivacy.blockSelectors])
+        .filter((s) => validSelector(s, document))
+        .join(", ") || undefined,
   });
 
   const session = createSessionRuntime(config, {
-    // A batch built during the hold (only what a page leaving before its
-    // rules are known hands on) carries no title: those rules could hide it.
-    maskTitle: (t) => (privacyKnown ? activeTextMasker.titleFor(t) : ""),
+    maskTitle: (t) => activeTextMasker.titleFor(t),
+    privacyTag: () => recordedUnder ?? undefined,
   });
   const sendBatch = createBatchSender(config);
   const { fp: fingerprint } = getBrowserFingerprint();
@@ -296,6 +324,9 @@ export function initReplay(config: WebReplayConfig): ReplayController {
   // Regular sends whose events are a beforeSend hook's output (see
   // CarriedBatch.hooked), so an upload carried on at pagehide keeps the flag.
   const hookedEnvelopes = new WeakSet<ReplayBatchEnvelope>();
+  // The rules each regular send's events were recorded under, for the same
+  // reason (CarriedBatch.rules).
+  const envelopeRules = new WeakMap<ReplayBatchEnvelope, RecorderRules>();
 
   if (config.distinctId)
     sendBatch.setIdentify({ distinctId: config.distinctId });
@@ -451,10 +482,18 @@ export function initReplay(config: WebReplayConfig): ReplayController {
     if (!gate.canSend(opts?.ignoreBackoff)) return;
     const generation = session.generation;
     // Carried batches go first, each under its own segment: a failed send
-    // being retried, or what an earlier page load of this session held back.
-    const carried = session.carried.shift();
+    // being retried, or what an earlier page load of this session held back,
+    // even one that left after this page started (adoptOutbox; not once this
+    // page is leaving itself: the outbox is then its own, for the next page).
+    // Each gets the rules known now first; one left with nothing is skipped.
+    if (!unloading) session.adoptOutbox();
+    let carried = session.carried.shift();
+    while (carried && !settleCarried(carried)) carried = session.carried.shift();
     const events = carried ? carried.events : session.drain();
     if (events.length === 0) return;
+    // What the events were recorded under (settleCarried brought a carried
+    // batch to the rules known now).
+    const builtUnder = recordedUnder;
     const envelope: ReplayBatchEnvelope = {
       projectId: config.projectId,
       sessionId: session.sessionId,
@@ -476,6 +515,7 @@ export function initReplay(config: WebReplayConfig): ReplayController {
     if (!nextEnvelope) return;
     const hooked = carried?.hooked === true || config.beforeSend !== undefined;
     if (hooked) hookedEnvelopes.add(nextEnvelope);
+    if (builtUnder) envelopeRules.set(nextEnvelope, builtUnder);
     gate.begin();
     const send = (async () => {
       let outcome: SendOutcome;
@@ -504,6 +544,9 @@ export function initReplay(config: WebReplayConfig): ReplayController {
             page: nextEnvelope.page,
             sequence: nextEnvelope.sequence,
             ...(hooked ? { hooked: true } : {}),
+            // Checked again before the resend: a config that arrived late
+            // (after the hold's cap) may hide more than these did.
+            ...(builtUnder ? { rules: builtUnder } : {}),
           },
           generation,
         );
@@ -714,10 +757,24 @@ export function initReplay(config: WebReplayConfig): ReplayController {
       (now.recordCrossOriginIframes || !was.recordCrossOriginIframes)
     );
   };
-  // The rules the DOM events in the buffer (rrweb's stream, click labels)
-  // were recorded under: the provisional ones from the start, the final ones
-  // once the config arrived.
-  let recordedUnder: RecorderRules | null = null;
+  // The JSON form of RecorderRules a carried batch holds (the outbox comes
+  // from storage): null when it isn't one, as for a batch an older SDK left.
+  const asRecorderRules = (v: unknown): RecorderRules | null => {
+    const r = v as Record<string, unknown> | null | undefined;
+    const list = (x: unknown) => Array.isArray(x) && x.every((s) => typeof s === "string");
+    const flag = (x: unknown) => typeof x === "boolean";
+    return r &&
+      typeof r === "object" &&
+      flag(r.maskAllInputs) &&
+      list(r.forcedTypes) &&
+      list(r.maskEntries) &&
+      list(r.blockCandidates) &&
+      list(r.blockEntries) &&
+      flag(r.recordCanvas) &&
+      flag(r.recordCrossOriginIframes)
+      ? (r as unknown as RecorderRules)
+      : null;
+  };
 
   // URL redaction policy applied to outgoing network events. The network
   // capture reads this when serialising each event so query-strings can
@@ -730,6 +787,8 @@ export function initReplay(config: WebReplayConfig): ReplayController {
     blockCC: boolean;
     /** Host and workspace redaction patterns (union). */
     patterns: Array<string | RegExp>;
+    /** Request and response bodies are recorded (the workspace's setting). */
+    bodies: boolean;
   } = {
     strip: provisionalPrivacy.stripQueryParams,
     allowed: provisionalPrivacy.allowedQueryParams,
@@ -738,7 +797,12 @@ export function initReplay(config: WebReplayConfig): ReplayController {
       ...(config.redactUrls ?? []),
       ...compileRedactPatterns(provisionalPrivacy.redactUrlPatterns),
     ],
+    bodies: provisionalPrivacy.networkBodies,
   };
+  // The capture channels the workspace turned off, once its config is known:
+  // events of theirs recorded before (under the host's settings) never leave.
+  let channelsOff: { network: boolean; console: boolean; performance: boolean } | null =
+    null;
   // Read live per-request by createNetworkCapture via the getUrlPolicy closure,
   // so a remote-config privacy update applies without re-installing the capture.
   // The network capture is installed once, in phase 1, with the host's
@@ -756,6 +820,7 @@ export function initReplay(config: WebReplayConfig): ReplayController {
     stripQueryParams: p.stripQueryParams,
     allowedQueryParams: p.allowedQueryParams,
     redactUrls: compileRedactPatterns(p.redactUrlPatterns),
+    captureBodies: p.networkBodies,
   });
 
   // Sampling overrides — populated when /v1/sdk/config arrives. Referenced
@@ -1023,6 +1088,7 @@ export function initReplay(config: WebReplayConfig): ReplayController {
       blockCC: !!effective.blockCreditCardText,
       // Both apply: the dashboard's patterns never replace the app's.
       patterns: [...(config.redactUrls ?? []), ...(effective.redactUrls ?? [])],
+      bodies: effective.captureBodies === true,
     };
     syncCapture("console", effective.console, () =>
       createConsoleCapture((d: ConsoleEventData) =>
@@ -1095,8 +1161,8 @@ export function initReplay(config: WebReplayConfig): ReplayController {
   // ── Privacy hold: release, and the events the known rules change ─────────
 
   // The workspace's rules are known, or the hold's cap passed: what was held
-  // goes out with the next flush. Not once stop() began: it sends nothing
-  // recorded under rules that were never confirmed.
+  // goes out with the next flush. Not once stop() began: it handed what was
+  // held on to the next page load.
   const releasePrivacyHold = () => {
     if (privacyHoldTimer !== undefined) {
       clearTimeout(privacyHoldTimer);
@@ -1125,62 +1191,92 @@ export function initReplay(config: WebReplayConfig): ReplayController {
     if (replay) snapshotReady = false;
   };
 
-  // Events recorded before the workspace's rules were known get them now:
-  // request and resource URLs its redaction (on top of what the provisional
-  // policy already redacted), page titles its masking. Page URLs (session
-  // start, page views, rrweb's meta event) only ever get the built-in key
-  // scrub, which they already have.
-  const applyKnownRules = () => {
+  // What an event that leaves under the known settings may hold: nothing of a
+  // channel the workspace turned off (recorded before its config arrived,
+  // under the host's settings), no request or response body unless it
+  // records them, and request, resource and long-frame script URLs redacted
+  // under its policy, on top of whatever policy redacted them when they were
+  // recorded (redaction only ever adds). False: drop the event. Page URLs
+  // (session start, page views, rrweb's meta event) only ever get the
+  // built-in key scrub, which they already have.
+  const settleEvent = (e: ReplayEvent): boolean => {
+    const off = channelsOff;
+    if (off) {
+      if (off.console && (e.type === "console" || isConsoleTee(e))) return false;
+      if (off.network && e.type === "network") return false;
+      if (off.performance && e.type === "performance") return false;
+    }
+    const d = e.data as Record<string, unknown> | null;
+    if (!d) return true;
+    if (e.type === "network") {
+      if (typeof d.url === "string") d.url = redactNetworkUrl(d.url);
+      if (!urlRedactionPolicy.bodies) {
+        delete d.requestBody;
+        delete d.responseBody;
+      }
+    } else if (e.type === "performance") {
+      const detail = d.detail as Record<string, unknown> | undefined;
+      if (detail && d.metric === "resource" && typeof detail.name === "string")
+        detail.name = redactNetworkUrl(detail.name).slice(0, 512);
+      if (detail && typeof detail.scriptSource === "string")
+        detail.scriptSource = redactNetworkUrl(detail.scriptSource);
+      if (detail && typeof detail.scriptInvoker === "string")
+        detail.scriptInvoker = redactNetworkUrl(detail.scriptInvoker);
+    }
+    return true;
+  };
+
+  // The buffer, once the workspace's rules are known (after dropDomEvents
+  // when they hide more): settleEvent on each event, and page titles masked
+  // by them (the same document: its <title> can be looked at again).
+  const settleBuffer = () => {
+    const kept: ReplayEvent[] = [];
     for (const e of session.drain()) {
+      if (!settleEvent(e)) continue;
       const d = e.data as Record<string, unknown> | null;
-      if (d && e.type === "network" && typeof d.url === "string") {
-        d.url = redactNetworkUrl(d.url);
-      } else if (d && e.type === "performance") {
-        const detail = d.detail as Record<string, unknown> | undefined;
-        if (detail && d.metric === "resource" && typeof detail.name === "string")
-          detail.name = redactNetworkUrl(detail.name).slice(0, 512);
-        if (detail && typeof detail.scriptSource === "string")
-          detail.scriptSource = redactNetworkUrl(detail.scriptSource);
-      } else if (
+      if (
         d &&
         (e.type === "session_start" || e.type === "navigation") &&
         typeof d.title === "string"
       ) {
         d.title = activeTextMasker.titleFor(d.title) || undefined;
       }
-      session.push(e);
-    }
-  };
-
-  // The page goes away during the hold: nothing recorded under the
-  // provisional rules that the workspace's could hide is sent or handed on.
-  // rrweb's stream, the click labels, request and resource URLs and a long
-  // frame's script URL are dropped, and page titles left out. The trade-off:
-  // a page closed within the hold (at most PRIVACY_HOLD_MAX_MS) has no replay,
-  // rather than one that may show what the workspace masks. The rest (session
-  // start, page views, viewport, errors, console, track() events, web vitals)
-  // goes to the next page load of the session, like the events of a page that
-  // leaves before its first snapshot.
-  const dropUnconfirmed = () => {
-    let replay = false;
-    const kept: ReplayEvent[] = [];
-    for (const e of session.drain()) {
-      if (isReplayEvent(e)) {
-        replay = true;
-        continue;
-      }
-      if (isClickLabel(e) || e.type === "network") continue;
-      const d = e.data as Record<string, unknown> | null;
-      if (d && e.type === "performance") {
-        if (d.metric === "resource") continue;
-        const detail = d.detail as Record<string, unknown> | undefined;
-        if (detail) delete detail.scriptSource;
-      }
-      if (d && (e.type === "session_start" || e.type === "navigation")) delete d.title;
       kept.push(e);
     }
     for (const e of kept) session.push(e);
-    if (replay) snapshotReady = false;
+  };
+
+  // A carried batch about to be sent: a failed send, or what an earlier page
+  // load (or this page, before a back/forward-cache freeze) held back. Its
+  // DOM events (rrweb's stream, click labels) and page titles go only when
+  // the rules they were recorded under hide everything the rules known now
+  // hide; then the base snapshot and every diff on it go together, else none
+  // of them. An older SDK's batch, with no rules, counts as hiding nothing.
+  // Every event gets settleEvent. Edited in place (the runtime knows a failed
+  // send by identity) and brought to the known rules once. False when nothing
+  // is left to send.
+  const settleCarried = (c: CarriedBatch): boolean => {
+    const now = recordedUnder;
+    if (!now || c.rules === now) return c.events.length > 0;
+    const was = asRecorderRules(c.rules);
+    const covered = !!was && coversRules(was, now);
+    c.events = c.events.filter((e) => {
+      if (!covered) {
+        if (isReplayEvent(e) || isClickLabel(e)) return false;
+        const d = e.data as Record<string, unknown> | null;
+        if (d && (e.type === "session_start" || e.type === "navigation")) delete d.title;
+      }
+      return settleEvent(e);
+    });
+    if (!covered && c.page) c.page = { ...c.page, title: "" };
+    c.rules = now;
+    return c.events.length > 0;
+  };
+  const settleAllCarried = () => {
+    const list = session.carried;
+    for (let i = list.length - 1; i >= 0; i -= 1) {
+      if (!settleCarried(list[i])) list.splice(i, 1);
+    }
   };
 
   // The visibility-gated start. Following the reference tracker, NOTHING is
@@ -1244,7 +1340,7 @@ export function initReplay(config: WebReplayConfig): ReplayController {
     // Promise race: whichever fires first wins. We never wait > 300ms for
     // remote config to start rrweb — a slow /v1/sdk/config request shouldn't
     // delay recording. It only delays the upload (the privacy hold).
-    const remotePromise = fetchRemoteConfig(config);
+    const remotePromise = loadRemoteConfig();
     const timeoutPromise = new Promise<null>((r) =>
       setTimeout(() => r(null), 300),
     );
@@ -1267,8 +1363,9 @@ export function initReplay(config: WebReplayConfig): ReplayController {
         });
         const lateRemote = await remotePromise.catch(() => null);
         if (lateRemote) applyRemoteConfig(lateRemote);
-        // No config (a 404, offline, an error): the provisional rules, with
-        // the host's, are the page's rules for good.
+        // No config (none for this key, or still failing when the hold
+        // ended): the provisional rules, with the host's, are the page's
+        // rules for good.
         else releasePrivacyHold();
         return;
       }
@@ -1280,9 +1377,22 @@ export function initReplay(config: WebReplayConfig): ReplayController {
     session.startAutoFlush(flush);
   };
 
-  function applyRemoteConfig(
-    remote: NonNullable<Awaited<ReturnType<typeof fetchRemoteConfig>>>,
-  ) {
+  // The workspace's config. A failure worth retrying (offline, a timeout,
+  // 429, 5xx, a request a back/forward-cache freeze aborted) is asked again
+  // while the privacy hold lasts, after CONFIG_RETRY_MS, then twice that…: a
+  // blip doesn't leave the page under the provisional rules. Null: no config
+  // (none for this key, or the hold ended first).
+  async function loadRemoteConfig(): Promise<SdkRemoteConfig | null> {
+    for (let wait = CONFIG_RETRY_MS; ; wait *= 2) {
+      const r = await requestRemoteConfig(config);
+      if (r.kind === "ok") return r.config;
+      if (r.kind === "none" || privacyKnown || stopping) return null;
+      await new Promise((done) => setTimeout(done, wait));
+      if (privacyKnown || stopping) return null;
+    }
+  }
+
+  function applyRemoteConfig(remote: SdkRemoteConfig) {
     // Uploads were already halted (or stop() ran): a late config must not
     // re-install the captures.
     if (blocked || stopped || stopping) return;
@@ -1347,6 +1457,7 @@ export function initReplay(config: WebReplayConfig): ReplayController {
       blockCreditCardText: remote.privacy.blockCreditCardText === true,
       stripQueryParams: remote.privacy.stripQueryParams === true,
       allowedQueryParams: strings(remote.privacy.allowedQueryParams),
+      networkBodies: remote.capture.networkBodies === true,
     };
     writeCachedPrivacy(privacy);
 
@@ -1364,7 +1475,11 @@ export function initReplay(config: WebReplayConfig): ReplayController {
     // defaults, unchanged), they go out as they are. Otherwise rrweb's stream
     // and the click labels are dropped before the recorder restarts under the
     // workspace's rules, and the replay begins at the restart's full snapshot.
-    // After the hold's cap, this only reaches what is not sent yet.
+    // Events of a channel it turns off (recorded under the host's settings)
+    // and request bodies it doesn't record go too (settleBuffer). After the
+    // hold's cap, this only reaches what is not sent yet: the buffer here,
+    // carried batches (a failed send waiting for its retry) when they go
+    // (settleCarried).
     const rules = recorderRules({
       ...privacy,
       recordCanvas: remote.capture.canvas,
@@ -1373,6 +1488,11 @@ export function initReplay(config: WebReplayConfig): ReplayController {
     const stricter = !coversRules(recordedUnder ?? recorderRules(provisionalPrivacy), rules);
     if (stricter) dropDomEvents();
     recordedUnder = rules;
+    channelsOff = {
+      network: remote.capture.network === false,
+      console: remote.capture.console === false,
+      performance: remote.capture.performance === false,
+    };
 
     installCaptures({
       console: remote.capture.console,
@@ -1380,7 +1500,7 @@ export function initReplay(config: WebReplayConfig): ReplayController {
       errors: remote.capture.errors,
       performance: remote.capture.performance,
       captureHeaders: remote.capture.networkHeaders ?? remote.capture.headers,
-      captureBodies: remote.capture.networkBodies,
+      // Bodies (privacy.networkBodies) come with the privacy options.
       ...privacyOptions(privacy),
       recordCanvas: remote.capture.canvas,
       recordCrossOriginIframes: remote.capture.iframe,
@@ -1395,7 +1515,7 @@ export function initReplay(config: WebReplayConfig): ReplayController {
         /* still loading: the recorder snapshots at the load event */
       }
     }
-    applyKnownRules();
+    settleBuffer();
     releasePrivacyHold();
   } // end applyRemoteConfig
 
@@ -1455,16 +1575,20 @@ export function initReplay(config: WebReplayConfig): ReplayController {
     // tags) — they're only sent if that page records — and so do earlier
     // pages' leftovers. A tab that never showed hands on only the latter.
     // During the privacy hold nothing goes either: a tab switch keeps it all
-    // for the release, and a page leaving first drops what the workspace's
-    // rules could hide (dropUnconfirmed) and hands on the rest.
+    // for the release, and a page leaving hands it all on, with the rules it
+    // was recorded under. The next page load sends it once it knows the
+    // workspace's rules, the replay and click labels only if those rules hide
+    // nothing more (settleCarried). The trade-off: if no page of the session
+    // follows in this tab (it was closed, or the user left the site), what a
+    // page recorded in its hold is never sent.
     if (!started || !privacyKnown || (!snapshotReady && !rrwebFailed)) {
-      if (leaving) {
-        if (started && !privacyKnown) dropUnconfirmed();
-        session.stashForNextPage(!started);
-      }
+      if (leaving) session.stashForNextPage(!started);
       return;
     }
     if (endReason) emitSessionEnd(endReason);
+    // Carried batches (sent first when leaving, a failed send's copy on a tab
+    // switch) get the rules known now.
+    settleAllCarried();
     session.flushFinal(
       (envelope, hooked) => {
         // A carried batch the hook already ran on goes out as it is, if the
@@ -1492,7 +1616,10 @@ export function initReplay(config: WebReplayConfig): ReplayController {
     // First the regular uploads the browser would cancel with the page: they
     // hold the older events, possibly this page's base snapshot.
     // What can't be re-sent now goes with this page's leftovers.
-    session.carryUnsent(sendBatch.redeliverPending(), (e) => hookedEnvelopes.has(e));
+    session.carryUnsent(sendBatch.redeliverPending(), (e) => ({
+      hooked: hookedEnvelopes.has(e),
+      rules: envelopeRules.get(e),
+    }));
     if (e.persisted) {
       // Into the back/forward cache: it may come back, so the session isn't over.
       inBfcache = started;
@@ -1744,9 +1871,6 @@ export function initReplay(config: WebReplayConfig): ReplayController {
         onFirstVisible = undefined;
       }
       if (idleTimer !== undefined) window.clearInterval(idleTimer);
-      // Stopped during the privacy hold: what it holds was recorded under
-      // rules never confirmed, and is not sent (like the events of a page
-      // stopped before its first snapshot).
       if (privacyHoldTimer !== undefined) clearTimeout(privacyHoldTimer);
       stopCaptures();
       for (const evt of activityEvents) {
@@ -1759,12 +1883,23 @@ export function initReplay(config: WebReplayConfig): ReplayController {
       window.removeEventListener("pageshow", onPageShow);
       session.stopAutoFlush();
       emitSessionEnd("manual");
+      // Stopped during the privacy hold (or before the tab ever showed):
+      // nothing may be sent yet, so what is held goes to the next page load of
+      // the session in this tab, as when a page leaves then, and is sent there
+      // once that page knows the workspace's rules (settleCarried). A tab that
+      // never showed hands on only earlier pages' leftovers.
+      if (sampled && !blocked && (!started || !privacyKnown)) {
+        session.stashForNextPage(!started);
+        stopped = true;
+        return;
+      }
       // Deliver what is left, even during a backoff: carried batches, then the
       // buffer — one batch per flush. Counted once the send in flight is done:
       // if it fails, its batch is carried and goes first. A carried batch that
       // goes through sends the next one at once (flush's own `void flush()`):
       // that send is waited for too, so nothing leaves after stop() resolves.
       if (inFlightSend) await inFlightSend;
+      if (!unloading) session.adoptOutbox();
       for (let i = session.carried.length; i >= 0; i -= 1) {
         await flush({ ignoreBackoff: true });
         while (inFlightSend) await inFlightSend;

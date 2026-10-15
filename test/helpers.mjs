@@ -13,16 +13,27 @@ const STUBS = {
     const r = (globalThis.__rrweb = globalThis.__rrweb || { snapshots: 0 });
     const meta = () => ({ type: 4, timestamp: Date.now(), data: { href: location.href, width: 1, height: 1 } });
     // \`install\`: which record() call (1st, 2nd…) took the snapshot.
-    const full = () => ({ type: 2, timestamp: Date.now(), data: { node: { id: 1 }, install: r.installs } });
+    const full = (install) => ({ type: 2, timestamp: Date.now(), data: { node: { id: 1 }, install } });
     export const record = Object.assign(
       (opts) => {
-        r.emit = opts.emit; r.recording = true; r.opts = opts; r.installs = (r.installs || 0) + 1;
-        opts.emit(meta()); opts.emit(full()); r.snapshots += 1;
-        return () => { r.recording = false; };
+        r.emit = opts.emit; r.opts = opts; r.installs = (r.installs || 0) + 1;
+        const install = r.installs;
+        const init = () => { r.recording = true; opts.emit(meta()); opts.emit(full(install)); r.snapshots += 1; };
+        // \`loading\`: the document is still loading, so (like rrweb) the
+        // snapshot waits for the window's load event; stop() before it
+        // cancels it.
+        if (!r.loading) {
+          init();
+          return () => { r.recording = false; };
+        }
+        r.recording = false;
+        const onLoad = () => { window.removeEventListener("load", onLoad); opts.emit({ type: 1, timestamp: Date.now(), data: {} }); init(); };
+        window.addEventListener("load", onLoad);
+        return () => { window.removeEventListener("load", onLoad); r.recording = false; };
       },
       { takeFullSnapshot: () => {
           if (!r.recording) throw new Error("not recording");
-          r.emit(meta()); r.emit(full()); r.snapshots += 1;
+          r.emit(meta()); r.emit(full(r.installs)); r.snapshots += 1;
         },
         // The SDK's event post-pass reads rrweb's mirror; the fake snapshot
         // has no node it would look up.
@@ -31,7 +42,8 @@ const STUBS = {
     export const addCustomEvent = () => {};`,
   "./signals": `
     const noop = () => () => {};
-    export const createConsoleCapture = noop, createViewportCapture = noop;
+    export const createViewportCapture = noop;
+    export const createConsoleCapture = (cb) => { globalThis.__emitConsole = cb; return () => {}; };
     // The URL redaction the real captures apply per request / per resource.
     export const createNetworkCapture = (cfg, cb, getUrlPolicy) => {
       globalThis.__netCapture = { cfg, getUrlPolicy, emit: cb };
@@ -58,10 +70,15 @@ const STUBS = {
   "./fingerprint": `
     export const getBrowserFingerprint = () => ({ fp: "fp_test" });
     export const setStoredFingerprint = () => {};`,
+  // __remoteConfig() gives the config, null (none for this key), or "retry"
+  // (a failure worth asking again); it may answer late. Each request counts.
   "./remote-config": `
-    export async function fetchRemoteConfig() {
+    export async function requestRemoteConfig() {
+      globalThis.__configRequests = (globalThis.__configRequests || 0) + 1;
       const f = globalThis.__remoteConfig;
-      return typeof f === "function" ? f() : null;
+      const v = typeof f === "function" ? await f() : null;
+      if (v === "retry") return { kind: "retry" };
+      return v ? { kind: "ok", config: v } : { kind: "none" };
     }`,
 };
 
@@ -151,12 +168,14 @@ export function installBrowser({ href = "https://app.test/a?token=secret&utm_sou
   globalThis.setInterval = (fn, ms, ...a) => { const t = realSetInterval(fn, ms, ...a); t.unref?.(); return t; };
   globalThis.__rrweb = { snapshots: 0 };
   globalThis.__remoteConfig = undefined;
+  globalThis.__configRequests = 0;
   globalThis.__emitError = undefined;
   globalThis.__clickMasker = undefined;
   globalThis.__emitClick = undefined;
   globalThis.__navMasker = undefined;
   globalThis.__netCapture = undefined;
   globalThis.__perfEmit = undefined;
+  globalThis.__emitConsole = undefined;
   return {
     store, window: win, document: doc, beacons,
     hide() { doc.visibilityState = "hidden"; doc.fire("visibilitychange"); },
