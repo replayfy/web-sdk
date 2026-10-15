@@ -17,7 +17,7 @@ import {
   type IdentifyPayload,
   type SendOutcome,
 } from "./transport";
-import { createSessionRuntime, createUploadGate } from "./runtime";
+import { createSessionRuntime, createUploadGate, type CarriedBatch } from "./runtime";
 import {
   createConsoleCapture,
   createErrorCapture,
@@ -28,11 +28,19 @@ import {
   createViewportCapture,
   errorDataFromValue,
 } from "./signals";
-import { fetchRemoteConfig } from "./remote-config";
+import { requestRemoteConfig, type SdkRemoteConfig } from "./remote-config";
+import {
+  ALL_INPUT_TYPES,
+  createTextMasker,
+  selectorEntries,
+  validSelector,
+  type TextMasker,
+} from "./text-mask";
 import { getBrowserFingerprint, setStoredFingerprint } from "./fingerprint";
 import {
   applyBeforeSend,
   applyBeforeSendToCopy,
+  compileRedactPatterns,
   recheckBeforeSend,
   redactUrlForStorage,
   dashboardHostFromApiHost,
@@ -43,6 +51,69 @@ import type { ReplayController, WebReplayConfig } from "./types";
 interface CaptureSlot {
   stop: () => void;
 }
+
+/** A workspace's privacy rules, as /v1/sdk/config sends them: what the
+ *  recorder masks and blocks, how stored request URLs are redacted, and
+ *  whether request and response bodies are recorded. */
+interface WorkspacePrivacy {
+  forceMaskAllInputs: boolean;
+  maskSelectors: string[];
+  blockSelectors: string[];
+  maskInputTypes: string[];
+  redactUrlPatterns: string[];
+  blockCreditCardText: boolean;
+  stripQueryParams: boolean;
+  allowedQueryParams: string[];
+  networkBodies: boolean;
+}
+
+/** The rules of a workspace that changed nothing. They mirror the server's
+ *  defaults (DEFAULT_MASKING in the ingest API's settings service, plus the
+ *  password type its SDK config always adds, and DEFAULT_RECORDING's
+ *  captureNetworkBodies): keep them in sync. A page with no remembered rules
+ *  records under them until its own arrive. */
+const DEFAULT_WORKSPACE_PRIVACY: WorkspacePrivacy = {
+  forceMaskAllInputs: false,
+  maskSelectors: ["[data-private]", ".sensitive"],
+  blockSelectors: [".no-replay"],
+  maskInputTypes: ["password"],
+  redactUrlPatterns: ["token=", "api_key="],
+  blockCreditCardText: true,
+  stripQueryParams: false,
+  allowedQueryParams: ["utm_source", "utm_medium", "utm_campaign"],
+  networkBodies: false,
+};
+
+/** How long a page waits for its workspace's privacy rules before it uploads
+ *  what it recorded under provisional ones. /v1/sdk/config is a cross-origin
+ *  request with a custom header, so a cold first visit pays DNS, TCP, TLS, the
+ *  CORS preflight and the GET: five or six round trips, 2-3 s on a slow mobile
+ *  link. Past 4 s the config is more likely blocked or offline than slow, and
+ *  waiting longer only delays the first upload and grows what a page closed
+ *  meanwhile can only hand on to the next page load (never sent unconfirmed),
+ *  and loses if none follows. */
+const PRIVACY_HOLD_MAX_MS = 4000;
+
+/** First wait before /v1/sdk/config is asked again after a failure worth
+ *  retrying (offline, a timeout, 429, 5xx), doubled each time, while the
+ *  privacy hold lasts: at most four requests in it, so a blip doesn't leave a
+ *  first visit under the defaults, and an outage costs the endpoint little. */
+const CONFIG_RETRY_MS = 500;
+
+/** rrweb's stream: the full snapshot and every event applied on top of it. */
+const isReplayEvent = (e: ReplayEvent) =>
+  e.type === "full_snapshot" || e.type === "incremental_snapshot";
+
+/** A heatmap click: its label is page text, masked by the rules in force. */
+const isClickLabel = (e: ReplayEvent) =>
+  e.type === "custom" && (e.data as { kind?: unknown } | null)?.kind === "click";
+
+/** A console message teed into rrweb's stream (emitConsole). */
+const isConsoleTee = (e: ReplayEvent) => {
+  const r = (e.data as { rrwebEvent?: { type?: unknown; data?: { tag?: unknown } } } | null)
+    ?.rrwebEvent;
+  return !!r && r.type === 5 && r.data?.tag === "console";
+};
 
 export function initReplay(config: WebReplayConfig): ReplayController {
   if (typeof window === "undefined" || typeof document === "undefined") {
@@ -72,7 +143,115 @@ export function initReplay(config: WebReplayConfig): ReplayController {
     }
   }
 
-  const session = createSessionRuntime(config);
+  // Each invalid selector is reported once per page, however often the
+  // recorder is (re)installed.
+  const warnedSelectors = new Set<string>();
+  const warnSelectors = (bad: string[], what: string) => {
+    const fresh = bad.filter((s) => !warnedSelectors.has(s));
+    if (fresh.length === 0) return;
+    for (const s of fresh) warnedSelectors.add(s);
+    // eslint-disable-next-line no-console
+    console.warn(`[replay-sdk] ${what}:`, fresh);
+  };
+  const warnMaskSelectors = (bad: string[]) =>
+    warnSelectors(bad, "invalid mask selector(s), treating the whole page as private");
+
+  // The last dashboard privacy rules seen for this ingest host + key, kept so a
+  // page whose remote config is slower than the 300ms race records its first
+  // snapshot with them. Per-browser localStorage; any failure just means no
+  // cached rules.
+  const privacyCacheKey = (() => {
+    const owner = `${config.apiHost}|${config.apiKey}`;
+    let h = 5381;
+    for (let i = 0; i < owner.length; i += 1) h = ((h * 33) ^ owner.charCodeAt(i)) >>> 0;
+    return `replay:privacy:${h.toString(36)}`;
+  })();
+  const strings = (v: unknown): string[] =>
+    Array.isArray(v) ? v.filter((s): s is string => typeof s === "string") : [];
+  const readCachedPrivacy = (): WorkspacePrivacy | null => {
+    try {
+      const raw = localStorage.getItem(privacyCacheKey);
+      if (!raw) return null;
+      const p = JSON.parse(raw) as Record<string, unknown> | null;
+      if (!p || typeof p !== "object") return null;
+      const d = DEFAULT_WORKSPACE_PRIVACY;
+      return {
+        forceMaskAllInputs: p.forceMaskAllInputs === true,
+        maskSelectors: strings(p.maskSelectors),
+        blockSelectors: strings(p.blockSelectors),
+        maskInputTypes: strings(p.maskInputTypes),
+        // An entry saved without the URL rules keeps the server's defaults.
+        redactUrlPatterns: Array.isArray(p.redactUrlPatterns)
+          ? strings(p.redactUrlPatterns)
+          : d.redactUrlPatterns,
+        blockCreditCardText:
+          typeof p.blockCreditCardText === "boolean"
+            ? p.blockCreditCardText
+            : d.blockCreditCardText,
+        stripQueryParams: p.stripQueryParams === true,
+        allowedQueryParams: Array.isArray(p.allowedQueryParams)
+          ? strings(p.allowedQueryParams)
+          : d.allowedQueryParams,
+        networkBodies: p.networkBodies === true,
+      };
+    } catch {
+      return null;
+    }
+  };
+  const writeCachedPrivacy = (p: WorkspacePrivacy) => {
+    try {
+      localStorage.setItem(privacyCacheKey, JSON.stringify(p));
+    } catch {
+      /* storage blocked or full — the next page just races without it */
+    }
+  };
+
+  // The rules this page records under until its workspace's own are known:
+  // the last ones seen for this host + key, else the server's defaults. Both
+  // are provisional, so nothing recorded under them is uploaded before the
+  // workspace's rules arrive (see the privacy hold below). Remembered rules
+  // can be stale: a selector the workspace added since is missing from them.
+  const provisionalPrivacy = readCachedPrivacy() ?? DEFAULT_WORKSPACE_PRIVACY;
+
+  // The privacy hold. From the start until the workspace's rules are known
+  // (its config arrived, failed, or PRIVACY_HOLD_MAX_MS passed), events are
+  // recorded under the provisional rules and kept: no regular upload, no
+  // hide/unload batch. Then, if the workspace's rules hide anything the
+  // provisional ones didn't, the replay and click labels recorded so far are
+  // dropped and the recorder restarts under them (see applyRemoteConfig);
+  // URLs, titles and the capture settings get them too; and the hold is
+  // released. A config that wins the 300ms race releases it before the first
+  // upload would have gone anyway, so the usual page waits for nothing.
+  let privacyKnown = false;
+  let privacyHoldTimer: ReturnType<typeof setTimeout> | undefined;
+  // The rules the DOM events in the buffer (rrweb's stream, click labels)
+  // were recorded under: the provisional ones from the start, the final ones
+  // once the config arrived. Batches that leave the buffer keep them
+  // (CarriedBatch.rules), so whichever page sends a batch later can check
+  // them against the rules it knows (settleCarried).
+  let recordedUnder: RecorderRules | null = null;
+
+  // The masker rrweb's text/input hooks, the event post-pass, the click labels
+  // and the page titles use. Built from the host config and the provisional
+  // workspace selectors now, so the captures installed before rrweb (phase 1)
+  // already mask what they record; replaced each time rrweb is (re)installed
+  // with the merged privacy settings.
+  let activeTextMasker: TextMasker = createTextMasker({
+    maskSelectors: [config.maskTextSelector, ...provisionalPrivacy.maskSelectors],
+    maskEmails: config.maskTextEmails !== false,
+    maskNumbers: config.maskTextNumbers === true,
+    rootDoc: document,
+    warn: warnMaskSelectors,
+    blockSelector:
+      selectorEntries([config.blockSelector, ...provisionalPrivacy.blockSelectors])
+        .filter((s) => validSelector(s, document))
+        .join(", ") || undefined,
+  });
+
+  const session = createSessionRuntime(config, {
+    maskTitle: (t) => activeTextMasker.titleFor(t),
+    privacyTag: () => recordedUnder ?? undefined,
+  });
   const sendBatch = createBatchSender(config);
   const { fp: fingerprint } = getBrowserFingerprint();
   sendBatch.setFingerprint(fingerprint);
@@ -145,10 +324,12 @@ export function initReplay(config: WebReplayConfig): ReplayController {
   // Regular sends whose events are a beforeSend hook's output (see
   // CarriedBatch.hooked), so an upload carried on at pagehide keeps the flag.
   const hookedEnvelopes = new WeakSet<ReplayBatchEnvelope>();
+  // The rules each regular send's events were recorded under, for the same
+  // reason (CarriedBatch.rules).
+  const envelopeRules = new WeakMap<ReplayBatchEnvelope, RecorderRules>();
 
   if (config.distinctId)
     sendBatch.setIdentify({ distinctId: config.distinctId });
-
 
   const emit = <TData>(
     event: Omit<ReplayEvent<TData>, "id" | "offsetMs" | "source">,
@@ -201,7 +382,8 @@ export function initReplay(config: WebReplayConfig): ReplayController {
       href: redactUrlForStorage(window.location.href),
       path: window.location.pathname,
       referrer: redactUrlForStorage(document.referrer),
-      title: document.title || undefined,
+      // Masked like the replay's <title> text (emails, digits if asked).
+      title: activeTextMasker.titleFor(document.title) || undefined,
     };
     emit({ ts: Date.now(), type: "session_start", data });
   };
@@ -213,6 +395,22 @@ export function initReplay(config: WebReplayConfig): ReplayController {
   // would have no base).
   let lastRrwebActivityAt = Date.now();
   const emitSnapshot = (rrwebEvent: eventWithTime) => {
+    // rrweb's Meta event carries the page URL: scrub it like every other
+    // stored page URL (session_start, page context, navigation).
+    if (rrwebEvent.type === 4) {
+      const meta = rrwebEvent.data as { href?: unknown };
+      if (typeof meta.href === "string") meta.href = redactUrlForStorage(meta.href);
+    }
+    // Privacy edits rrweb has no hook for (shadow-root text, href/meta, input
+    // values, private media, blocked iframes, select state), while its mirror
+    // still matches the page. An event with nothing left to record is dropped.
+    if (
+      !activeTextMasker.postProcess(
+        rrwebEvent,
+        (record as unknown as { mirror?: unknown }).mirror,
+      )
+    )
+      return;
     lastRrwebActivityAt = Date.now();
     // The session becomes shippable the moment its first FULL snapshot (type 2)
     // is buffered — every later incremental is a diff against it, so a batch sent
@@ -272,7 +470,9 @@ export function initReplay(config: WebReplayConfig): ReplayController {
     // have failed). This is what guarantees the first batch that creates the
     // server-side session carries the full_snapshot — never a snapshot-less "no
     // replay" row — and that a not-yet-visible tab ships nothing at all.
-    if (!started || (!snapshotReady && !rrwebFailed)) return;
+    // The privacy hold keeps everything (carried batches too) until the
+    // workspace's rules are known.
+    if (!started || !privacyKnown || (!snapshotReady && !rrwebFailed)) return;
     // No minimum-duration hold here: the server judges a short session when it
     // settles (keeps it when identified or when it caught an error, deletes it
     // otherwise), and it can only do that with the events it was sent.
@@ -282,10 +482,18 @@ export function initReplay(config: WebReplayConfig): ReplayController {
     if (!gate.canSend(opts?.ignoreBackoff)) return;
     const generation = session.generation;
     // Carried batches go first, each under its own segment: a failed send
-    // being retried, or what an earlier page load of this session held back.
-    const carried = session.carried.shift();
+    // being retried, or what an earlier page load of this session held back,
+    // even one that left after this page started (adoptOutbox; not once this
+    // page is leaving itself: the outbox is then its own, for the next page).
+    // Each gets the rules known now first; one left with nothing is skipped.
+    if (!unloading) session.adoptOutbox();
+    let carried = session.carried.shift();
+    while (carried && !settleCarried(carried)) carried = session.carried.shift();
     const events = carried ? carried.events : session.drain();
     if (events.length === 0) return;
+    // What the events were recorded under (settleCarried brought a carried
+    // batch to the rules known now).
+    const builtUnder = recordedUnder;
     const envelope: ReplayBatchEnvelope = {
       projectId: config.projectId,
       sessionId: session.sessionId,
@@ -307,6 +515,7 @@ export function initReplay(config: WebReplayConfig): ReplayController {
     if (!nextEnvelope) return;
     const hooked = carried?.hooked === true || config.beforeSend !== undefined;
     if (hooked) hookedEnvelopes.add(nextEnvelope);
+    if (builtUnder) envelopeRules.set(nextEnvelope, builtUnder);
     gate.begin();
     const send = (async () => {
       let outcome: SendOutcome;
@@ -335,6 +544,9 @@ export function initReplay(config: WebReplayConfig): ReplayController {
             page: nextEnvelope.page,
             sequence: nextEnvelope.sequence,
             ...(hooked ? { hooked: true } : {}),
+            // Checked again before the resend: a config that arrived late
+            // (after the hold's cap) may hide more than these did.
+            ...(builtUnder ? { rules: builtUnder } : {}),
           },
           generation,
         );
@@ -473,17 +685,143 @@ export function initReplay(config: WebReplayConfig): ReplayController {
     maskInputOptionsKey?: string;
   } | null = null;
 
+  // What the recorder masks and blocks under a set of workspace rules: the
+  // host's and the workspace's entries combined (union), invalid block entries
+  // left out. installCaptures installs rrweb with it; the privacy hold compares
+  // the rules events were recorded under with the final ones.
+  type RecorderRules = {
+    maskAllInputs: boolean;
+    /** Input types the workspace always masks, password excepted (the masker
+     *  sends no value for it at all). */
+    forcedTypes: string[];
+    maskEntries: string[];
+    blockCandidates: string[];
+    blockEntries: string[];
+    recordCanvas: boolean;
+    recordCrossOriginIframes: boolean;
+  };
+  const recorderRules = (w: {
+    forceMaskAllInputs?: boolean;
+    maskInputTypes?: string[];
+    maskSelectors?: string[];
+    blockSelectors?: string[];
+    recordCanvas?: boolean;
+    recordCrossOriginIframes?: boolean;
+  }): RecorderRules => {
+    // Input masking follows the reference tracker: every value is masked
+    // unless the app opts out in code (maskAllInputs: false). The dashboard
+    // flag can only force masking on; it never unmasks.
+    const maskAllInputs =
+      (config.maskAllInputs ?? true) || w.forceMaskAllInputs === true;
+    const forcedTypes = selectorEntries(
+      (w.maskInputTypes ?? []).map((t) => String(t).toLowerCase()),
+    )
+      .filter((t) => t !== "password")
+      .sort();
+    // Host and workspace selectors are combined (union): either side can add a
+    // private region or a blocked element, neither can remove the other's.
+    const maskEntries = selectorEntries([
+      config.maskTextSelector,
+      ...(w.maskSelectors ?? []),
+    ]);
+    // An invalid block selector makes rrweb throw on every DOM mutation (the
+    // replay freezes on its snapshot): bad entries are dropped one by one.
+    const blockCandidates = selectorEntries([
+      config.blockSelector,
+      ...(w.blockSelectors ?? []),
+    ]);
+    return {
+      maskAllInputs,
+      forcedTypes,
+      maskEntries,
+      blockCandidates,
+      blockEntries: blockCandidates.filter((s) => validSelector(s, document)),
+      // Host config can force these on without waiting for remote config.
+      recordCanvas: w.recordCanvas ?? config.recordCanvas ?? false,
+      recordCrossOriginIframes:
+        w.recordCrossOriginIframes ?? config.recordCrossOriginIframes ?? false,
+    };
+  };
+  // True when events recorded under `was` hide everything `now` hides: each
+  // of its mask and block entries, its input masking, and no canvas or
+  // cross-origin iframe content it doesn't record. Then nothing recorded
+  // under `was` shows what `now` would hide, and it can be sent as it is.
+  const coversRules = (was: RecorderRules, now: RecorderRules): boolean => {
+    const within = (xs: string[], ys: string[]) => xs.every((x) => ys.indexOf(x) !== -1);
+    return (
+      within(now.maskEntries, was.maskEntries) &&
+      within(now.blockEntries, was.blockEntries) &&
+      (was.maskAllInputs ||
+        (!now.maskAllInputs && within(now.forcedTypes, was.forcedTypes))) &&
+      (now.recordCanvas || !was.recordCanvas) &&
+      (now.recordCrossOriginIframes || !was.recordCrossOriginIframes)
+    );
+  };
+  // The JSON form of RecorderRules a carried batch holds (the outbox comes
+  // from storage): null when it isn't one, as for a batch an older SDK left.
+  const asRecorderRules = (v: unknown): RecorderRules | null => {
+    const r = v as Record<string, unknown> | null | undefined;
+    const list = (x: unknown) => Array.isArray(x) && x.every((s) => typeof s === "string");
+    const flag = (x: unknown) => typeof x === "boolean";
+    return r &&
+      typeof r === "object" &&
+      flag(r.maskAllInputs) &&
+      list(r.forcedTypes) &&
+      list(r.maskEntries) &&
+      list(r.blockCandidates) &&
+      list(r.blockEntries) &&
+      flag(r.recordCanvas) &&
+      flag(r.recordCrossOriginIframes)
+      ? (r as unknown as RecorderRules)
+      : null;
+  };
+
   // URL redaction policy applied to outgoing network events. The network
   // capture reads this when serialising each event so query-strings can
   // be stripped / allowlisted, and credit-card-looking text scrubbed,
-  // before they leave the browser.
+  // before they leave the browser. The provisional rules' policy until the
+  // workspace's config arrives.
   let urlRedactionPolicy: {
     strip: boolean;
     allowed: string[];
     blockCC: boolean;
-  } = { strip: false, allowed: [], blockCC: false };
+    /** Host and workspace redaction patterns (union). */
+    patterns: Array<string | RegExp>;
+    /** Request and response bodies are recorded (the workspace's setting). */
+    bodies: boolean;
+  } = {
+    strip: provisionalPrivacy.stripQueryParams,
+    allowed: provisionalPrivacy.allowedQueryParams,
+    blockCC: provisionalPrivacy.blockCreditCardText,
+    patterns: [
+      ...(config.redactUrls ?? []),
+      ...compileRedactPatterns(provisionalPrivacy.redactUrlPatterns),
+    ],
+    bodies: provisionalPrivacy.networkBodies,
+  };
+  // The capture channels the workspace turned off, once its config is known:
+  // events of theirs recorded before (under the host's settings) never leave.
+  let channelsOff: { network: boolean; console: boolean; performance: boolean } | null =
+    null;
   // Read live per-request by createNetworkCapture via the getUrlPolicy closure,
   // so a remote-config privacy update applies without re-installing the capture.
+  // The network capture is installed once, in phase 1, with the host's
+  // patterns only: the workspace's reach it through this policy alone.
+  // Resource timings name the same request URLs, so they get the same policy.
+  const redactNetworkUrl = (url: string) => redactUrlForStorage(url, urlRedactionPolicy);
+
+  // A workspace's rules as installCaptures takes them.
+  const privacyOptions = (p: WorkspacePrivacy) => ({
+    forceMaskAllInputs: p.forceMaskAllInputs,
+    maskSelectors: p.maskSelectors,
+    blockSelectors: p.blockSelectors,
+    maskInputTypes: p.maskInputTypes,
+    blockCreditCardText: p.blockCreditCardText,
+    stripQueryParams: p.stripQueryParams,
+    allowedQueryParams: p.allowedQueryParams,
+    redactUrls: compileRedactPatterns(p.redactUrlPatterns),
+    captureBodies: p.networkBodies,
+  });
 
   // Sampling overrides — populated when /v1/sdk/config arrives. Referenced
   // inside error + identify handlers so they can flip a dropped session
@@ -502,11 +840,15 @@ export function initReplay(config: WebReplayConfig): ReplayController {
     performance?: boolean;
     captureHeaders: boolean;
     captureBodies?: boolean;
-    maskAllInputs?: boolean;
-    /** rrweb maskInputOptions — e.g. { password: true, email: true } */
-    maskInputOptions?: Record<string, boolean>;
-    maskTextSelector?: string;
-    blockSelector?: string;
+    /** The dashboard's "mask all inputs" force. It can only turn masking on:
+     *  the app's own maskAllInputs (default true) is never overridden to off. */
+    forceMaskAllInputs?: boolean;
+    /** Input types the workspace always masks, e.g. ["email", "tel"]. */
+    maskInputTypes?: string[];
+    /** Workspace mask/block selectors, one entry each. Combined with the host's
+     *  maskTextSelector / blockSelector (union), never replacing them. */
+    maskSelectors?: string[];
+    blockSelectors?: string[];
     recordCanvas?: boolean;
     recordCrossOriginIframes?: boolean;
     blockCreditCardText?: boolean;
@@ -514,8 +856,8 @@ export function initReplay(config: WebReplayConfig): ReplayController {
     allowedQueryParams?: string[];
     redactUrls?: Array<string | RegExp>;
     /** Phase-1 callers set this — start console/network/errors but defer
-     *  rrweb until phase 2 (after remote config or 300ms timeout) so we
-     *  don't lose the FullSnapshot to a stop+restart. */
+     *  rrweb until phase 2 (after remote config or 300ms timeout), so the
+     *  page is usually serialized once, under the workspace's rules. */
     skipRrweb?: boolean;
   }) => {
     if (effective.skipRrweb) {
@@ -544,10 +886,13 @@ export function initReplay(config: WebReplayConfig): ReplayController {
         }),
       );
       syncCapture("navigation", true, () =>
-        createNavigationCapture((d: NavigationEventData) => {
-          markMeaningful(); // a real route change revives an idle session
-          emit({ ts: Date.now(), type: "navigation", data: d });
-        }),
+        createNavigationCapture(
+          (d: NavigationEventData) => {
+            markMeaningful(); // a real route change revives an idle session
+            emit({ ts: Date.now(), type: "navigation", data: d });
+          },
+          () => activeTextMasker,
+        ),
       );
       syncCapture("viewport", true, () =>
         createViewportCapture(() => {
@@ -556,8 +901,9 @@ export function initReplay(config: WebReplayConfig): ReplayController {
         }),
       );
       syncCapture("rageDead", true, () =>
-        createRageDeadClickCapture((d) =>
-          emit({ ts: Date.now(), type: "custom", data: d }),
+        createRageDeadClickCapture(
+          (d) => emit({ ts: Date.now(), type: "custom", data: d }),
+          () => activeTextMasker,
         ),
       );
       // Performance signals (LCP/CLS/FID/longtask/memory) — ride along
@@ -571,28 +917,51 @@ export function initReplay(config: WebReplayConfig): ReplayController {
             apiHost: config.apiHost,
             captureResourceTimings: config.captureResourceTimings,
             resourceMinDurationMs: config.resourceMinDurationMs,
+            redactUrl: redactNetworkUrl,
           },
         ),
       );
       return;
     }
+    const rules = recorderRules(effective);
+    const { maskAllInputs, forcedTypes, maskEntries, blockCandidates } = rules;
+    // A copy: the media placeholders are added to it below.
+    const blockEntries = rules.blockEntries.slice();
+    const maskInputEmails = config.maskInputEmails !== false;
+    const maskInputNumbers = config.maskInputNumbers !== false;
+    if (blockEntries.length < blockCandidates.length) {
+      warnSelectors(
+        blockCandidates.filter((s) => blockEntries.indexOf(s) === -1),
+        "invalid block selector(s) ignored",
+      );
+    }
+    const textMasker = createTextMasker({
+      maskSelectors: maskEntries,
+      maskEmails: config.maskTextEmails !== false,
+      maskNumbers: config.maskTextNumbers === true,
+      rootDoc: document,
+      warn: warnMaskSelectors,
+      inputs: {
+        maskAll: maskAllInputs,
+        forcedTypes,
+        maskEmails: maskInputEmails,
+        maskNumbers: maskInputNumbers,
+      },
+      blockSelector: blockEntries.join(", ") || undefined,
+    });
+    // Images, canvas, video and iframes inside private regions are recorded
+    // as blocked placeholders.
+    if (textMasker.mediaBlockSelector) blockEntries.push(textMasker.mediaBlockSelector);
     const nextPrivacy = {
-      maskAllInputs: effective.maskAllInputs ?? config.maskAllInputs ?? true, // safe default
-      maskTextSelector: effective.maskTextSelector ?? config.maskTextSelector,
-      blockSelector: effective.blockSelector ?? config.blockSelector,
-      // Host config can force these on without waiting for remote config.
-      recordCanvas: effective.recordCanvas ?? config.recordCanvas ?? false,
-      recordCrossOriginIframes:
-        effective.recordCrossOriginIframes ??
-        config.recordCrossOriginIframes ??
-        false,
-      // Serialise input-type masks so the change-detection below can use a
-      // simple string equality check.
-      maskInputOptionsKey: Object.keys(
-        effective.maskInputOptions ?? { password: true },
-      )
-        .sort()
-        .join(","),
+      maskAllInputs,
+      // The real selectors (not rrweb's "*"), so a change restarts the recorder.
+      maskTextSelector: maskEntries.join(", ") || undefined,
+      blockSelector: blockEntries.join(", ") || undefined,
+      recordCanvas: rules.recordCanvas,
+      recordCrossOriginIframes: rules.recordCrossOriginIframes,
+      // Serialise the input-masking rules so the change-detection below can
+      // use a simple string equality check.
+      maskInputOptionsKey: `${forcedTypes.join(",")}|${maskInputEmails}|${maskInputNumbers}`,
     };
     const privacyChanged =
       installedPrivacy !== null &&
@@ -605,8 +974,11 @@ export function initReplay(config: WebReplayConfig): ReplayController {
         installedPrivacy.maskInputOptionsKey !==
           nextPrivacy.maskInputOptionsKey);
     if (privacyChanged && captures.rrweb) {
-      // Stop the old recorder; new snapshot will fire on re-record so the
-      // server gets a fresh full snapshot with the new privacy applied.
+      // Stop the old recorder; the new one takes a fresh full snapshot with
+      // the new privacy applied. Checked in Chrome with rrweb 2.0.0-alpha.20:
+      // record() emits Meta + FullSnapshot as it starts once the document is
+      // interactive, and at the window load event while it is still loading
+      // (the stopped recorder emits nothing more).
       captures.rrweb.stop();
       captures.rrweb = null;
     }
@@ -622,43 +994,31 @@ export function initReplay(config: WebReplayConfig): ReplayController {
       // them to. A periodic checkout self-heals a lost initial snapshot and lets
       // a live viewer join mid-session. Paired with the flush re-queue.
       rrwebOpts.checkoutEveryNms = 120000;
-      // Default privacy floor for VISIBLE TEXT: mask email addresses in every
-      // text node (opt out with maskTextEmails:false), and optionally long digit
-      // runs (maskTextNumbers). maskAllInputs already covers input VALUES; this
-      // covers free-text PII the reference tracker masks by default.
-      const maskEmails = config.maskTextEmails !== false;
-      if (maskEmails || config.maskTextNumbers) {
-        rrwebOpts.maskTextFn = (text: string): string => {
-          let t = text;
-          if (maskEmails)
-            t = t.replace(/[\w.+-]+@[\w-]+\.[\w.-]+/g, "[email]");
-          if (config.maskTextNumbers)
-            t = t.replace(/\b\d{5,}\b/g, (m) =>
-              "•".repeat(Math.min(m.length, 12)),
-            );
-          return t;
-        };
-      }
-      if (typeof nextPrivacy.maskAllInputs === "boolean")
-        rrwebOpts.maskAllInputs = nextPrivacy.maskAllInputs;
-      if (nextPrivacy.maskTextSelector)
-        rrwebOpts.maskTextSelector = nextPrivacy.maskTextSelector;
+      // Visible text. rrweb only calls maskTextFn for text it already decided
+      // to mask and then uses its result INSTEAD of its "*" wipe, so every
+      // text node is routed through it ("*") and the masker decides per
+      // element: private regions wiped, emails (and digits, if asked) masked
+      // everywhere else, CSS untouched.
+      activeTextMasker = textMasker;
+      rrwebOpts.maskTextSelector = "*";
+      rrwebOpts.maskTextFn = textMasker.maskTextFn;
+      // HTML comments are never recorded (the reference tracker drops them;
+      // rrweb would ship them raw, even inside private regions).
+      rrwebOpts.slimDOMOptions = { comment: true };
+      // Input values. rrweb hands every input type to maskInputFn, which
+      // applies maskAllInputs, sends nothing for passwords and for types the
+      // reference tracker never records (hidden, file, url, color…), and with
+      // the app's opt-out still masks emails, 4+ digit values, workspace-forced
+      // types and anything in a private region. rrweb's own maskAllInputs is
+      // not used: its map would replace this one and record hidden and file
+      // values raw.
+      rrwebOpts.maskInputOptions = { ...ALL_INPUT_TYPES };
+      rrwebOpts.maskInputFn = textMasker.maskInputFn;
       if (nextPrivacy.blockSelector)
         rrwebOpts.blockSelector = nextPrivacy.blockSelector;
       if (nextPrivacy.recordCanvas) rrwebOpts.recordCanvas = true;
       if (nextPrivacy.recordCrossOriginIframes)
         rrwebOpts.recordCrossOriginIframes = true;
-      // Always-on input-type masks (password by default, plus anything the
-      // workspace's mask rules implied via `input[type="X"]` selectors).
-      // This wins even when maskAllInputs is false.
-      if (
-        effective.maskInputOptions &&
-        Object.keys(effective.maskInputOptions).length > 0
-      ) {
-        rrwebOpts.maskInputOptions = effective.maskInputOptions;
-      } else {
-        rrwebOpts.maskInputOptions = { password: true };
-      }
       let stop: (() => void) | undefined;
       let heartbeat: ReturnType<typeof setInterval> | undefined;
       try {
@@ -669,8 +1029,7 @@ export function initReplay(config: WebReplayConfig): ReplayController {
         // unplayable ("no replay frames"). Force a full snapshot on a wall-clock
         // TIMER (every 30s, regardless of activity): this keeps the stream
         // spanning the whole session (idle included) and guarantees a FRESH BASE
-        // exists within 30s of any point — self-healing a lost initial snapshot,
-        // surviving the privacy-driven restart below (which doesn't re-snapshot),
+        // exists within 30s of any point — self-healing a lost initial snapshot
         // and enabling live mid-join. The SDK analog of the reference tracker's
         // periodic keepalive.
         heartbeat = setInterval(() => {
@@ -727,6 +1086,9 @@ export function initReplay(config: WebReplayConfig): ReplayController {
       strip: !!effective.stripQueryParams,
       allowed: effective.allowedQueryParams ?? [],
       blockCC: !!effective.blockCreditCardText,
+      // Both apply: the dashboard's patterns never replace the app's.
+      patterns: [...(config.redactUrls ?? []), ...(effective.redactUrls ?? [])],
+      bodies: effective.captureBodies === true,
     };
     syncCapture("console", effective.console, () =>
       createConsoleCapture((d: ConsoleEventData) =>
@@ -770,8 +1132,9 @@ export function initReplay(config: WebReplayConfig): ReplayController {
     // Rage + dead-click detector emits as custom events; the persistence
     // worker counts these into session.rageCount / deadCount.
     syncCapture("rageDead", true, () =>
-      createRageDeadClickCapture((d) =>
-        emit({ ts: Date.now(), type: "custom", data: d }),
+      createRageDeadClickCapture(
+        (d) => emit({ ts: Date.now(), type: "custom", data: d }),
+        () => activeTextMasker,
       ),
     );
     // Performance signals — LCP/CLS/FID via PerformanceObserver,
@@ -789,9 +1152,131 @@ export function initReplay(config: WebReplayConfig): ReplayController {
           apiHost: config.apiHost,
           captureResourceTimings: config.captureResourceTimings,
           resourceMinDurationMs: config.resourceMinDurationMs,
+          redactUrl: redactNetworkUrl,
         },
       ),
     );
+  };
+
+  // ── Privacy hold: release, and the events the known rules change ─────────
+
+  // The workspace's rules are known, or the hold's cap passed: what was held
+  // goes out with the next flush. Not once stop() began: it handed what was
+  // held on to the next page load.
+  const releasePrivacyHold = () => {
+    if (privacyHoldTimer !== undefined) {
+      clearTimeout(privacyHoldTimer);
+      privacyHoldTimer = undefined;
+    }
+    if (privacyKnown || stopping) return;
+    privacyKnown = true;
+    scheduleFlush();
+  };
+
+  // Drops the buffered events whose content the masking rules decided when
+  // they were recorded: rrweb's stream (its base snapshot among them) and the
+  // click labels. Called when stricter rules arrive; the recorder's restart
+  // then takes a fresh full snapshot under them, so the replay starts from
+  // that base, never from diffs without one.
+  const dropDomEvents = () => {
+    let replay = false;
+    const kept = session.drain().filter((e) => {
+      if (isReplayEvent(e)) {
+        replay = true;
+        return false;
+      }
+      return !isClickLabel(e);
+    });
+    for (const e of kept) session.push(e);
+    if (replay) snapshotReady = false;
+  };
+
+  // What an event that leaves under the known settings may hold: nothing of a
+  // channel the workspace turned off (recorded before its config arrived,
+  // under the host's settings), no request or response body unless it
+  // records them, and request, resource and long-frame script URLs redacted
+  // under its policy, on top of whatever policy redacted them when they were
+  // recorded (redaction only ever adds). False: drop the event. Page URLs
+  // (session start, page views, rrweb's meta event) only ever get the
+  // built-in key scrub, which they already have.
+  const settleEvent = (e: ReplayEvent): boolean => {
+    const off = channelsOff;
+    if (off) {
+      if (off.console && (e.type === "console" || isConsoleTee(e))) return false;
+      if (off.network && e.type === "network") return false;
+      if (off.performance && e.type === "performance") return false;
+    }
+    const d = e.data as Record<string, unknown> | null;
+    if (!d) return true;
+    if (e.type === "network") {
+      if (typeof d.url === "string") d.url = redactNetworkUrl(d.url);
+      if (!urlRedactionPolicy.bodies) {
+        delete d.requestBody;
+        delete d.responseBody;
+      }
+    } else if (e.type === "performance") {
+      const detail = d.detail as Record<string, unknown> | undefined;
+      if (detail && d.metric === "resource" && typeof detail.name === "string")
+        detail.name = redactNetworkUrl(detail.name).slice(0, 512);
+      if (detail && typeof detail.scriptSource === "string")
+        detail.scriptSource = redactNetworkUrl(detail.scriptSource);
+      if (detail && typeof detail.scriptInvoker === "string")
+        detail.scriptInvoker = redactNetworkUrl(detail.scriptInvoker);
+    }
+    return true;
+  };
+
+  // The buffer, once the workspace's rules are known (after dropDomEvents
+  // when they hide more): settleEvent on each event, and page titles masked
+  // by them (the same document: its <title> can be looked at again).
+  const settleBuffer = () => {
+    const kept: ReplayEvent[] = [];
+    for (const e of session.drain()) {
+      if (!settleEvent(e)) continue;
+      const d = e.data as Record<string, unknown> | null;
+      if (
+        d &&
+        (e.type === "session_start" || e.type === "navigation") &&
+        typeof d.title === "string"
+      ) {
+        d.title = activeTextMasker.titleFor(d.title) || undefined;
+      }
+      kept.push(e);
+    }
+    for (const e of kept) session.push(e);
+  };
+
+  // A carried batch about to be sent: a failed send, or what an earlier page
+  // load (or this page, before a back/forward-cache freeze) held back. Its
+  // DOM events (rrweb's stream, click labels) and page titles go only when
+  // the rules they were recorded under hide everything the rules known now
+  // hide; then the base snapshot and every diff on it go together, else none
+  // of them. An older SDK's batch, with no rules, counts as hiding nothing.
+  // Every event gets settleEvent. Edited in place (the runtime knows a failed
+  // send by identity) and brought to the known rules once. False when nothing
+  // is left to send.
+  const settleCarried = (c: CarriedBatch): boolean => {
+    const now = recordedUnder;
+    if (!now || c.rules === now) return c.events.length > 0;
+    const was = asRecorderRules(c.rules);
+    const covered = !!was && coversRules(was, now);
+    c.events = c.events.filter((e) => {
+      if (!covered) {
+        if (isReplayEvent(e) || isClickLabel(e)) return false;
+        const d = e.data as Record<string, unknown> | null;
+        if (d && (e.type === "session_start" || e.type === "navigation")) delete d.title;
+      }
+      return settleEvent(e);
+    });
+    if (!covered && c.page) c.page = { ...c.page, title: "" };
+    c.rules = now;
+    return c.events.length > 0;
+  };
+  const settleAllCarried = () => {
+    const list = session.carried;
+    for (let i = list.length - 1; i >= 0; i -= 1) {
+      if (!settleCarried(list[i])) list.splice(i, 1);
+    }
   };
 
   // The visibility-gated start. Following the reference tracker, NOTHING is
@@ -823,17 +1308,16 @@ export function initReplay(config: WebReplayConfig): ReplayController {
     if (!session.resumed) emitSessionStart();
     emitViewport();
 
-    // We install captures in *two phases* to avoid losing the rrweb
-    // FullSnapshot. Phase 1 starts everything EXCEPT rrweb. Phase 2 runs
-    // after remote config arrives (or 300ms timeout, whichever's first) and
-    // starts rrweb with the final privacy/canvas options.
+    // We install captures in *two phases*. Phase 1 starts everything EXCEPT
+    // rrweb. Phase 2 runs after remote config arrives (or 300ms timeout,
+    // whichever's first) and starts rrweb with the workspace's privacy/canvas
+    // options, or the provisional ones when the config is late.
     //
-    // Why split? rrweb only fires FullSnapshot on initial `record()`. If we
-    // started it in phase 1 with stale config, then stopped+restarted in
-    // phase 2 because `recordCanvas` flipped, the new instance does NOT
-    // re-emit a FullSnapshot (rrweb 2.0-alpha quirk). The Replayer then
-    // has incremental snapshots with nothing to apply them to → blank
-    // screen with "no replay frames" in the dashboard.
+    // Why split? A recorder started with other rules than the workspace's
+    // must be restarted when they arrive, which serializes the whole page
+    // again (the restart does take a fresh full snapshot: see installCaptures)
+    // and, during the privacy hold, discards what was recorded before. Waiting
+    // up to 300ms for the config usually avoids both.
     installCaptures({
       console: config.captureConsole !== false,
       network: config.captureNetwork !== false,
@@ -843,34 +1327,46 @@ export function initReplay(config: WebReplayConfig): ReplayController {
       // installCaptures call disables it.
       performance: true,
       captureHeaders: config.captureHeaders ?? false,
-      maskAllInputs: config.maskAllInputs ?? true,
       // Phase 1 deliberately skips rrweb — see installCaptures internals.
       skipRrweb: true,
     });
 
+    // Everything from here on is recorded under the provisional rules and held
+    // until the workspace's are known (see the privacy hold), at most
+    // PRIVACY_HOLD_MAX_MS: then the provisional rules are kept as final.
+    recordedUnder = recorderRules(provisionalPrivacy);
+    privacyHoldTimer = setTimeout(releasePrivacyHold, PRIVACY_HOLD_MAX_MS);
+
     // Promise race: whichever fires first wins. We never wait > 300ms for
-    // remote config — a slow /v1/sdk/config request shouldn't delay
-    // recording.
-    const remotePromise = fetchRemoteConfig(config);
+    // remote config to start rrweb — a slow /v1/sdk/config request shouldn't
+    // delay recording. It only delays the upload (the privacy hold).
+    const remotePromise = loadRemoteConfig();
     const timeoutPromise = new Promise<null>((r) =>
       setTimeout(() => r(null), 300),
     );
     void Promise.race([remotePromise, timeoutPromise]).then(async (remote) => {
-      // If the race was won by the timeout, await the actual remote in the
-      // background so it can still adjust mid-session — but start recording
-      // NOW using local config as the source of truth.
+      // If the race was won by the timeout (or the config already failed),
+      // await the actual remote in the background so it can still adjust
+      // mid-session — but start recording NOW under the provisional rules.
       if (remote === null) {
         if (stopping) return;
+        // The workspace's last-seen privacy rules (force flag, selectors,
+        // forced types, URL rules), else the server's defaults, apply now:
+        // the first snapshot masks what the workspace most likely asks for.
         installCaptures({
           console: config.captureConsole !== false,
           network: config.captureNetwork !== false,
           errors: config.captureErrors !== false,
           performance: true,
           captureHeaders: config.captureHeaders ?? false,
-          maskAllInputs: config.maskAllInputs ?? true,
+          ...privacyOptions(provisionalPrivacy),
         });
         const lateRemote = await remotePromise.catch(() => null);
         if (lateRemote) applyRemoteConfig(lateRemote);
+        // No config (none for this key, or still failing when the hold
+        // ended): the provisional rules, with the host's, are the page's
+        // rules for good.
+        else releasePrivacyHold();
         return;
       }
       applyRemoteConfig(remote);
@@ -881,9 +1377,22 @@ export function initReplay(config: WebReplayConfig): ReplayController {
     session.startAutoFlush(flush);
   };
 
-  function applyRemoteConfig(
-    remote: NonNullable<Awaited<ReturnType<typeof fetchRemoteConfig>>>,
-  ) {
+  // The workspace's config. A failure worth retrying (offline, a timeout,
+  // 429, 5xx, a request a back/forward-cache freeze aborted) is asked again
+  // while the privacy hold lasts, after CONFIG_RETRY_MS, then twice that…: a
+  // blip doesn't leave the page under the provisional rules. Null: no config
+  // (none for this key, or the hold ended first).
+  async function loadRemoteConfig(): Promise<SdkRemoteConfig | null> {
+    for (let wait = CONFIG_RETRY_MS; ; wait *= 2) {
+      const r = await requestRemoteConfig(config);
+      if (r.kind === "ok") return r.config;
+      if (r.kind === "none" || privacyKnown || stopping) return null;
+      await new Promise((done) => setTimeout(done, wait));
+      if (privacyKnown || stopping) return null;
+    }
+  }
+
+  function applyRemoteConfig(remote: SdkRemoteConfig) {
     // Uploads were already halted (or stop() ran): a late config must not
     // re-install the captures.
     if (blocked || stopped || stopping) return;
@@ -896,6 +1405,7 @@ export function initReplay(config: WebReplayConfig): ReplayController {
     if (remote.shouldNotRecord) {
       blocked = true;
       sampled = false;
+      releasePrivacyHold(); // nothing is sent: the held events are dropped
       return;
     }
 
@@ -913,6 +1423,7 @@ export function initReplay(config: WebReplayConfig): ReplayController {
     ) {
       blocked = true;
       sampled = false;
+      releasePrivacyHold(); // nothing is sent: the held events are dropped
       return;
     }
 
@@ -933,20 +1444,22 @@ export function initReplay(config: WebReplayConfig): ReplayController {
     }
 
     // ---- Capture toggles --------------------------------------------
-    // maskSelectors/blockSelectors arrive as arrays of CSS selectors;
-    // rrweb takes a single comma-joined string for each.
-    const maskTextSelector =
-      (remote.privacy.maskSelectors ?? []).join(", ") || undefined;
-    const blockSelector =
-      (remote.privacy.blockSelectors ?? []).join(", ") || undefined;
-
-    // Build rrweb's maskInputOptions from the server-derived input-type
-    // list. `password` is always included even when the customer disables
-    // maskAllInputs — that's the security floor.
-    const maskInputOptions: Record<string, boolean> = {};
-    for (const t of remote.privacy.maskInputTypes ?? ["password"]) {
-      maskInputOptions[t] = true;
-    }
+    // maskSelectors/blockSelectors arrive as arrays of CSS selectors and stay
+    // arrays: installCaptures validates them one by one and combines them with
+    // the host's. maskAllInputs is the dashboard's force (it can only add
+    // masking); maskInputTypes lists the types the workspace always masks.
+    const privacy: WorkspacePrivacy = {
+      forceMaskAllInputs: remote.privacy.maskAllInputs === true,
+      maskSelectors: strings(remote.privacy.maskSelectors),
+      blockSelectors: strings(remote.privacy.blockSelectors),
+      maskInputTypes: strings(remote.privacy.maskInputTypes),
+      redactUrlPatterns: strings(remote.privacy.redactUrlPatterns),
+      blockCreditCardText: remote.privacy.blockCreditCardText === true,
+      stripQueryParams: remote.privacy.stripQueryParams === true,
+      allowedQueryParams: strings(remote.privacy.allowedQueryParams),
+      networkBodies: remote.capture.networkBodies === true,
+    };
+    writeCachedPrivacy(privacy);
 
     // Remember the rules so identify()-triggered re-evaluation can flip
     // sampling on later when alwaysRecordIdentified=true.
@@ -955,26 +1468,55 @@ export function initReplay(config: WebReplayConfig): ReplayController {
       alwaysRecordIdentified: remote.sampling.alwaysRecordIdentified,
     };
 
+    // ---- Privacy hold ----------------------------------------------
+    // The DOM events still buffered (all of them during the hold) were
+    // recorded under the provisional rules. When those hide everything the
+    // workspace's rules hide (the usual case: the remembered rules, or the
+    // defaults, unchanged), they go out as they are. Otherwise rrweb's stream
+    // and the click labels are dropped before the recorder restarts under the
+    // workspace's rules, and the replay begins at the restart's full snapshot.
+    // Events of a channel it turns off (recorded under the host's settings)
+    // and request bodies it doesn't record go too (settleBuffer). After the
+    // hold's cap, this only reaches what is not sent yet: the buffer here,
+    // carried batches (a failed send waiting for its retry) when they go
+    // (settleCarried).
+    const rules = recorderRules({
+      ...privacy,
+      recordCanvas: remote.capture.canvas,
+      recordCrossOriginIframes: remote.capture.iframe,
+    });
+    const stricter = !coversRules(recordedUnder ?? recorderRules(provisionalPrivacy), rules);
+    if (stricter) dropDomEvents();
+    recordedUnder = rules;
+    channelsOff = {
+      network: remote.capture.network === false,
+      console: remote.capture.console === false,
+      performance: remote.capture.performance === false,
+    };
+
     installCaptures({
       console: remote.capture.console,
       network: remote.capture.network,
       errors: remote.capture.errors,
       performance: remote.capture.performance,
       captureHeaders: remote.capture.networkHeaders ?? remote.capture.headers,
-      captureBodies: remote.capture.networkBodies,
-      maskAllInputs: remote.privacy.maskAllInputs,
-      maskInputOptions,
-      maskTextSelector,
-      blockSelector,
+      // Bodies (privacy.networkBodies) come with the privacy options.
+      ...privacyOptions(privacy),
       recordCanvas: remote.capture.canvas,
       recordCrossOriginIframes: remote.capture.iframe,
-      blockCreditCardText: remote.privacy.blockCreditCardText,
-      stripQueryParams: remote.privacy.stripQueryParams,
-      allowedQueryParams: remote.privacy.allowedQueryParams,
-      redactUrls: remote.privacy.redactUrlPatterns.map(
-        (p) => new RegExp(p, "i"),
-      ),
     });
+    // Rules that differ restart the recorder, which takes the new base. Should
+    // they not (a difference the recorder's options don't show), take one:
+    // what was dropped included the old base.
+    if (stricter && !snapshotReady && captures.rrweb) {
+      try {
+        record.takeFullSnapshot(true);
+      } catch {
+        /* still loading: the recorder snapshots at the load event */
+      }
+    }
+    settleBuffer();
+    releasePrivacyHold();
   } // end applyRemoteConfig
 
   // Tiny glob matcher — supports `**` (matches anything) and `*` (matches
@@ -1032,11 +1574,21 @@ export function initReplay(config: WebReplayConfig): ReplayController {
     // redirect must not lose the landing page's session_start, URL and UTM
     // tags) — they're only sent if that page records — and so do earlier
     // pages' leftovers. A tab that never showed hands on only the latter.
-    if (!started || (!snapshotReady && !rrwebFailed)) {
+    // During the privacy hold nothing goes either: a tab switch keeps it all
+    // for the release, and a page leaving hands it all on, with the rules it
+    // was recorded under. The next page load sends it once it knows the
+    // workspace's rules, the replay and click labels only if those rules hide
+    // nothing more (settleCarried). The trade-off: if no page of the session
+    // follows in this tab (it was closed, or the user left the site), what a
+    // page recorded in its hold is never sent.
+    if (!started || !privacyKnown || (!snapshotReady && !rrwebFailed)) {
       if (leaving) session.stashForNextPage(!started);
       return;
     }
     if (endReason) emitSessionEnd(endReason);
+    // Carried batches (sent first when leaving, a failed send's copy on a tab
+    // switch) get the rules known now.
+    settleAllCarried();
     session.flushFinal(
       (envelope, hooked) => {
         // A carried batch the hook already ran on goes out as it is, if the
@@ -1064,7 +1616,10 @@ export function initReplay(config: WebReplayConfig): ReplayController {
     // First the regular uploads the browser would cancel with the page: they
     // hold the older events, possibly this page's base snapshot.
     // What can't be re-sent now goes with this page's leftovers.
-    session.carryUnsent(sendBatch.redeliverPending(), (e) => hookedEnvelopes.has(e));
+    session.carryUnsent(sendBatch.redeliverPending(), (e) => ({
+      hooked: hookedEnvelopes.has(e),
+      rules: envelopeRules.get(e),
+    }));
     if (e.persisted) {
       // Into the back/forward cache: it may come back, so the session isn't over.
       inBfcache = started;
@@ -1111,7 +1666,7 @@ export function initReplay(config: WebReplayConfig): ReplayController {
       type: "navigation",
       data: {
         to: redactUrlForStorage(window.location.href),
-        title: document.title || undefined,
+        title: activeTextMasker.titleFor(document.title) || undefined,
         trigger: "load",
       } satisfies NavigationEventData,
     });
@@ -1316,6 +1871,7 @@ export function initReplay(config: WebReplayConfig): ReplayController {
         onFirstVisible = undefined;
       }
       if (idleTimer !== undefined) window.clearInterval(idleTimer);
+      if (privacyHoldTimer !== undefined) clearTimeout(privacyHoldTimer);
       stopCaptures();
       for (const evt of activityEvents) {
         window.removeEventListener(evt, onUserActivity, {
@@ -1327,12 +1883,23 @@ export function initReplay(config: WebReplayConfig): ReplayController {
       window.removeEventListener("pageshow", onPageShow);
       session.stopAutoFlush();
       emitSessionEnd("manual");
+      // Stopped during the privacy hold (or before the tab ever showed):
+      // nothing may be sent yet, so what is held goes to the next page load of
+      // the session in this tab, as when a page leaves then, and is sent there
+      // once that page knows the workspace's rules (settleCarried). A tab that
+      // never showed hands on only earlier pages' leftovers.
+      if (sampled && !blocked && (!started || !privacyKnown)) {
+        session.stashForNextPage(!started);
+        stopped = true;
+        return;
+      }
       // Deliver what is left, even during a backoff: carried batches, then the
       // buffer — one batch per flush. Counted once the send in flight is done:
       // if it fails, its batch is carried and goes first. A carried batch that
       // goes through sends the next one at once (flush's own `void flush()`):
       // that send is waited for too, so nothing leaves after stop() resolves.
       if (inFlightSend) await inFlightSend;
+      if (!unloading) session.adoptOutbox();
       for (let i = session.carried.length; i >= 0; i -= 1) {
         await flush({ ignoreBackoff: true });
         while (inFlightSend) await inFlightSend;

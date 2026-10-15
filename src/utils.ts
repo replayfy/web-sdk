@@ -138,14 +138,66 @@ export function withRedactedUrl(
     if (typeof p === "string") {
       // Replace `key=value` substrings (treat string as a key name).
       result = result.replace(
-        new RegExp(`\\b${p}[^&]*`, "gi"),
+        new RegExp(`\\b${escapeRegExp(p)}[^&]*`, "gi"),
         `${p}[REDACTED]`,
       );
     } else {
-      result = result.replace(p, "[REDACTED]");
+      result = redactMatches(result, p);
     }
   }
   return result;
+}
+
+/** Replace EVERY match of `rx` with "[REDACTED]". A match that ends in "="
+ *  (a key-only pattern such as `token=`, the dashboard's default kind) also
+ *  takes the value after it, up to the next "&" or "#": the value is what the
+ *  pattern exists to hide. */
+function redactMatches(url: string, rx: RegExp): string {
+  const g = new RegExp(rx.source, rx.flags.includes("g") ? rx.flags : rx.flags + "g");
+  let out = "";
+  let last = 0;
+  let m: RegExpExecArray | null;
+  while ((m = g.exec(url)) !== null) {
+    if (m[0].length === 0) {
+      g.lastIndex++;
+      continue;
+    }
+    let end = m.index + m[0].length;
+    if (m[0].endsWith("=")) {
+      while (end < url.length && url[end] !== "&" && url[end] !== "#") end++;
+      out += url.slice(last, m.index) + m[0] + "[REDACTED]";
+    } else {
+      out += url.slice(last, m.index) + "[REDACTED]";
+    }
+    last = end;
+    g.lastIndex = end;
+  }
+  return out + url.slice(last);
+}
+
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+let warnedBadRedactPattern = false;
+
+/** Compile the workspace's URL redaction patterns. One that is not a valid
+ *  regular expression is skipped with a single warning: before, it threw out
+ *  of the remote-config handler, so none of the dashboard's privacy settings
+ *  applied on that page. */
+export function compileRedactPatterns(patterns: readonly string[]): RegExp[] {
+  const out: RegExp[] = [];
+  for (const p of patterns) {
+    try {
+      out.push(new RegExp(p, "i"));
+    } catch {
+      if (!warnedBadRedactPattern) {
+        warnedBadRedactPattern = true;
+        console.warn("[replay-sdk] skipped an invalid URL redaction pattern:", p);
+      }
+    }
+  }
+  return out;
 }
 
 /** Query-string keys whose VALUES are ALWAYS scrubbed from any captured URL,

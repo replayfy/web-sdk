@@ -5,6 +5,162 @@ All notable changes to `@replayfyapp/browser` are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.20] - 2026-10-14
+
+Text and input masking now follow the usual session-replay defaults. Replays
+look different where they used to show private data: more `*`, and lines of
+masked text can wrap differently, since `*` is not as wide as the letters it
+replaces.
+
+### Fixed
+
+- **Private regions are private again.** Text inside a mask selector
+  (`maskTextSelector`, the workspace's mask selectors, `.rr-mask`) only had its
+  email addresses masked; everything else in it was sent as plain text,
+  because the default email masking replaced the recorder's own masking. It is
+  now replaced by `*` at the same length, spaces kept.
+- **Email addresses in page text are masked.** The email mask only ever ran
+  inside mask selectors, so emails anywhere else were recorded as shown. Every
+  email address in page text is now masked at the same length, keeping `@` and
+  the dots between domain labels (`jane.doe@example.com` →
+  `********@*******.***`); the `[email]` placeholder is gone. Opt out with
+  `maskTextEmails: false`.
+- **The dashboard can no longer unmask inputs.** The workspace's "mask all
+  inputs" setting (off by default) replaced the SDK's `maskAllInputs` default,
+  so most pages recorded what users typed. The app's `maskAllInputs` (default
+  `true`) now decides, and the dashboard can only force masking on: every
+  input, textarea and select value is `*`-masked unless the app sets
+  `maskAllInputs: false`.
+- **Hidden and file inputs are no longer recorded raw.** Their values (CSRF
+  tokens, prefilled emails, `C:\fakepath\` file names) skipped masking
+  entirely. Hidden, file, url, color, month, week, datetime-local and image
+  inputs now send no value, whatever `maskAllInputs` says.
+- **A cleared field no longer shows its old value.** A prefilled field the
+  user emptied was recorded with its original HTML value, unmasked.
+- **Passwords send nothing.** A password field, including one a "show
+  password" toggle switched to text, records an empty value: no characters and
+  no length. Changes to its `value` attribute (one per keystroke in
+  frameworks that keep it in sync) are not recorded, so neither is its
+  typing rhythm.
+- **An invalid block selector no longer freezes the replay.** The recorder
+  threw on every DOM change and the replay stopped at its first snapshot. Each
+  host and workspace block selector is now checked, and one the browser can't
+  parse is ignored with a console warning.
+- **A selector that leaves a quote, bracket or paren open counts as invalid.**
+  `[data-x="a` parses on its own, but joined with the other selectors it
+  swallowed them, so `[data-private]`, `.sensitive` and `.rr-mask` text was
+  recorded as shown (and blocked elements were recorded) with no warning. As a
+  mask selector it now makes the whole page private; as a block selector it is
+  ignored. Both log a console warning.
+- **CSS is never altered.** Masking inside a private region could rewrite
+  `<style>` text (`url(icon@2x.png)`, `@media`) and break the replay's styling.
+- **Text directly under a shadow root** follows its host: wiped under a
+  private host, email-masked otherwise. Changes to it were sent raw.
+- **Click labels** (rage and dead clicks, heatmaps) are masked like page text:
+  wiped when the clicked element, its label or anything inside it is private,
+  emails masked otherwise. A `<select>` is no longer labelled with the option
+  the user chose, and a field's label no longer includes the content of a
+  `<textarea>` or `<select>` inside it. Clicks before the replay starts already
+  use the workspace's last-seen mask selectors, or the server's defaults.
+- **URL redaction patterns hide the value, everywhere in the URL.** A
+  workspace pattern such as `token=` replaced only its first match and only
+  the text `token=` itself, so the value after it was still stored. Every
+  match is now redacted, and a pattern ending in `=` also hides the value up
+  to the next `&` or `#`. A pattern that is not a valid regular expression is
+  skipped with a console warning; before, it stopped every dashboard privacy
+  setting from applying on the page.
+- **The workspace's URL patterns now apply.** The network capture is set up
+  before the dashboard config arrives and kept only the app's `redactUrls`,
+  so the workspace's patterns never reached a request URL. They now apply
+  live, together with the app's (both, neither replaces the other).
+- **Resource timings are redacted like request URLs.** Performance events
+  named each loaded resource by its full URL, so a token the network capture
+  hid (built-in keys such as `token=`, or a pattern) was still stored there.
+- **The replay's page URL is scrubbed.** rrweb's meta event carried the page
+  URL as is (`?token=…`); it now gets the built-in key scrub every other
+  stored page URL gets.
+- **The page title is masked like page text.** `session_start`, navigation
+  events and every batch sent `document.title` as is, so an address in the
+  title (`Inbox – jane.doe@example.com`) was recorded in full.
+- **The first page view waits for the workspace's privacy rules.** When the
+  dashboard settings were slower than the 300 ms start-up race on a first
+  visit (no rules remembered yet), the replay's first snapshot was uploaded
+  with text inside the workspace's mask selectors (`[data-private]`,
+  `.sensitive`, or custom ones) readable, with the click labels and request
+  URLs recorded before the settings arrived. Also in 0.1.19. Until the
+  settings arrive, a page now records under the server's defaults (or the
+  remembered rules) and uploads nothing, for up to 4 s; a request for them
+  that fails for a reason worth retrying (offline, a timeout, 429, 5xx) is
+  retried within that time. If the workspace's rules hide more, what was
+  recorded is dropped and the replay starts at a fresh snapshot taken under
+  them; request and resource URLs and page titles recorded meanwhile get the
+  workspace's rules, and events of a channel it turns off (network, console,
+  performance) are dropped. A page closed, stopped or put in the
+  back/forward cache before the settings arrive sends nothing then: the next
+  page load of the session in the tab (or the page itself, back from the
+  cache) sends it once it has them, the replay and click labels only if they
+  hide nothing more (if no page follows, it is never sent). Batches held for
+  a later send (a failed upload, an earlier page's leftovers) are checked
+  against the rules known when they go. Without settings (none for the key,
+  or still failing after 4 s), the last settings seen in this browser apply,
+  or the dashboard's defaults on a first visit.
+- **Events held around a back/forward-cache restore go out in order, at
+  once.** A restored page sent what it recorded after its pagehide before
+  what it set aside at the pagehide (older), and what the page shown in
+  between left at its own pagehide waited for the next page load, since
+  Chrome fires that pagehide after the restore. The restored page now sends
+  both, oldest first.
+- **Request and response bodies follow the workspace's setting.** The network
+  capture recorded bodies (up to 8 KB) whatever the dashboard's "Capture
+  request / response bodies" setting said, and it is off by default. Bodies
+  are now recorded only when it is on (before the settings arrive: the last
+  setting seen in this browser, else off). The app's `sanitizeBody` now runs
+  on XHR response and `sendBeacon` bodies too.
+- **Click labels inside blocked elements are wiped.** A click on (or around)
+  an element matching a block selector (`blockSelector`, the workspace's
+  `.no-replay` or its own) sent the element's text as the click label, while
+  the replay showed a placeholder there.
+- **A long frame's script URL is redacted everywhere.** A long animation
+  frame named the script that caused it twice, and only one of them was
+  redacted: the invoker kept the script's full URL, query string included.
+
+### Changed
+
+- **Opting out keeps a floor.** With `maskAllInputs: false`, values that look
+  like an email (`type="email"` or containing `@`), values with 4 or more
+  digits in a row (except date inputs), values inside a private region and
+  input types the workspace masks are still masked. The new `maskInputEmails`
+  and `maskInputNumbers` options (default `true`) turn off the first two.
+- **`maskTextNumbers` turns every digit into `0`**, keeping the length. It
+  used to replace runs of 5 or more digits with up to 12 `•`.
+- **Images, canvases, videos and iframes inside a private region** are
+  recorded as placeholders of the same size, including inside a private
+  element's shadow root and on browsers without `:is()`. A blocked or private
+  iframe's document is no longer recorded, nor is anything that later changes
+  or is typed or clicked inside it.
+- **A textarea's default text is masked like its value.**
+- **Host and dashboard selectors are combined.** The workspace's mask and
+  block selectors used to replace the `maskTextSelector` / `blockSelector`
+  passed to `init()` as soon as the dashboard settings arrived, so a host
+  `.rpf-mask` stopped working. Both now apply.
+- **An invalid mask selector masks all page text** (except CSS), with a
+  console warning, instead of masking nothing. The whole page is then treated
+  as private: input values are masked and media are placeholders too.
+- **No longer recorded:** HTML comments, `<meta>` content (CSRF tokens and
+  similar), and `href` on HTML elements other than stylesheet and font
+  `<link>`s (`mailto:` and magic-link anchors replay without their target;
+  canonical, alternate and icon links lose theirs). Script and `<noscript>`
+  text, including SVG `<script>`, is replaced by `*`.
+- **Late dashboard settings.** The last dashboard privacy settings, URL rules
+  included, are kept in `localStorage` per ingest host and key, and a page
+  whose settings are slower than the 300 ms start-up race records its first
+  snapshot with them. They may be out of date, so that page uploads nothing
+  until its settings confirm them (see Fixed). Settings that change mid-page
+  still restart the recorder with a fresh snapshot.
+- **rrweb is pinned to exactly `2.0.0-alpha.20`.** The `^2.0.0-alpha.18` range
+  let npm consumers resolve other versions the masking was not checked
+  against.
+
 ## [0.1.19]
 
 ### Fixed

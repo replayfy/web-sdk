@@ -7,6 +7,7 @@ import type {
   StackFrame,
 } from "./schema";
 import type { WebReplayConfig } from "./types";
+import type { TextMasker } from "./text-mask";
 import {
   formatConsoleArg,
   redactHeaders,
@@ -279,8 +280,18 @@ export function createErrorCapture(
   };
 }
 
+/** The part of the text masker a page title needs. */
+type TitleMasker = Pick<TextMasker, "titleFor">;
+
+/** document.title, masked when there is a masker. */
+function maskedTitle(masker: TitleMasker | null | undefined): string {
+  return masker ? masker.titleFor(document.title) : document.title;
+}
+
 export function createNavigationCapture(
   onEvent: (data: NavigationEventData) => void,
+  // Read per event: the masker is replaced when the recorder is reinstalled.
+  getTextMasker?: () => TitleMasker | null | undefined,
 ): StopHandle {
   const originalPushState = history.pushState.bind(history);
   const originalReplaceState = history.replaceState.bind(history);
@@ -300,7 +311,8 @@ export function createNavigationCapture(
       trigger,
       // Human-readable screen name so the dashboard can label screens by title,
       // not just an opaque URL (parity with the reference tracker's page location).
-      title: document.title || undefined,
+      // Masked like the replay's <title> text.
+      title: maskedTitle(getTextMasker?.()) || undefined,
     });
     currentUrl = nextUrl;
   };
@@ -366,7 +378,14 @@ type ClickEmit = (
       },
 ) => void;
 
-export function createRageDeadClickCapture(onEvent: ClickEmit): StopHandle {
+/** The part of the text masker a click label needs. */
+type LabelMasker = Pick<TextMasker, "labelFor">;
+
+export function createRageDeadClickCapture(
+  onEvent: ClickEmit,
+  // Read per click: the masker is replaced when the recorder is reinstalled.
+  getTextMasker?: () => LabelMasker | null | undefined,
+): StopHandle {
   const recent: Array<{ x: number; y: number; ts: number }> = [];
   const PROXIMITY_PX = 24;
   const RAGE_WINDOW_MS = 1000;
@@ -406,7 +425,9 @@ export function createRageDeadClickCapture(onEvent: ClickEmit): StopHandle {
     // Mirrors our mobile TapEventData (selector + label + content-normalized
     // coords 0..1e4 + a stable uiId bucket).
     if (isInteractiveEl(target)) {
-      const label = targetLabel(target);
+      // Masked like the replay's text: wiped for a private target, emails
+      // (and digits, if asked) masked otherwise.
+      const label = targetLabel(target, getTextMasker?.() ?? null);
       const nx = normCoord(
         ev.pageX,
         document.documentElement.scrollWidth || window.innerWidth,
@@ -534,6 +555,10 @@ export interface PerfCaptureOptions {
   apiHost?: string;
   captureResourceTimings?: boolean;
   resourceMinDurationMs?: number;
+  /** Redacts a resource or script URL before it is recorded. initReplay
+   *  passes the policy network request URLs get, since a resource timing
+   *  carries the same request URL. Default: the built-in sensitive query keys. */
+  redactUrl?: (url: string) => string;
 }
 
 /** One script's attribution inside a Long Animation Frame entry. The
@@ -639,6 +664,16 @@ export function createPerformanceCapture(
    * Defensive observer creator. Browsers throw if a type is unknown
    * (Firefox lacks `longtask` for example), so we wrap it.
    */
+  // A resource timing names the request URL that the network capture
+  // redacts: recorded raw, it would carry the tokens that capture hides.
+  const redactUrl = (url: string): string => {
+    try {
+      return options.redactUrl ? options.redactUrl(url) : redactUrlForStorage(url);
+    } catch {
+      return redactUrlForStorage(url);
+    }
+  };
+
   const safeObserve = (
     type: string,
     cb: (list: PerformanceObserverEntryList) => void,
@@ -682,9 +717,12 @@ export function createPerformanceCapture(
               top && typeof top.duration === "number"
                 ? Math.round(top.duration)
                 : undefined,
-            scriptSource: top?.sourceURL || undefined,
+            scriptSource: top?.sourceURL ? redactUrl(top.sourceURL) : undefined,
             scriptFunction: top?.sourceFunctionName || undefined,
-            scriptInvoker: top?.invoker || undefined,
+            // A classic or module script's invoker is its src URL, query
+            // included; an event listener's or callback's (BUTTON#pay.onclick,
+            // Window.setTimeout) has no query for the redaction to touch.
+            scriptInvoker: top?.invoker ? redactUrl(top.invoker) : undefined,
           },
         });
       }
@@ -785,7 +823,7 @@ export function createPerformanceCapture(
           unit: "ms",
           ts: Math.round(entry.startTime + performance.timeOrigin),
           detail: {
-            name: url.slice(0, 512),
+            name: redactUrl(url).slice(0, 512),
             initiatorType: entry.initiatorType,
             ttfb: Math.round(
               Math.max(0, entry.responseStart - entry.requestStart),
@@ -960,12 +998,48 @@ function normSpaces(s: string): string {
   return s.replace(/\s+/g, " ").trim();
 }
 
+// Never part of a label's text: a wrapped textarea's default content and a
+// select's options are the field's data, and the rest is never rendered.
+const NOT_LABEL_TEXT = ["TEXTAREA", "SELECT", "DATALIST", "OPTION", "SCRIPT", "STYLE", "NOSCRIPT", "TEMPLATE"];
+
+/** An element's text without the form controls (and unrendered elements)
+ *  inside it — what a <label> wrapping its field says about it. */
+function labelText(root: Element): string {
+  let out = "";
+  const stack: Node[] = [root];
+  while (stack.length) {
+    const n = stack.pop()!;
+    if (n.nodeType === 3) {
+      out += n.nodeValue ?? "";
+      continue;
+    }
+    if (n.nodeType !== 1 || NOT_LABEL_TEXT.indexOf((n as Element).tagName.toUpperCase()) !== -1) continue;
+    const kids = n.childNodes;
+    for (let i = kids.length - 1; i >= 0; i -= 1) stack.push(kids[i]);
+  }
+  return out;
+}
+
 /** A human label for a clicked element — attribute label, input placeholder, or
  *  short trimmed text. NEVER an input's actual value (that's user data), except a
- *  submit button's caption. Capped at 100 chars. */
-function targetLabel(el: Element | null): string {
+ *  submit button's caption, and never a <select>'s chosen option (the reference
+ *  tracker doesn't label a select by its text either). Capped at 100 chars.
+ *  With a masker, the label is masked like the replay's text: wiped when the
+ *  target, the element it came from, or anything inside them is private;
+ *  emails (and digits, if asked) masked otherwise. Masked BEFORE the cut: a cut
+ *  through an address would leave a part the email masker no longer sees. */
+export function targetLabel(
+  el: Element | null,
+  masker?: LabelMasker | null,
+): string {
   if (!el) return "";
-  const cap = (s: string) => truncate(normSpaces(s), 100);
+  const mask = (s: string, from: Element | null): string => {
+    if (!masker) return s;
+    const own = from && from !== el ? masker.labelFor(s, from) : s;
+    return masker.labelFor(own, el);
+  };
+  const cap = (s: string, from: Element | null = el) =>
+    truncate(normSpaces(mask(s, from)), 100);
 
   // 1. Author-intent labels on the element itself. `name` is deliberately NOT
   //    here — it is rarely human-facing and used to win over visible text, so a
@@ -976,20 +1050,25 @@ function targetLabel(el: Element | null): string {
     el.getAttribute("title");
   if (direct && normSpaces(direct)) return cap(direct);
 
-  // 2. aria-labelledby → the referenced element(s') text.
+  // 2. aria-labelledby → the referenced element(s') text, each masked for
+  //    where it sits.
   const labelledby = el.getAttribute("aria-labelledby");
   if (labelledby) {
     const doc = el.ownerDocument;
     const txt = labelledby
       .split(/\s+/)
-      .map((id) => (doc ? doc.getElementById(id)?.textContent ?? "" : ""))
+      .map((id) => {
+        const ref = doc ? doc.getElementById(id) : null;
+        return ref ? mask(labelText(ref), ref) : "";
+      })
       .join(" ");
-    if (normSpaces(txt)) return cap(txt);
+    if (normSpaces(txt)) return truncate(normSpaces(txt), 100);
   }
 
   const tag = el.tagName;
 
-  // 3. Form controls — resolve their human label, NEVER the typed value.
+  // 3. Form controls — resolve their human label, NEVER the typed or chosen
+  //    value.
   if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") {
     const input = el as HTMLInputElement;
     const doc = el.ownerDocument;
@@ -997,9 +1076,10 @@ function targetLabel(el: Element | null): string {
       input.id && doc
         ? doc.querySelector(`label[for="${cssEscape(input.id)}"]`)
         : null;
-    const wrap = el.closest("label");
-    const lbl = (forLabel || wrap)?.textContent;
-    if (lbl && normSpaces(lbl)) return cap(lbl);
+    const labelEl = forLabel || el.closest("label");
+    // Not textContent: a label wrapping a textarea would carry its content.
+    const lbl = labelEl ? labelText(labelEl) : "";
+    if (lbl && normSpaces(lbl)) return cap(lbl, labelEl);
     const ph = el.getAttribute("placeholder");
     if (ph && normSpaces(ph)) return cap(ph);
     if (tag === "INPUT") {
@@ -1008,11 +1088,6 @@ function targetLabel(el: Element | null): string {
         return cap(input.value || type);
       if (type === "image")
         return cap(el.getAttribute("alt") || input.value || "image");
-    }
-    if (tag === "SELECT") {
-      const opt = (el as unknown as HTMLSelectElement).selectedOptions?.[0]
-        ?.textContent;
-      if (opt && normSpaces(opt)) return cap(opt);
     }
     // Never leak the typed value; fall back to the field name or control kind.
     return cap(el.getAttribute("name") || tag.toLowerCase());
@@ -1024,8 +1099,9 @@ function targetLabel(el: Element | null): string {
 
   // 5. Icon / image controls with no text: a descendant image's alt, a
   //    labelled descendant, or the element's own alt.
-  const imgAlt = el.querySelector("img[alt]")?.getAttribute("alt");
-  if (imgAlt && normSpaces(imgAlt)) return cap(imgAlt);
+  const img = el.querySelector("img[alt]");
+  const imgAlt = img?.getAttribute("alt");
+  if (imgAlt && normSpaces(imgAlt)) return cap(imgAlt, img);
   const descLabelled =
     el.querySelector("[aria-label]")?.getAttribute("aria-label") ||
     el.querySelector("[title]")?.getAttribute("title") ||
@@ -1080,6 +1156,11 @@ export function createNetworkCapture(
     strip?: boolean;
     allowed?: string[];
     blockCC?: boolean;
+    /** Host and workspace patterns; replaces the install-time host list. */
+    patterns?: Array<string | RegExp>;
+    /** false: no request or response body is recorded (the workspace's
+     *  network-bodies setting). Read when the request ends. */
+    bodies?: boolean;
   },
 ): StopHandle {
   const originalFetch = (config.fetchImpl ?? window.fetch).bind(window);
@@ -1094,6 +1175,9 @@ export function createNetworkCapture(
     patterns: config.redactUrls,
     ...(getUrlPolicy?.() ?? {}),
   });
+  // Bodies are read only while the policy records them, so a page whose
+  // workspace doesn't never even clones a response.
+  const bodiesOn = () => getUrlPolicy?.().bodies !== false;
   // Apply the host body sanitizer, if any. null → drop the body.
   const redactBody = (
     body: string | undefined,
@@ -1143,9 +1227,10 @@ export function createNetworkCapture(
       const response = await originalFetch(input, init);
       // Clone the response so we can read the body without breaking the caller.
       let responseBody: string | undefined;
+      const withBodies = bodiesOn();
       try {
         const ct = response.headers.get("content-type") ?? "";
-        if (/json|text|xml|javascript|html/i.test(ct)) {
+        if (withBodies && /json|text|xml|javascript|html/i.test(ct)) {
           const clone = response.clone();
           const text = await clone.text();
           responseBody = truncate(text, MAX_BODY);
@@ -1177,8 +1262,8 @@ export function createNetworkCapture(
               config.redactHeaderNames,
             )
           : undefined,
-        requestBody: redactBody(requestBody, "request", request.url),
-        responseBody: redactBody(responseBody, "response", request.url),
+        requestBody: withBodies ? redactBody(requestBody, "request", request.url) : undefined,
+        responseBody: withBodies ? redactBody(responseBody, "response", request.url) : undefined,
         connectionRtt: conn.rtt,
         connectionEffectiveType: conn.effectiveType,
       });
@@ -1267,6 +1352,7 @@ export function createNetworkCapture(
         try {
           const ct = this.getResponseHeader("content-type") ?? "";
           if (
+            bodiesOn() &&
             /json|text|xml|javascript|html/i.test(ct) &&
             typeof this.responseText === "string"
           ) {
@@ -1309,7 +1395,7 @@ export function createNetworkCapture(
           responseHeaders: config.captureHeaders
             ? redactHeaders(responseHeaders, config.redactHeaderNames)
             : undefined,
-          responseBody,
+          responseBody: redactBody(responseBody, "response", meta.url),
           connectionRtt: conn.rtt,
           connectionEffectiveType: conn.effectiveType,
         });
@@ -1357,7 +1443,8 @@ export function createNetworkCapture(
       try {
         if (!isOwnIngest(urlStr)) {
           let body: string | undefined;
-          if (typeof data === "string") body = truncate(data, MAX_BODY);
+          if (!bodiesOn()) body = undefined;
+          else if (typeof data === "string") body = truncate(data, MAX_BODY);
           else if (data instanceof URLSearchParams)
             body = data.toString().slice(0, MAX_BODY);
           const at = Date.now();
@@ -1371,7 +1458,7 @@ export function createNetworkCapture(
             endedAt: at,
             durationMs: 0,
             ok,
-            requestBody: body,
+            requestBody: redactBody(body, "request", urlStr),
           });
         }
       } catch {

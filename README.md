@@ -14,7 +14,7 @@ to your Replayfy dashboard so you can see, measure, and fix what matters.
 - **Console & network capture** — console logs and fetch/XHR requests are recorded alongside the replay for fast debugging.
 - **Web performance** — Core Web Vitals (LCP, CLS, INP), long tasks, and resource timing.
 - **Rage- & dead-click detection** — surfaces frustrated interactions automatically.
-- **Privacy-first** — inputs are masked by default, with selectors and URL rules to redact anything sensitive before it leaves the browser.
+- **Privacy-first** — input values and email addresses in page text are masked by default, passwords never leave the browser, and selectors and URL rules redact anything else sensitive before it leaves the browser.
 - **Tiny & dependency-safe** — ships as ESM/CJS for bundlers and as a single self-contained `<script>` bundle for no-build setups.
 
 ## Install
@@ -121,7 +121,7 @@ const replay = initReplay({
 
   // privacy
   maskAllInputs: true, // mask every <input> value (default)
-  maskTextSelector: ".rpf-mask", // mask the text of these elements
+  maskTextSelector: ".rpf-mask", // private regions: text, inputs and media masked
   blockSelector: ".rpf-block", // fully block these elements
   redactUrls: [/\/reset-password\/[^/]+/], // strip tokens from captured URLs
 });
@@ -150,9 +150,13 @@ Only `apiKey` and `apiHost` are required.
 | `maxBodyBytes` | `number` | `8192` | Maximum captured request/response body size, in bytes. |
 | `captureResourceTimings` | `boolean` | `true` | Capture per-resource timing (images, scripts, CSS, fonts). |
 | `resourceMinDurationMs` | `number` | `0` | Skip resource-timing entries faster than this many milliseconds to trim volume. |
-| `maskAllInputs` | `boolean` | `true` | Mask the value of every `<input>` in the replay. |
-| `maskTextSelector` | `string` | — | CSS selector for text nodes to mask in the replay. |
-| `blockSelector` | `string` | — | CSS selector for elements to fully block (rendered as a placeholder). |
+| `maskAllInputs` | `boolean` | `true` | Mask the value of every input, textarea and select in the replay (`*` per character). Password fields never send a value or a length, whatever this says, and neither do hidden, file, url, color, month, week, datetime-local and image inputs. The dashboard can force masking on; it never turns it off. |
+| `maskTextSelector` | `string` | — | CSS selector for private regions: their text is replaced by `*` at the same length, their input values are masked, and their images, canvases, videos and iframes are recorded as placeholders. Combined with the dashboard's mask selectors. An invalid selector makes the whole page private (all text, inputs and media masked), with a console warning. |
+| `blockSelector` | `string` | — | CSS selector for elements to fully block (rendered as a placeholder). Combined with the dashboard's block selectors; an invalid selector is ignored, with a console warning. |
+| `maskTextEmails` | `boolean` | `true` | Mask email addresses in all page text at the same length, keeping `@` and the dots between domain labels (`jane.doe@example.com` → `********@*******.***`). |
+| `maskTextNumbers` | `boolean` | `false` | Turn every digit in page text into `0`. |
+| `maskInputEmails` | `boolean` | `true` | With `maskAllInputs: false`, still mask input values that look like an email (`type="email"`, or containing `@`). |
+| `maskInputNumbers` | `boolean` | `true` | With `maskAllInputs: false`, still mask input values with 4 or more digits in a row (card, phone and account numbers), except date inputs. |
 | `redactUrls` | `Array<string \| RegExp>` | — | Patterns whose matches are stripped from captured URLs. |
 | `excludeUrls` | `string[]` | — | Path globs (`*` = anything but `/`, `**` = anything), e.g. `["/settings/billing", "/admin/**"]`, that opt a page out of recording. On a matching page the SDK records and ships nothing — a per-page opt-out that beats any always-record override and the sample rate. |
 | `sdk` | `object` | — | Override SDK descriptor fields (name/version) reported with each batch. |
@@ -242,15 +246,27 @@ const url = replay.urlForCurrentSession();
 ## Privacy & masking
 
 Replayfy is designed to keep sensitive data in the browser. By default, every
-input value is masked. Tune redaction with these options:
+input value is masked, password fields send no value and no length, and email
+addresses in page text (and in the page title sent with each batch) are
+masked. Tune redaction with these options:
 
-- **`maskAllInputs`** (default `true`) — masks the value of every input field in the replay.
-- **`maskTextSelector`** — a CSS selector for text nodes to mask (e.g. `.pii, .account-number`).
-- **`blockSelector`** — a CSS selector for elements to block entirely; they render as a placeholder in playback.
-- **`redactUrls`** — string/`RegExp` patterns stripped from captured URLs, so tokens and ids never leave the page.
+- **`maskAllInputs`** (default `true`) — masks the value of every input field in the replay. With `false`, values are recorded as typed, except passwords, values inside a private region, and (unless `maskInputEmails` / `maskInputNumbers` are set to `false`) email-like values and values with 4 or more digits in a row. Hidden, file, url, color, month, week, datetime-local and image inputs never send a value, whatever this says.
+- **`maskTextSelector`** — a CSS selector for private regions (e.g. `.pii, .account-number`). Their text is replaced by `*` at the same length, their input values are masked, and their images, canvases, videos and iframes render as placeholders.
+- **`blockSelector`** — a CSS selector for elements to block entirely; they render as a placeholder in playback, and a click on them carries no label text.
+- **`maskTextEmails`** (default `true`) — masks email addresses in all page text at the same length; `@` and the dots stay, so the replay still reads as an address.
+- **`maskTextNumbers`** (default `false`) — turns every digit in page text into `0`.
+- **`redactUrls`** — string/`RegExp` patterns stripped from captured network request and resource URLs, so tokens and ids never leave the page. Combined with the workspace's URL patterns (both apply). Page URLs always get the built-in sensitive-key scrub (`token`, `code`, `password`…).
 - **`captureHeaders`** (default `false`) — headers are only captured when explicitly enabled.
 - **`redactHeaderNames`** — additional header names whose values are masked, on top of the always-on built-in deny-list.
-- **`maxBodyBytes`** — caps how much of a request/response body is ever captured.
+- **`maxBodyBytes`** — caps how much of a request/response body is ever captured. Bodies are only captured when the dashboard's "Capture request / response bodies" setting is on (off by default).
+
+CSS text is never altered, script and `<noscript>` text is never sent readable,
+and HTML comments, `<meta>` content and link targets (`href` on HTML elements
+other than stylesheet and font `<link>`s, such as `mailto:` and magic-link
+anchors) are not recorded. Nothing inside a blocked or private iframe is
+recorded. A selector the browser can't parse is never passed to the recorder:
+an invalid mask selector makes the whole page private, and an invalid block
+selector is ignored; both log a console warning.
 
 ### Mask a specific input or element
 
@@ -262,7 +278,7 @@ the mask/block selectors at it. The real values never leave the browser:
 <!-- inputs are masked automatically -->
 <input type="text" name="ssn" />
 
-<!-- mask the TEXT of an element: shown as ●●●● in playback -->
+<!-- a private region: its text shows as **** **** **** **** in playback -->
 <span class="rpf-mask">4111 1111 1111 1111</span>
 
 <!-- BLOCK an element entirely: rendered as a placeholder box -->
@@ -274,7 +290,7 @@ initReplay({
   apiKey: "pk_live_123",
   apiHost: "https://us.replayfy.app",  // or your self-hosted API URL
   maskAllInputs: true, // default — every <input> value is masked
-  maskTextSelector: ".rpf-mask", // mask the text content of matching elements
+  maskTextSelector: ".rpf-mask", // mask the text, inputs and media of matching elements
   blockSelector: ".rpf-block", // replace matching elements with a placeholder
 });
 ```
@@ -284,12 +300,32 @@ so you can drop or scrub anything programmatically.
 
 ## Dashboard configuration
 
-Privacy, capture, and sampling settings you configure in your Replayfy
-**dashboard are fetched at startup and take precedence over the values you pass
-to `init()`**. This lets you tighten masking, turn console or network capture on
-or off, adjust sampling, or pause recording for a workspace — without shipping a
-new build of your app. Treat the options above as your defaults; when a setting
-is configured in the dashboard, the dashboard wins.
+Capture and sampling settings you configure in your Replayfy **dashboard are
+fetched at startup and take precedence over the values you pass to `init()`**.
+This lets you turn console or network capture on or off, adjust sampling, or
+pause recording for a workspace — without shipping a new build of your app.
+
+Privacy settings are combined, so the dashboard can only add masking:
+
+- The dashboard's "mask all inputs" forces input masking on. It never turns off
+  masking your code asked for.
+- The dashboard's mask and block selectors apply together with
+  `maskTextSelector` / `blockSelector`; neither replaces the other.
+- A page uploads nothing until the dashboard's privacy settings have arrived,
+  for up to 4 seconds (a failed request for them is retried meanwhile). On a
+  fast connection they arrive before the first upload would go, so nothing
+  waits. Recording starts at once, under the last settings seen in this
+  browser or, on a first visit, the dashboard's defaults (`[data-private]`
+  and `.sensitive` masked, `.no-replay` blocked, no request bodies). If the
+  settings that arrive hide more, what was recorded before them is discarded
+  and the replay starts from a fresh snapshot; events of a capture they turn
+  off (network, console, performance) are discarded too. A page closed,
+  stopped or put in the back/forward cache during that wait hands what it
+  recorded to the next page of the session in the same tab (or to itself,
+  when it comes back), which sends it once it has the settings (its replay
+  only if they hide nothing more); if no page follows, it is never sent. When
+  the settings can't be fetched, the last settings seen in this browser apply
+  or, on a first visit, the dashboard's defaults.
 
 ## Links
 

@@ -1,6 +1,6 @@
 {
   "name": "@replayfyapp/browser",
-  "version": "0.1.19",
+  "version": "0.1.20",
   "description": "Replayfy browser SDK — session replay, product analytics, and error capture for the web.",
   "keywords": [
     "session-replay",
@@ -58,7 +58,7 @@
   },
   "dependencies": {
     "error-stack-parser-es": "^0.1.5",
-    "rrweb": "^2.0.0-alpha.18",
+    "rrweb": "2.0.0-alpha.20",
     "web-vitals": "^5.2.0"
   },
   "devDependencies": {
