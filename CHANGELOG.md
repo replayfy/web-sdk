@@ -46,6 +46,12 @@ replaces.
   threw on every DOM change and the replay stopped at its first snapshot. Each
   host and workspace block selector is now checked, and one the browser can't
   parse is ignored with a console warning.
+- **A selector that leaves a quote, bracket or paren open counts as invalid.**
+  `[data-x="a` parses on its own, but joined with the other selectors it
+  swallowed them, so `[data-private]`, `.sensitive` and `.rr-mask` text was
+  recorded as shown (and blocked elements were recorded) with no warning. As a
+  mask selector it now makes the whole page private; as a block selector it is
+  ignored. Both log a console warning.
 - **CSS is never altered.** Masking inside a private region could rewrite
   `<style>` text (`url(icon@2x.png)`, `@media`) and break the replay's styling.
 - **Text directly under a shadow root** follows its host: wiped under a

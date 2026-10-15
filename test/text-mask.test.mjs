@@ -104,6 +104,43 @@ test("selector entries are trimmed, de-duplicated and never split on commas", ()
   assert.equal(validSelector(".ok", doc), true);
 });
 
+// A browser-like parser for the probe: an entry that leaves a quote open
+// parses alone (the parser closes it at the end) but swallows the probe
+// selector joined after it, so the probe is no longer matched.
+function probeDoc() {
+  return {
+    ...ROOT,
+    createElement: (tag) => ({ localName: tag, className: "" }),
+    createDocumentFragment: () => {
+      const kids = [];
+      return {
+        appendChild: (n) => kids.push(n),
+        querySelector: (s) => {
+          if (s.includes("[[")) throw new SyntaxError("x");
+          const quotes = (s.match(/"/g) || []).length;
+          const probe = kids.find((k) => k.className && s.includes(`.${k.className}`));
+          return probe && quotes % 2 === 0 ? probe : null;
+        },
+      };
+    },
+  };
+}
+
+test("a selector that swallows the entries joined after it is invalid", () => {
+  const doc = probeDoc();
+  assert.equal(validSelector('[data-x="foo', doc), false);
+  assert.equal(validSelector('[data-x="foo"]', doc), true);
+  assert.equal(validSelector("[data-private]", doc), true);
+  assert.equal(validSelector("[[", doc), false);
+  // Joined, '[data-x="foo, [data-private]' would match nothing private: the
+  // masker treats the page as private instead (fail closed) and warns once.
+  const warns = [];
+  const m = createTextMasker({ maskSelectors: ['[data-x="foo', "[data-private]"], maskEmails: true, maskNumbers: false, rootDoc: doc, warn: (b) => warns.push(b) });
+  assert.equal(m.invalid, true);
+  assert.deepEqual(warns, [['[data-x="foo']]);
+  assert.equal(m.maskTextFn("plain text", el({ ownerDocument: doc, root: doc })), "***** ****");
+});
+
 // ── maskTextFn ──────────────────────────────────────────────────────────────
 
 test("maskTextFn: private text wiped, ordinary text email-masked, CSS untouched, scripts wiped", () => {

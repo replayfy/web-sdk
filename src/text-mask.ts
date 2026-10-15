@@ -70,14 +70,27 @@ function hasDomainDot(seg: string): boolean {
   return d !== -1 && d <= seg.length - 2;
 }
 
+const PROBE_CLASS = "replay-sdk-selector-probe";
+
 /** True when the browser parses `sel` (an invalid selector makes rrweb treat
- *  every node as unmatched, or throw on every mutation for blockSelector).
+ *  every node as unmatched, or throw on every mutation for blockSelector) AND
+ *  it can be joined with the next entry. An entry that leaves a string,
+ *  bracket or paren open (`[data-x="a`, `div:is(`, a trailing `\`) parses
+ *  alone, because the parser closes it at the end, but swallows every entry
+ *  joined after it: `[data-x="a, [data-private]` never matches
+ *  `[data-private]`. So the entry is joined with a selector for a probe
+ *  element, which must still match it.
  *  Without a DOM to ask (tests), every selector passes. */
 export function validSelector(sel: string, doc?: Document | null): boolean {
   if (!doc || typeof doc.createDocumentFragment !== "function") return true;
   try {
-    doc.createDocumentFragment().querySelector(sel);
-    return true;
+    const frag = doc.createDocumentFragment();
+    frag.querySelector(sel);
+    if (typeof doc.createElement !== "function" || typeof frag.appendChild !== "function") return true;
+    const probe = doc.createElement("i");
+    probe.className = PROBE_CLASS;
+    frag.appendChild(probe);
+    return frag.querySelector(`${sel}, .${PROBE_CLASS}`) === probe;
   } catch {
     return false;
   }
