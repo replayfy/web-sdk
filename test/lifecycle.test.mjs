@@ -15,8 +15,8 @@ const remoteCfg = (o = {}) => ({
   retentionDays: 30,
 });
 
-async function start({ respond, config = {}, href, storage, remote, local } = {}) {
-  const b = installBrowser({ href, storage, local });
+async function start({ respond, config = {}, href, storage, remote, local, title } = {}) {
+  const b = installBrowser({ href, storage, local, title });
   // `remote` is the config itself, or a function called when the SDK fetches it
   // (to answer late).
   if (remote !== undefined) globalThis.__remoteConfig = typeof remote === "function" ? remote : () => remote;
@@ -873,7 +873,10 @@ const fakeInput = (type, attrs = {}, priv = false) => ({
   getAttribute: (n) => (n === "type" ? type : n in attrs ? attrs[n] : null),
   hasAttribute: (n) => n in attrs,
 });
-const RRWEB_INPUT_TYPES = ["color", "date", "datetime-local", "email", "month", "number", "range", "search", "tel", "text", "time", "url", "week", "textarea", "select", "password"];
+// rrweb's maskAllInputs types, plus the three its map leaves out (recorded raw).
+const INPUT_TYPES = ["color", "date", "datetime-local", "email", "month", "number", "range", "search", "tel", "text", "time", "url", "week", "textarea", "select", "password", "hidden", "file", "image"];
+/** The installed maskInputFn stars a plain text value: every value is masked. */
+const masksAll = (o) => o.maskInputFn("hello", fakeInput("text")) === "*****";
 
 test("privacy defaults: all text goes through the masker, comments are dropped, inputs are masked", async () => {
   const { ctrl } = await start();
@@ -881,12 +884,16 @@ test("privacy defaults: all text goes through the masker, comments are dropped, 
   assert.equal(o.maskTextSelector, "*");
   assert.equal(typeof o.maskTextFn, "function");
   assert.deepEqual(o.slimDOMOptions, { comment: true });
-  assert.equal(o.maskAllInputs, true);
+  // rrweb's own maskAllInputs would swap in a map without hidden/file/image.
+  assert.equal(o.maskAllInputs, undefined);
+  assert.deepEqual(Object.keys(o.maskInputOptions).sort(), [...INPUT_TYPES].sort());
   assert.equal(typeof o.maskInputFn, "function");
   assert.equal(o.maskTextFn("Contact jane.doe@example.com", fakeEl()), "Contact ********@*******.***");
   assert.equal(o.maskInputFn("hunter2", fakeInput("password")), "", "a password sends no value and no length");
   assert.equal(o.maskInputFn("hunter2", fakeInput("text", { "data-rr-is-password": "true" })), "", "show-password toggle");
   assert.equal(o.maskInputFn("hello", fakeInput("text")), "*****");
+  assert.equal(o.maskInputFn("tok123", fakeInput("hidden")), "", "a hidden input sends nothing");
+  assert.equal(o.maskInputFn("C:\\fakepath\\scan.pdf", fakeInput("file")), "", "nor does a file input");
   await ctrl.stop();
 });
 
@@ -902,16 +909,11 @@ test("input masking is the app's setting OR the dashboard's force; the dashboard
   for (const [name, remote, maskAllInputs, want] of cases) {
     const { ctrl } = await start({ remote, config: maskAllInputs === undefined ? {} : { maskAllInputs } });
     const o = rr().opts;
-    assert.equal(o.maskAllInputs, want, name);
-    assert.equal(typeof o.maskInputFn, "function", name);
-    if (want) {
-      assert.equal(o.maskInputOptions, undefined, `${name}: rrweb builds its own full map`);
-      assert.equal(o.maskInputFn("hello", fakeInput("text")), "*****", name);
-    } else {
-      // Every type reaches maskInputFn, which decides per value.
-      assert.deepEqual(Object.keys(o.maskInputOptions).sort(), [...RRWEB_INPUT_TYPES].sort(), name);
-      assert.equal(o.maskInputFn("hello", fakeInput("text")), "hello", name);
-    }
+    // Every type reaches maskInputFn, which applies the setting per value.
+    assert.equal(o.maskAllInputs, undefined, name);
+    assert.deepEqual(Object.keys(o.maskInputOptions).sort(), [...INPUT_TYPES].sort(), name);
+    assert.equal(o.maskInputFn("hello", fakeInput("text")), want ? "*****" : "hello", name);
+    assert.equal(o.maskInputFn("tok123", fakeInput("hidden")), "", name);
     await ctrl.stop();
   }
 });
@@ -957,7 +959,7 @@ test("host and workspace selectors are combined; an invalid block entry is dropp
     assert.ok(o.blockSelector.startsWith(".card, .no-replay, "), o.blockSelector);
     assert.ok(!o.blockSelector.includes("[["), o.blockSelector);
     // Media inside a private region is recorded as a placeholder.
-    assert.ok(o.blockSelector.includes(":is([data-private]) :is(img, canvas, video, iframe)"), o.blockSelector);
+    assert.ok(o.blockSelector.includes(":is([data-private]) :is(img, picture, canvas, video, iframe)"), o.blockSelector);
     assert.equal(w.list.filter((m) => m.includes("block selector")).length, 1);
     await ctrl.stop();
   } finally {
@@ -993,7 +995,7 @@ test("late dashboard rules that add masking restart the recorder; the same rules
   const forced = await start({ remote: later(withPrivacy({ maskAllInputs: true }), 400), config: { maskAllInputs: false } });
   await sleep(100);
   assert.equal(rr().installs, 2, "restarted for the force");
-  assert.equal(rr().opts.maskAllInputs, true);
+  assert.ok(masksAll(rr().opts));
   await forced.ctrl.stop();
 
   const region = await start({ remote: later(withPrivacy({ maskAllInputs: false, maskSelectors: [".new"] }), 400) });
@@ -1007,7 +1009,7 @@ test("late dashboard rules that add masking restart the recorder; the same rules
   const same = await start({ remote: later(withPrivacy({ maskAllInputs: false }), 400) });
   await sleep(100);
   assert.equal(rr().installs, 1, "nothing changed: no restart");
-  assert.equal(rr().opts.maskAllInputs, true);
+  assert.ok(masksAll(rr().opts));
   await same.ctrl.stop();
 });
 
@@ -1022,7 +1024,7 @@ test("the last dashboard rules are kept per key and applied when the config is l
   // already has the dashboard's rules.
   const p2 = await start({ local, remote: later(rules, 2000), config: { maskAllInputs: false } });
   assert.equal(rr().installs, 1);
-  assert.equal(rr().opts.maskAllInputs, true);
+  assert.ok(masksAll(rr().opts));
   const seen = [];
   rr().opts.maskTextFn("x", fakeEl(seen));
   assert.deepEqual(seen, ["[data-private], .rr-mask"]);
@@ -1030,7 +1032,7 @@ test("the last dashboard rules are kept per key and applied when the config is l
 
   // Another key gets nothing from it.
   const p3 = await start({ local, remote: later(rules, 2000), config: { apiKey: "other", maskAllInputs: false } });
-  assert.equal(rr().opts.maskAllInputs, false);
+  assert.ok(!masksAll(rr().opts));
   await p3.ctrl.stop();
 
   // Storage that throws just means no cached rules.
@@ -1040,6 +1042,37 @@ test("the last dashboard rules are kept per key and applied when the config is l
   broken.set = () => { throw new Error("blocked"); };
   const p4 = await start({ local: broken, remote: later(rules, 2000), config: { maskAllInputs: false } });
   assert.equal(rr().installs, 1);
-  assert.equal(rr().opts.maskAllInputs, false);
+  assert.ok(!masksAll(rr().opts));
   await p4.ctrl.stop();
+});
+
+test("the page title is masked like the replay's <title> text wherever it is sent", async () => {
+  const title = "Inbox (3) – jane.doe@example.com";
+  const { f, ctrl } = await start({ title, config: { maskTextNumbers: true } });
+  const masked = "Inbox (0) – ********@*******.***";
+  const start0 = all(f).find((e) => e.type === "session_start");
+  assert.equal(start0.data.title, masked, "session_start");
+  assert.ok(f.calls.length >= 1);
+  for (const c of f.calls) assert.equal(c.envelope.page.title, masked, "every batch's page context");
+  assert.equal(globalThis.__navMasker().titleFor(title), masked, "navigation events");
+  assert.ok(!JSON.stringify(f.calls.map((c) => c.envelope)).includes("jane.doe"));
+  await ctrl.stop();
+});
+
+test("before rrweb starts, click labels already use the cached dashboard selectors", async () => {
+  const local = new Map();
+  const rules = withPrivacy({ maskSelectors: [".sensitive"] });
+  const p1 = await start({ local, remote: rules, config: { maskTextSelector: ".rpf-mask" } });
+  await p1.ctrl.stop();
+
+  installBrowser({ local });
+  globalThis.__remoteConfig = later(rules, 2000);
+  const { initReplay } = await load("initReplay.ts", { stub: true });
+  const ctrl = initReplay({ apiKey: "k", apiHost: "https://api.test", flushIntervalMs: 1e9, sessionInactivityMs: 0, fetchImpl: makeFetch(), maskTextSelector: ".rpf-mask" });
+  assert.equal(rr().installs, undefined, "rrweb is not running yet");
+  const labels = globalThis.__clickMasker();
+  const seen = [];
+  assert.equal(labels.labelFor("Pay Jane", fakeEl(seen, { priv: true })), "*** ****");
+  assert.deepEqual(seen, [".rpf-mask, .sensitive, .rr-mask"]);
+  await ctrl.stop();
 });

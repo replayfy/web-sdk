@@ -171,7 +171,7 @@ test("an invalid mask selector wipes all text (except CSS) and warns once", () =
   assert.equal(m.maskTextFn("a{b:c}", el({ tag: "style" })), "a{b:c}");
   assert.equal(m.isPrivate(el()), true);
   // Media placeholders only come from the entries that parse.
-  assert.ok(m.mediaBlockSelector.includes(":is(.ok) :is(img, canvas, video, iframe)"));
+  assert.ok(m.mediaBlockSelector.includes(":is(.ok) :is(img, picture, canvas, video, iframe)"));
   assert.ok(!m.mediaBlockSelector.includes("[["));
 
   const quiet = [];
@@ -190,8 +190,8 @@ test("media inside private regions get a block selector, per entry", () => {
   const m = masker({ maskSelectors: ["[data-private]"] });
   assert.equal(
     m.mediaBlockSelector,
-    ":is([data-private]) :is(img, canvas, video, iframe), :is(img, canvas, video, iframe):is([data-private]), " +
-      ":is(.rr-mask) :is(img, canvas, video, iframe), :is(img, canvas, video, iframe):is(.rr-mask)",
+    ":is([data-private]) :is(img, picture, canvas, video, iframe), :is(img, picture, canvas, video, iframe):is([data-private]), " +
+      ":is(.rr-mask) :is(img, picture, canvas, video, iframe), :is(img, picture, canvas, video, iframe):is(.rr-mask)",
   );
 });
 
@@ -248,6 +248,38 @@ test("inputs, app opted out: the reference tracker's plain-mode heuristics still
   assert.equal(off.maskInputFn("x", input("password")), "");
 });
 
+test("inputs the reference tracker records no value for send nothing; captions are kept", () => {
+  for (const maskAll of [true, false]) {
+    const m = masker({ inputs: { maskAll } });
+    for (const type of ["hidden", "file", "url", "color", "month", "week", "datetime-local", "image"]) {
+      assert.equal(m.maskInputFn("me@x.io 4111", input(type)), "", `${type}, maskAll ${maskAll}`);
+    }
+    assert.equal(m.maskInputFn("Pay now", input("submit")), "Pay now", "a submit caption");
+    assert.equal(m.maskInputFn("12", input("range")), maskAll ? "**" : "12");
+  }
+});
+
+test("a textarea's text is masked like its value", () => {
+  const ta = () => el({ tag: "textarea", type: "textarea" });
+  assert.equal(masker({ inputs: { maskAll: true } }).maskTextFn("Patient notes", ta()), "*************");
+  const optOut = masker({ inputs: { maskAll: false } });
+  assert.equal(optOut.maskTextFn("call me", ta()), "call me");
+  assert.equal(optOut.maskTextFn("call 08031234567", ta()), stars("call 08031234567"), "4+ digits");
+  assert.equal(optOut.maskTextFn("hi", el({ tag: "textarea", type: "textarea", priv: true })), "**", "private");
+});
+
+test("titleFor masks the page title like the <title> text", () => {
+  const titleEl = el({ tag: "title" });
+  const doc = { ...ROOT, querySelector: (s) => (s === "title" ? titleEl : null) };
+  const m = createTextMasker({ maskSelectors: [".s"], maskEmails: true, maskNumbers: true, rootDoc: doc });
+  assert.equal(m.titleFor("Inbox (12) – jane.doe@example.com"), "Inbox (00) – ********@*******.***");
+  const privDoc = { ...ROOT, querySelector: () => el({ tag: "title", priv: true }) };
+  const p = createTextMasker({ maskSelectors: ["head"], maskEmails: true, maskNumbers: false, rootDoc: privDoc });
+  assert.equal(p.titleFor("Jane Doe"), "**** ***", "a private <title> is wiped");
+  assert.equal(masker().titleFor("a@b.co"), "*@*.**", "no DOM to ask: emails still masked");
+  assert.equal(masker().titleFor(""), "");
+});
+
 test("inputs: an error masks the value", () => {
   const m = masker({ inputs: { maskAll: false } });
   const bad = input("text");
@@ -302,13 +334,17 @@ test("post-pass: href on non-<link> HTML elements is blanked and <meta content> 
   const ev = { type: 2, data: { node: { type: 0, childNodes: [
     { type: 2, id: 2, tagName: "a", attributes: { href: "mailto:bob@x.io" }, childNodes: [] },
     { type: 2, id: 3, tagName: "link", attributes: { rel: "icon", href: "https://x/i.png" }, childNodes: [] },
+    { type: 2, id: 6, tagName: "link", attributes: { rel: "stylesheet", href: "https://x/a.css" }, childNodes: [] },
+    { type: 2, id: 7, tagName: "link", attributes: { rel: "preload", as: "font", href: "https://x/f.woff2" }, childNodes: [] },
     { type: 2, id: 4, tagName: "use", isSVG: true, attributes: { href: "#icon" }, childNodes: [] },
     { type: 2, id: 5, tagName: "meta", attributes: { name: "csrf-token", content: "s3cr3t" }, childNodes: [] },
   ] } } };
   m.postProcess(ev, mirrorOf({}));
-  const [a, link, use, meta] = ev.data.node.childNodes;
+  const [a, link, css, font, use, meta] = ev.data.node.childNodes;
   assert.equal(a.attributes.href, "");
-  assert.equal(link.attributes.href, "https://x/i.png");
+  assert.equal(link.attributes.href, "", "only stylesheet and font links keep their target");
+  assert.equal(css.attributes.href, "https://x/a.css");
+  assert.equal(font.attributes.href, "https://x/f.woff2");
   assert.equal(use.attributes.href, "#icon");
   assert.deepEqual(meta.attributes, { name: "csrf-token" });
 
@@ -319,14 +355,21 @@ test("post-pass: href on non-<link> HTML elements is blanked and <meta content> 
     { id: 5, attributes: { content: "n3w" } },
     { id: 3, attributes: { href: "https://x/a.css" } },
   ] } };
-  m.postProcess(mut, mirrorOf({ 2: el({ tag: "a" }), 3: el({ tag: "link" }), 4: el({ tag: "use", namespaceURI: svgNs }), 5: el({ tag: "meta" }) }));
+  mut.data.attributes.push({ id: 6, attributes: { href: "https://x/canonical?t=3" } });
+  m.postProcess(mut, mirrorOf({ 2: el({ tag: "a" }), 3: el({ tag: "link", attrs: { rel: "stylesheet" } }), 4: el({ tag: "use", namespaceURI: svgNs }), 5: el({ tag: "meta" }), 6: el({ tag: "link", attrs: { rel: "canonical" } }) }));
   assert.equal(mut.data.adds[0].node.attributes.href, "");
-  assert.deepEqual(mut.data.attributes.map((x) => x.attributes), [{ href: "" }, { href: "#other" }, {}, { href: "https://x/a.css" }]);
+  // The emptied <meta> change is dropped.
+  assert.deepEqual(mut.data.attributes.map((x) => x.attributes), [{ href: "" }, { href: "#other" }, { href: "https://x/a.css" }, { href: "" }]);
+
+  // A node the mirror doesn't have (a cross-origin frame's): no tag to go by.
+  const remote = { type: 3, data: { source: 0, adds: [], texts: [], attributes: [{ id: 99, attributes: { href: "https://x/a", content: "t0k", selected: "", class: "c" } }] } };
+  assert.equal(m.postProcess(remote, mirrorOf({})), true);
+  assert.deepEqual(remote.data.attributes[0].attributes, { href: "", class: "c" });
 });
 
 test("post-pass: a blocked or private iframe's document is not attached", () => {
   const m = masker({ maskSelectors: [".s"], blockSelector: ".no-replay" });
-  const attach = (parentId) => ({ type: 3, data: { source: 0, isAttachIframe: true, adds: [{ parentId, nextId: null, node: { type: 0, id: 20, childNodes: [{ type: 2, id: 21, tagName: "html", attributes: {}, childNodes: [] }] } }], texts: [], attributes: [], removes: [] } });
+  const attach = (parentId) => ({ type: 3, data: { source: 0, isAttachIframe: true, adds: [{ parentId, nextId: null, node: { type: 0, id: 20, compatMode: "BackCompat", childNodes: [{ type: 2, id: 21, tagName: "html", attributes: {}, childNodes: [] }] } }], texts: [], attributes: [], removes: [] } });
   const nodes = {
     1: el({ tag: "iframe", priv: true }),
     2: el({ tag: "iframe", closest: (s) => (s === ".no-replay" ? {} : null) }),
@@ -337,10 +380,108 @@ test("post-pass: a blocked or private iframe's document is not attached", () => 
     const ev = attach(id);
     m.postProcess(ev, mirrorOf(nodes));
     assert.deepEqual(ev.data.adds[0].node.childNodes, [], `iframe ${id}`);
+    // rrweb's rebuild would read the first child of an empty quirks-mode document.
+    assert.equal(ev.data.adds[0].node.compatMode, undefined, `iframe ${id}`);
   }
   const open = attach(4);
   m.postProcess(open, mirrorOf(nodes));
   assert.equal(open.data.adds[0].node.childNodes.length, 1);
+});
+
+test("post-pass: a recorded value the masker hides, or a raw HTML default, is dropped", () => {
+  const m = masker({ inputs: { maskAll: true } });
+  const nodes = {
+    2: input("password", { value: "hunter2" }),
+    3: input("hidden", { value: "tok123" }),
+    4: input("text", { value: "" }),
+    5: input("text", { value: "hello" }),
+    6: input("checkbox", { value: "yes" }),
+    7: input("file", { value: "C:\\fakepath\\scan.pdf" }),
+  };
+  const attrs = { 2: { type: "password", value: "" }, 3: { type: "hidden", value: "" }, 4: { type: "text", value: "jane@x.com" }, 5: { type: "text", value: "*****" }, 6: { type: "checkbox", value: "yes" }, 7: { type: "file", value: "" } };
+  const ev = { type: 2, data: { node: { type: 0, childNodes: Object.keys(attrs).map((id) => ({ type: 2, id: Number(id), tagName: "input", attributes: { ...attrs[id] }, childNodes: [] })) } } };
+  m.postProcess(ev, mirrorOf(nodes));
+  assert.deepEqual(ev.data.node.childNodes.map((n) => n.attributes.value), [undefined, undefined, undefined, "*****", "yes", undefined]);
+
+  // A password's value attribute, synced per keystroke (React): masked to ""
+  // by rrweb but still one change per key. Nothing of it ships.
+  const key = () => ({ type: 3, data: { source: 0, adds: [], removes: [], texts: [], attributes: [{ id: 2, attributes: { value: "" } }] } });
+  assert.equal(m.postProcess(key(), mirrorOf(nodes)), false);
+  const mixed = { type: 3, data: { source: 0, adds: [], removes: [], texts: [], attributes: [{ id: 2, attributes: { value: "", class: "invalid" } }, { id: 5, attributes: { value: "******" } }] } };
+  assert.equal(m.postProcess(mixed, mirrorOf(nodes)), true);
+  assert.deepEqual(mixed.data.attributes.map((x) => x.attributes), [{ class: "invalid" }, { value: "******" }]);
+  const shown = masker({ inputs: { maskAll: false } });
+  const toggled = input("text", { attrs: { "data-rr-is-password": "true" } });
+  assert.equal(shown.postProcess(key(), mirrorOf({ 2: toggled })), false, "a show-password field too");
+});
+
+test("post-pass: nothing recorded inside a blocked frame's document ships", () => {
+  const m = masker({ blockSelector: ".no-replay" });
+  const frame = el({ tag: "iframe", closest: (s) => (s === ".no-replay" ? {} : null) });
+  const frameDoc = { nodeType: 9 };
+  const inFrame = (o) => ({ nodeType: 1, ownerDocument: frameDoc, parentElement: {}, parentNode: {}, ...o });
+  const nestedFrame = inFrame({ localName: "iframe" });
+  const nestedDoc = { nodeType: 9 };
+  const page = el({ tag: "div" });
+  page.nodeType = 1;
+  const nodes = { 4: frame, 20: frameDoc, 30: inFrame({ localName: "p" }), 31: inFrame({ nodeType: 3 }), 40: inFrame({ localName: "input" }), 50: page, 60: nestedFrame, 70: nestedDoc, 71: { nodeType: 3, ownerDocument: nestedDoc } };
+  const mirror = mirrorOf(nodes);
+  const mutation = (d) => ({ type: 3, data: { source: 0, adds: [], removes: [], texts: [], attributes: [], ...d } });
+  const attach = mutation({ isAttachIframe: true, adds: [{ parentId: 4, node: { type: 0, id: 20, childNodes: [{ type: 2, id: 21, tagName: "html", attributes: {}, childNodes: [] }] } }] });
+  assert.equal(m.postProcess(attach, mirror), true);
+  assert.deepEqual(attach.data.adds[0].node.childNodes, []);
+
+  const inside = mutation({
+    adds: [{ parentId: 30, node: { type: 3, id: 32, textContent: "iframe LATER secret" } }],
+    removes: [{ parentId: 30, id: 33 }],
+    texts: [{ id: 31, value: "iframe CHANGED secret" }],
+    attributes: [{ id: 30, attributes: { title: "secret" } }],
+  });
+  assert.equal(m.postProcess(inside, mirror), false);
+  const both = mutation({ adds: [{ parentId: 50, node: { type: 3, id: 51, textContent: "page text" } }], texts: [{ id: 31, value: "secret" }] });
+  assert.equal(m.postProcess(both, mirror), true);
+  assert.deepEqual([both.data.adds.length, both.data.texts.length], [1, 0]);
+
+  // Typing, clicks and selections inside it; pointer moves are trimmed.
+  assert.equal(m.postProcess({ type: 3, data: { source: 5, id: 40, text: "typed-later", isChecked: false } }, mirror), false);
+  assert.equal(m.postProcess({ type: 3, data: { source: 2, id: 30, type: 2, x: 4, y: 9 } }, mirror), false);
+  assert.equal(m.postProcess({ type: 3, data: { source: 14, ranges: [{ start: 31, startOffset: 0, end: 31, endOffset: 3 }] } }, mirror), false);
+  const moves = { type: 3, data: { source: 1, positions: [{ id: 30, x: 1, y: 1 }, { id: 50, x: 2, y: 2 }] } };
+  assert.equal(m.postProcess(moves, mirror), true);
+  assert.deepEqual(moves.data.positions.map((p) => p.id), [50]);
+  assert.equal(m.postProcess({ type: 3, data: { source: 1, positions: [{ id: 30, x: 1, y: 1 }] } }, mirror), false);
+  assert.equal(m.postProcess({ type: 3, data: { source: 5, id: 50, text: "x", isChecked: false } }, mirror), true, "the page itself");
+
+  // A frame nested inside it is not attached either, nor recorded later.
+  assert.equal(m.postProcess(mutation({ isAttachIframe: true, adds: [{ parentId: 60, node: { type: 0, id: 70, childNodes: [] } }] }), mirror), false);
+  assert.equal(m.postProcess(mutation({ texts: [{ id: 71, value: "nested secret" }] }), mirror), false);
+});
+
+test("post-pass: media in a private region become placeholders, also inside a shadow root", () => {
+  const m = masker({ maskSelectors: [".sensitive"] });
+  const host = el({ tag: "x-profile", priv: true });
+  const avatar = el({ tag: "img", root: { nodeType: 11, host }, getBoundingClientRect: () => ({ width: 40, height: 30 }) });
+  const canvas = el({ tag: "canvas", priv: true, getBoundingClientRect: () => ({ width: 10, height: 10 }) });
+  const logo = el({ tag: "img" });
+  const snap = { type: 2, data: { node: { type: 0, childNodes: [
+    { type: 2, id: 5, tagName: "img", attributes: { src: "https://x/jane.png", alt: "Jane Doe", class: "avatar" }, childNodes: [] },
+    { type: 2, id: 6, tagName: "canvas", attributes: { rr_dataURL: "data:image/png;base64,AAAA" }, childNodes: [] },
+    { type: 2, id: 7, tagName: "img", attributes: { src: "https://x/logo.png" }, childNodes: [] },
+    { type: 2, id: 8, tagName: "img", attributes: { class: "x", rr_width: "5px", rr_height: "5px" }, childNodes: [] },
+  ] } } };
+  const mirror = mirrorOf({ 5: avatar, 6: canvas, 7: logo, 8: el({ tag: "img", priv: true }) });
+  m.postProcess(snap, mirror);
+  const [a, c, l, done] = snap.data.node.childNodes;
+  assert.deepEqual(a.attributes, { rr_width: "40px", rr_height: "30px", class: "avatar" });
+  assert.deepEqual(c.attributes, { rr_width: "10px", rr_height: "10px" });
+  assert.equal(l.attributes.src, "https://x/logo.png");
+  assert.deepEqual(done.attributes, { class: "x", rr_width: "5px", rr_height: "5px" }, "already blocked by rrweb");
+
+  // Later changes to a placeholder, and its canvas drawing, don't ship.
+  const src = { type: 3, data: { source: 0, adds: [], removes: [], texts: [], attributes: [{ id: 5, attributes: { src: "https://x/john.png" } }] } };
+  assert.equal(m.postProcess(src, mirror), false);
+  assert.equal(m.postProcess({ type: 3, data: { source: 9, id: 6, type: 0, commands: [] } }, mirror), false);
+  assert.equal(m.postProcess({ type: 3, data: { source: 2, id: 7, type: 2, x: 1, y: 1 } }, mirror), true);
 });
 
 test("post-pass: an option's `selected` is kept only when its select is recorded in clear", () => {
@@ -360,29 +501,37 @@ test("post-pass: an option's `selected` is kept only when its select is recorded
 
   const attrs = () => ({ type: 3, data: { source: 0, adds: [], texts: [], attributes: [{ id: 2, attributes: { selected: "" } }, { id: 3, attributes: { selected: "" } }] } });
   const a1 = attrs();
-  optOut.postProcess(a1, mirrorOf(nodes));
-  assert.deepEqual(a1.data.attributes.map((x) => x.attributes), [{ selected: "" }, {}]);
+  assert.equal(optOut.postProcess(a1, mirrorOf(nodes)), true);
+  assert.deepEqual(a1.data.attributes.map((x) => x.attributes), [{ selected: "" }]);
   const a2 = attrs();
-  all.postProcess(a2, mirrorOf(nodes));
-  assert.deepEqual(a2.data.attributes.map((x) => x.attributes), [{}, {}]);
+  assert.equal(all.postProcess(a2, mirrorOf(nodes)), false, "nothing left to record");
 });
 
-test("post-pass: no mirror is a no-op; a mirror that throws leaves the event and warns once", () => {
+test("post-pass: with no mirror or a failing one, every check fails closed (one warning)", () => {
   const m = masker({ maskSelectors: [".s"] });
-  const ev = () => ({ type: 3, data: { source: 0, adds: [{ parentId: 1, node: { type: 3, id: 9, textContent: "Hi bob@x.io", isShadow: true } }], texts: [], attributes: [] } });
-  const a = ev();
-  m.postProcess(a, undefined);
-  m.postProcess(a, {});
-  assert.equal(a.data.adds[0].node.textContent, "Hi bob@x.io");
+  const ev = () => ({ type: 3, data: { source: 0, adds: [{ parentId: 1, node: { type: 3, id: 9, textContent: "Hi bob@x.io", isShadow: true } }], texts: [{ id: 4, value: "Yo c@d.io" }], attributes: [{ id: 5, attributes: { value: "*****" } }] } });
+  // No mirror: no host to go by, so shadow-root text is wiped; nothing else needs a node.
+  for (const mirror of [undefined, {}]) {
+    const a = ev();
+    assert.equal(m.postProcess(a, mirror), true);
+    assert.equal(a.data.adds[0].node.textContent, "** ********");
+    assert.equal(a.data.texts[0].value, "Yo c@d.io");
+    assert.deepEqual(a.data.attributes[0].attributes, { value: "*****" });
+  }
   const warns = [];
   const realWarn = console.warn;
   console.warn = (...x) => warns.push(x);
   try {
     const b = ev();
     const boom = { getNode: () => { throw new Error("boom"); } };
-    m.postProcess(b, boom);
+    assert.equal(m.postProcess(b, boom), true);
     m.postProcess(ev(), boom);
-    assert.equal(b.data.adds[0].node.textContent, "Hi bob@x.io");
+    assert.equal(b.data.adds[0].node.textContent, "** ********");
+    assert.equal(b.data.texts[0].value, "** ******");
+    assert.deepEqual(b.data.attributes, [], "an unknown node's value is dropped");
+    const attach = { type: 3, data: { source: 0, isAttachIframe: true, adds: [{ parentId: 1, node: { type: 0, id: 2, childNodes: [{ type: 2, id: 3, tagName: "html", attributes: {}, childNodes: [] }] } }], texts: [], attributes: [] } };
+    m.postProcess(attach, boom);
+    assert.deepEqual(attach.data.adds[0].node.childNodes, [], "an unknown frame is not attached");
     assert.equal(warns.length, 1);
   } finally {
     console.warn = realWarn;
@@ -412,8 +561,18 @@ test("click labels: masked like page text, never a select's chosen option", asyn
   const long = "x".repeat(90) + " john.doe@example.com";
   assert.equal(targetLabel(el({ tag: "button", innerText: long }), m), ("x".repeat(90) + " ********@*******.***").slice(0, 100));
   // A label element that is private wipes the label of a public field.
-  const lbl = el({ tag: "label", priv: true, textContent: "Card holder" });
+  const lbl = el({ tag: "label", priv: true, nodeType: 1, childNodes: [{ nodeType: 3, nodeValue: "Card holder" }] });
   const field = el({ tag: "input", type: "text", id: "f", ownerDocument: { querySelector: () => lbl } });
   field.closest = () => null;
   assert.equal(targetLabel(field, m), "**** ******");
+
+  // A label wrapping a textarea: its content (the field's data) is not label text.
+  const notes = el({ tag: "label", nodeType: 1, childNodes: [
+    { nodeType: 3, nodeValue: "Notes " },
+    { nodeType: 1, tagName: "TEXTAREA", childNodes: [{ nodeType: 3, nodeValue: "Patient has diabetes, call 0803" }] },
+    { nodeType: 1, tagName: "SPAN", childNodes: [{ nodeType: 3, nodeValue: "(private)" }] },
+  ] });
+  const area = el({ tag: "textarea", type: "textarea", ownerDocument: { querySelector: () => null } });
+  area.closest = (s) => (s === "label" ? notes : null);
+  assert.equal(targetLabel(area, m), "Notes (private)");
 });

@@ -31,10 +31,15 @@ const STUBS = {
   "./signals": `
     const noop = () => () => {};
     export const createConsoleCapture = noop, createNetworkCapture = noop,
-      createPerformanceCapture = noop, createRageDeadClickCapture = noop,
-      createViewportCapture = noop;
+      createPerformanceCapture = noop, createViewportCapture = noop;
+    // The masker getters the real captures read per click / per navigation.
+    export const createRageDeadClickCapture = (cb, getMasker) => {
+      globalThis.__clickMasker = getMasker;
+      return () => {};
+    };
     export const createErrorCapture = (cb) => { globalThis.__emitError = cb; return () => {}; };
-    export const createNavigationCapture = (cb) => {
+    export const createNavigationCapture = (cb, getMasker) => {
+      globalThis.__navMasker = getMasker;
       cb({ to: location.href, trigger: "load" });
       return () => {};
     };
@@ -81,7 +86,7 @@ export async function load(entry, { stub = false, define = true } = {}) {
 
 /** Install a fake browser: storage, window/document event targets, navigator
  *  (sendBeacon spy), location. Returns handles for driving it. */
-export function installBrowser({ href = "https://app.test/a?token=secret&utm_source=x", visible = true, storage, local } = {}) {
+export function installBrowser({ href = "https://app.test/a?token=secret&utm_source=x", visible = true, storage, local, title = "Page" } = {}) {
   const mkTarget = () => {
     const map = new Map();
     return {
@@ -108,7 +113,7 @@ export function installBrowser({ href = "https://app.test/a?token=secret&utm_sou
     clearInterval: (t) => clearInterval(t),
   });
   const doc = Object.assign(mkTarget(), {
-    visibilityState: visible ? "visible" : "hidden", title: "Page", referrer: "",
+    visibilityState: visible ? "visible" : "hidden", title, referrer: "",
     // Selector validation: this fake parser rejects anything containing "[[".
     createDocumentFragment: () => ({
       querySelector: (sel) => { if (String(sel).includes("[[")) throw new SyntaxError(`bad selector ${sel}`); return null; },
@@ -136,6 +141,8 @@ export function installBrowser({ href = "https://app.test/a?token=secret&utm_sou
   globalThis.__rrweb = { snapshots: 0 };
   globalThis.__remoteConfig = undefined;
   globalThis.__emitError = undefined;
+  globalThis.__clickMasker = undefined;
+  globalThis.__navMasker = undefined;
   return {
     store, window: win, document: doc, beacons,
     hide() { doc.visibilityState = "hidden"; doc.fire("visibilitychange"); },

@@ -299,12 +299,15 @@ function safeTimezone(): string | undefined {
   }
 }
 
-function pageContext(): ReplayBatchEnvelope["page"] {
+function pageContext(
+  maskTitle?: (title: string) => string,
+): ReplayBatchEnvelope["page"] {
   return {
     // Credential-style query keys (token, jwt, password, …) are masked before
     // they reach storage, the same as in session_start and navigation events.
     url: redactUrlForStorage(window.location.href),
-    title: document.title,
+    // Masked like the replay's <title> text, when the caller gives a masker.
+    title: maskTitle ? maskTitle(document.title) : document.title,
     referrer: redactUrlForStorage(document.referrer),
     userAgent: navigator.userAgent,
     viewport: { width: window.innerWidth, height: window.innerHeight },
@@ -481,8 +484,17 @@ function writeStoredSequence(n: number): void {
   }
 }
 
-export function createSessionRuntime(config: WebReplayConfig): SessionRuntime {
+export interface SessionRuntimeOptions {
+  /** Masks document.title before it goes into a batch's page context. */
+  maskTitle?: (title: string) => string;
+}
+
+export function createSessionRuntime(
+  config: WebReplayConfig,
+  options: SessionRuntimeOptions = {},
+): SessionRuntime {
   const now = Date.now();
+  const page = () => pageContext(options.maskTitle);
   const inactivityMs = config.sessionInactivityMs ?? DEFAULT_INACTIVITY_MS;
 
   // Decide this page load's session identity:
@@ -673,7 +685,7 @@ export function createSessionRuntime(config: WebReplayConfig): SessionRuntime {
       }
     },
     nextSequence: claimSequence,
-    pageContext,
+    pageContext: page,
     startAutoFlush: (flush) => {
       const flushIntervalMs = config.flushIntervalMs ?? 3000;
       timer = window.setInterval(() => {
@@ -693,7 +705,7 @@ export function createSessionRuntime(config: WebReplayConfig): SessionRuntime {
         sequence: MAX_SEQUENCE,
         sentAt: Date.now(),
         sdk,
-        page: c.page ?? pageContext(),
+        page: c.page ?? page(),
         events: [],
       });
       // Send one carried batch whole, if it still leaves FINAL_TAIL_ROOM_BYTES
@@ -767,7 +779,7 @@ export function createSessionRuntime(config: WebReplayConfig): SessionRuntime {
         sequence: MAX_SEQUENCE,
         sentAt: Date.now(),
         sdk,
-        page: pageContext(),
+        page: page(),
         events: [],
       };
       // A batch that didn't go out (beforeSend made it bigger than the room, or
@@ -810,7 +822,7 @@ export function createSessionRuntime(config: WebReplayConfig): SessionRuntime {
     stashForNextPage: (carriedOnly) => {
       const own: CarriedBatch | null =
         !carriedOnly && buffer.length > 0
-          ? { segmentId, events: buffer.slice(), page: pageContext() }
+          ? { segmentId, events: buffer.slice(), page: page() }
           : null;
       const candidates = own ? [...carried, own] : carried.slice();
       if (candidates.length === 0) return false;
@@ -879,7 +891,7 @@ export function createSessionRuntime(config: WebReplayConfig): SessionRuntime {
         carried.push({
           segmentId: beforeSegment,
           events: buffer.splice(0, buffer.length),
-          page: pageContext(),
+          page: page(),
         });
       }
       buffer.length = 0;

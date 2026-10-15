@@ -280,8 +280,18 @@ export function createErrorCapture(
   };
 }
 
+/** The part of the text masker a page title needs. */
+type TitleMasker = Pick<TextMasker, "titleFor">;
+
+/** document.title, masked when there is a masker. */
+function maskedTitle(masker: TitleMasker | null | undefined): string {
+  return masker ? masker.titleFor(document.title) : document.title;
+}
+
 export function createNavigationCapture(
   onEvent: (data: NavigationEventData) => void,
+  // Read per event: the masker is replaced when the recorder is reinstalled.
+  getTextMasker?: () => TitleMasker | null | undefined,
 ): StopHandle {
   const originalPushState = history.pushState.bind(history);
   const originalReplaceState = history.replaceState.bind(history);
@@ -301,7 +311,8 @@ export function createNavigationCapture(
       trigger,
       // Human-readable screen name so the dashboard can label screens by title,
       // not just an opaque URL (parity with the reference tracker's page location).
-      title: document.title || undefined,
+      // Masked like the replay's <title> text.
+      title: maskedTitle(getTextMasker?.()) || undefined,
     });
     currentUrl = nextUrl;
   };
@@ -970,6 +981,28 @@ function normSpaces(s: string): string {
   return s.replace(/\s+/g, " ").trim();
 }
 
+// Never part of a label's text: a wrapped textarea's default content and a
+// select's options are the field's data, and the rest is never rendered.
+const NOT_LABEL_TEXT = ["TEXTAREA", "SELECT", "DATALIST", "OPTION", "SCRIPT", "STYLE", "NOSCRIPT", "TEMPLATE"];
+
+/** An element's text without the form controls (and unrendered elements)
+ *  inside it — what a <label> wrapping its field says about it. */
+function labelText(root: Element): string {
+  let out = "";
+  const stack: Node[] = [root];
+  while (stack.length) {
+    const n = stack.pop()!;
+    if (n.nodeType === 3) {
+      out += n.nodeValue ?? "";
+      continue;
+    }
+    if (n.nodeType !== 1 || NOT_LABEL_TEXT.indexOf((n as Element).tagName.toUpperCase()) !== -1) continue;
+    const kids = n.childNodes;
+    for (let i = kids.length - 1; i >= 0; i -= 1) stack.push(kids[i]);
+  }
+  return out;
+}
+
 /** A human label for a clicked element — attribute label, input placeholder, or
  *  short trimmed text. NEVER an input's actual value (that's user data), except a
  *  submit button's caption, and never a <select>'s chosen option (the reference
@@ -1009,7 +1042,7 @@ export function targetLabel(
       .split(/\s+/)
       .map((id) => {
         const ref = doc ? doc.getElementById(id) : null;
-        return ref ? mask(ref.textContent ?? "", ref) : "";
+        return ref ? mask(labelText(ref), ref) : "";
       })
       .join(" ");
     if (normSpaces(txt)) return truncate(normSpaces(txt), 100);
@@ -1027,7 +1060,8 @@ export function targetLabel(
         ? doc.querySelector(`label[for="${cssEscape(input.id)}"]`)
         : null;
     const labelEl = forLabel || el.closest("label");
-    const lbl = labelEl?.textContent;
+    // Not textContent: a label wrapping a textarea would carry its content.
+    const lbl = labelEl ? labelText(labelEl) : "";
     if (lbl && normSpaces(lbl)) return cap(lbl, labelEl);
     const ph = el.getAttribute("placeholder");
     if (ph && normSpaces(ph)) return cap(ph);

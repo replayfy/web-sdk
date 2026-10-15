@@ -79,7 +79,76 @@ export function initReplay(config: WebReplayConfig): ReplayController {
     }
   }
 
-  const session = createSessionRuntime(config);
+  // Each invalid selector is reported once per page, however often the
+  // recorder is (re)installed.
+  const warnedSelectors = new Set<string>();
+  const warnSelectors = (bad: string[], what: string) => {
+    const fresh = bad.filter((s) => !warnedSelectors.has(s));
+    if (fresh.length === 0) return;
+    for (const s of fresh) warnedSelectors.add(s);
+    // eslint-disable-next-line no-console
+    console.warn(`[replay-sdk] ${what}:`, fresh);
+  };
+  const warnMaskSelectors = (bad: string[]) =>
+    warnSelectors(bad, "invalid mask selector(s), treating the whole page as private");
+
+  // The last dashboard privacy rules seen for this ingest host + key, kept so a
+  // page whose remote config is slower than the 300ms race still records its
+  // first snapshot with them (they can only add masking). Per-browser
+  // localStorage; any failure just means no cached rules.
+  const privacyCacheKey = (() => {
+    const owner = `${config.apiHost}|${config.apiKey}`;
+    let h = 5381;
+    for (let i = 0; i < owner.length; i += 1) h = ((h * 33) ^ owner.charCodeAt(i)) >>> 0;
+    return `replay:privacy:${h.toString(36)}`;
+  })();
+  type CachedPrivacy = {
+    forceMaskAllInputs: boolean;
+    maskSelectors: string[];
+    blockSelectors: string[];
+    maskInputTypes: string[];
+  };
+  const strings = (v: unknown): string[] =>
+    Array.isArray(v) ? v.filter((s): s is string => typeof s === "string") : [];
+  const readCachedPrivacy = (): CachedPrivacy | null => {
+    try {
+      const raw = localStorage.getItem(privacyCacheKey);
+      if (!raw) return null;
+      const p = JSON.parse(raw) as Record<string, unknown>;
+      return {
+        forceMaskAllInputs: p.forceMaskAllInputs === true,
+        maskSelectors: strings(p.maskSelectors),
+        blockSelectors: strings(p.blockSelectors),
+        maskInputTypes: strings(p.maskInputTypes),
+      };
+    } catch {
+      return null;
+    }
+  };
+  const writeCachedPrivacy = (p: CachedPrivacy) => {
+    try {
+      localStorage.setItem(privacyCacheKey, JSON.stringify(p));
+    } catch {
+      /* storage blocked or full — the next page just races without it */
+    }
+  };
+
+  // The masker rrweb's text/input hooks, the event post-pass, the click labels
+  // and the page titles use. Built from the host config and the cached
+  // dashboard selectors now, so the captures installed before rrweb (phase 1)
+  // already mask what they send; replaced each time rrweb is (re)installed
+  // with the merged privacy settings.
+  let activeTextMasker: TextMasker = createTextMasker({
+    maskSelectors: [config.maskTextSelector, ...(readCachedPrivacy()?.maskSelectors ?? [])],
+    maskEmails: config.maskTextEmails !== false,
+    maskNumbers: config.maskTextNumbers === true,
+    rootDoc: document,
+    warn: warnMaskSelectors,
+  });
+
+  const session = createSessionRuntime(config, {
+    maskTitle: (t) => activeTextMasker.titleFor(t),
+  });
   const sendBatch = createBatchSender(config);
   const { fp: fingerprint } = getBrowserFingerprint();
   sendBatch.setFingerprint(fingerprint);
@@ -156,73 +225,6 @@ export function initReplay(config: WebReplayConfig): ReplayController {
   if (config.distinctId)
     sendBatch.setIdentify({ distinctId: config.distinctId });
 
-  // Each invalid selector is reported once per page, however often the
-  // recorder is (re)installed.
-  const warnedSelectors = new Set<string>();
-  const warnSelectors = (bad: string[], what: string) => {
-    const fresh = bad.filter((s) => !warnedSelectors.has(s));
-    if (fresh.length === 0) return;
-    for (const s of fresh) warnedSelectors.add(s);
-    // eslint-disable-next-line no-console
-    console.warn(`[replay-sdk] ${what}:`, fresh);
-  };
-  const warnMaskSelectors = (bad: string[]) =>
-    warnSelectors(bad, "invalid mask selector(s), masking all page text");
-
-  // The masker rrweb's text/input hooks, the event post-pass and the click
-  // labels use. Built from the host config now, so the click capture installed
-  // before rrweb (phase 1) already masks its labels; replaced each time rrweb
-  // is (re)installed with the merged privacy settings.
-  let activeTextMasker: TextMasker = createTextMasker({
-    maskSelectors: [config.maskTextSelector],
-    maskEmails: config.maskTextEmails !== false,
-    maskNumbers: config.maskTextNumbers === true,
-    rootDoc: document,
-    warn: warnMaskSelectors,
-  });
-
-  // The last dashboard privacy rules seen for this ingest host + key, kept so a
-  // page whose remote config is slower than the 300ms race still records its
-  // first snapshot with them (they can only add masking). Per-browser
-  // localStorage; any failure just means no cached rules.
-  const privacyCacheKey = (() => {
-    const owner = `${config.apiHost}|${config.apiKey}`;
-    let h = 5381;
-    for (let i = 0; i < owner.length; i += 1) h = ((h * 33) ^ owner.charCodeAt(i)) >>> 0;
-    return `replay:privacy:${h.toString(36)}`;
-  })();
-  type CachedPrivacy = {
-    forceMaskAllInputs: boolean;
-    maskSelectors: string[];
-    blockSelectors: string[];
-    maskInputTypes: string[];
-  };
-  const strings = (v: unknown): string[] =>
-    Array.isArray(v) ? v.filter((s): s is string => typeof s === "string") : [];
-  const readCachedPrivacy = (): CachedPrivacy | null => {
-    try {
-      const raw = localStorage.getItem(privacyCacheKey);
-      if (!raw) return null;
-      const p = JSON.parse(raw) as Record<string, unknown>;
-      return {
-        forceMaskAllInputs: p.forceMaskAllInputs === true,
-        maskSelectors: strings(p.maskSelectors),
-        blockSelectors: strings(p.blockSelectors),
-        maskInputTypes: strings(p.maskInputTypes),
-      };
-    } catch {
-      return null;
-    }
-  };
-  const writeCachedPrivacy = (p: CachedPrivacy) => {
-    try {
-      localStorage.setItem(privacyCacheKey, JSON.stringify(p));
-    } catch {
-      /* storage blocked or full — the next page just races without it */
-    }
-  };
-
-
   const emit = <TData>(
     event: Omit<ReplayEvent<TData>, "id" | "offsetMs" | "source">,
   ) => {
@@ -274,7 +276,8 @@ export function initReplay(config: WebReplayConfig): ReplayController {
       href: redactUrlForStorage(window.location.href),
       path: window.location.pathname,
       referrer: redactUrlForStorage(document.referrer),
-      title: document.title || undefined,
+      // Masked like the replay's <title> text (emails, digits if asked).
+      title: activeTextMasker.titleFor(document.title) || undefined,
     };
     emit({ ts: Date.now(), type: "session_start", data });
   };
@@ -286,12 +289,16 @@ export function initReplay(config: WebReplayConfig): ReplayController {
   // would have no base).
   let lastRrwebActivityAt = Date.now();
   const emitSnapshot = (rrwebEvent: eventWithTime) => {
-    // Privacy edits rrweb has no hook for (shadow-root text, href/meta,
-    // blocked iframes, select state), while its mirror still matches the page.
-    activeTextMasker.postProcess(
-      rrwebEvent,
-      (record as unknown as { mirror?: unknown }).mirror,
-    );
+    // Privacy edits rrweb has no hook for (shadow-root text, href/meta, input
+    // values, private media, blocked iframes, select state), while its mirror
+    // still matches the page. An event with nothing left to record is dropped.
+    if (
+      !activeTextMasker.postProcess(
+        rrwebEvent,
+        (record as unknown as { mirror?: unknown }).mirror,
+      )
+    )
+      return;
     lastRrwebActivityAt = Date.now();
     // The session becomes shippable the moment its first FULL snapshot (type 2)
     // is buffered — every later incremental is a diff against it, so a batch sent
@@ -627,10 +634,13 @@ export function initReplay(config: WebReplayConfig): ReplayController {
         }),
       );
       syncCapture("navigation", true, () =>
-        createNavigationCapture((d: NavigationEventData) => {
-          markMeaningful(); // a real route change revives an idle session
-          emit({ ts: Date.now(), type: "navigation", data: d });
-        }),
+        createNavigationCapture(
+          (d: NavigationEventData) => {
+            markMeaningful(); // a real route change revives an idle session
+            emit({ ts: Date.now(), type: "navigation", data: d });
+          },
+          () => activeTextMasker,
+        ),
       );
       syncCapture("viewport", true, () =>
         createViewportCapture(() => {
@@ -763,12 +773,14 @@ export function initReplay(config: WebReplayConfig): ReplayController {
       // HTML comments are never recorded (the reference tracker drops them;
       // rrweb would ship them raw, even inside private regions).
       rrwebOpts.slimDOMOptions = { comment: true };
-      // Input values. With maskAllInputs rrweb hands every type to
-      // maskInputFn; with the app's opt-out it gets every type too, and the
-      // masker still hides passwords and masks emails, 4+ digit values,
-      // workspace-forced types and anything in a private region.
-      rrwebOpts.maskAllInputs = nextPrivacy.maskAllInputs;
-      if (!nextPrivacy.maskAllInputs) rrwebOpts.maskInputOptions = { ...ALL_INPUT_TYPES };
+      // Input values. rrweb hands every input type to maskInputFn, which
+      // applies maskAllInputs, sends nothing for passwords and for types the
+      // reference tracker never records (hidden, file, url, color…), and with
+      // the app's opt-out still masks emails, 4+ digit values, workspace-forced
+      // types and anything in a private region. rrweb's own maskAllInputs is
+      // not used: its map would replace this one and record hidden and file
+      // values raw.
+      rrwebOpts.maskInputOptions = { ...ALL_INPUT_TYPES };
       rrwebOpts.maskInputFn = textMasker.maskInputFn;
       if (nextPrivacy.blockSelector)
         rrwebOpts.blockSelector = nextPrivacy.blockSelector;
@@ -1225,7 +1237,7 @@ export function initReplay(config: WebReplayConfig): ReplayController {
       type: "navigation",
       data: {
         to: redactUrlForStorage(window.location.href),
-        title: document.title || undefined,
+        title: activeTextMasker.titleFor(document.title) || undefined,
         trigger: "load",
       } satisfies NavigationEventData,
     });

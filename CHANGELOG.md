@@ -31,9 +31,17 @@ replaces.
   `true`) now decides, and the dashboard can only force masking on: every
   input, textarea and select value is `*`-masked unless the app sets
   `maskAllInputs: false`.
+- **Hidden and file inputs are no longer recorded raw.** Their values (CSRF
+  tokens, prefilled emails, `C:\fakepath\` file names) skipped masking
+  entirely. Hidden, file, url, color, month, week, datetime-local and image
+  inputs now send no value, whatever `maskAllInputs` says.
+- **A cleared field no longer shows its old value.** A prefilled field the
+  user emptied was recorded with its original HTML value, unmasked.
 - **Passwords send nothing.** A password field, including one a "show
   password" toggle switched to text, records an empty value: no characters and
-  no length.
+  no length. Changes to its `value` attribute (one per keystroke in
+  frameworks that keep it in sync) are not recorded, so neither is its
+  typing rhythm.
 - **An invalid block selector no longer freezes the replay.** The recorder
   threw on every DOM change and the replay stopped at its first snapshot. Each
   host and workspace block selector is now checked, and one the browser can't
@@ -45,7 +53,12 @@ replaces.
 - **Click labels** (rage and dead clicks, heatmaps) are masked like page text:
   wiped when the clicked element, its label or anything inside it is private,
   emails masked otherwise. A `<select>` is no longer labelled with the option
-  the user chose.
+  the user chose, and a field's label no longer includes the content of a
+  `<textarea>` or `<select>` inside it. Clicks before the replay starts already
+  use the workspace's last-seen mask selectors.
+- **The page title is masked like page text.** `session_start`, navigation
+  events and every batch sent `document.title` as is, so an address in the
+  title (`Inbox – jane.doe@example.com`) was recorded in full.
 
 ### Changed
 
@@ -57,17 +70,22 @@ replaces.
 - **`maskTextNumbers` turns every digit into `0`**, keeping the length. It
   used to replace runs of 5 or more digits with up to 12 `•`.
 - **Images, canvases, videos and iframes inside a private region** are
-  recorded as placeholders of the same size. A blocked or private iframe's
-  document is no longer recorded.
+  recorded as placeholders of the same size, including inside a private
+  element's shadow root and on browsers without `:is()`. A blocked or private
+  iframe's document is no longer recorded, nor is anything that later changes
+  or is typed or clicked inside it.
+- **A textarea's default text is masked like its value.**
 - **Host and dashboard selectors are combined.** The workspace's mask and
   block selectors used to replace the `maskTextSelector` / `blockSelector`
   passed to `init()` as soon as the dashboard settings arrived, so a host
   `.rpf-mask` stopped working. Both now apply.
 - **An invalid mask selector masks all page text** (except CSS), with a
-  console warning, instead of masking nothing.
+  console warning, instead of masking nothing. The whole page is then treated
+  as private: input values are masked and media are placeholders too.
 - **No longer recorded:** HTML comments, `<meta>` content (CSRF tokens and
-  similar), and `href` on HTML elements other than `<link>` (`mailto:` and
-  magic-link anchors replay without their target). Script and `<noscript>`
+  similar), and `href` on HTML elements other than stylesheet and font
+  `<link>`s (`mailto:` and magic-link anchors replay without their target;
+  canonical, alternate and icon links lose theirs). Script and `<noscript>`
   text, including SVG `<script>`, is replaced by `*`.
 - **Late dashboard settings.** The last dashboard privacy settings are kept in
   `localStorage` per ingest host and key, and a page whose settings are slower

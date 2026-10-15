@@ -150,8 +150,8 @@ Only `apiKey` and `apiHost` are required.
 | `maxBodyBytes` | `number` | `8192` | Maximum captured request/response body size, in bytes. |
 | `captureResourceTimings` | `boolean` | `true` | Capture per-resource timing (images, scripts, CSS, fonts). |
 | `resourceMinDurationMs` | `number` | `0` | Skip resource-timing entries faster than this many milliseconds to trim volume. |
-| `maskAllInputs` | `boolean` | `true` | Mask the value of every input, textarea and select in the replay (`*` per character). Password fields never send a value or a length, whatever this says. The dashboard can force masking on; it never turns it off. |
-| `maskTextSelector` | `string` | — | CSS selector for private regions: their text is replaced by `*` at the same length, their input values are masked, and their images, canvases, videos and iframes are recorded as placeholders. Combined with the dashboard's mask selectors. An invalid selector masks all page text, with a console warning. |
+| `maskAllInputs` | `boolean` | `true` | Mask the value of every input, textarea and select in the replay (`*` per character). Password fields never send a value or a length, whatever this says, and neither do hidden, file, url, color, month, week, datetime-local and image inputs. The dashboard can force masking on; it never turns it off. |
+| `maskTextSelector` | `string` | — | CSS selector for private regions: their text is replaced by `*` at the same length, their input values are masked, and their images, canvases, videos and iframes are recorded as placeholders. Combined with the dashboard's mask selectors. An invalid selector makes the whole page private (all text, inputs and media masked), with a console warning. |
 | `blockSelector` | `string` | — | CSS selector for elements to fully block (rendered as a placeholder). Combined with the dashboard's block selectors; an invalid selector is ignored, with a console warning. |
 | `maskTextEmails` | `boolean` | `true` | Mask email addresses in all page text at the same length, keeping `@` and the dots between domain labels (`jane.doe@example.com` → `********@*******.***`). |
 | `maskTextNumbers` | `boolean` | `false` | Turn every digit in page text into `0`. |
@@ -247,9 +247,10 @@ const url = replay.urlForCurrentSession();
 
 Replayfy is designed to keep sensitive data in the browser. By default, every
 input value is masked, password fields send no value and no length, and email
-addresses in page text are masked. Tune redaction with these options:
+addresses in page text (and in the page title sent with each batch) are
+masked. Tune redaction with these options:
 
-- **`maskAllInputs`** (default `true`) — masks the value of every input field in the replay. With `false`, values are recorded as typed, except passwords, values inside a private region, and (unless `maskInputEmails` / `maskInputNumbers` are set to `false`) email-like values and values with 4 or more digits in a row.
+- **`maskAllInputs`** (default `true`) — masks the value of every input field in the replay. With `false`, values are recorded as typed, except passwords, values inside a private region, and (unless `maskInputEmails` / `maskInputNumbers` are set to `false`) email-like values and values with 4 or more digits in a row. Hidden, file, url, color, month, week, datetime-local and image inputs never send a value, whatever this says.
 - **`maskTextSelector`** — a CSS selector for private regions (e.g. `.pii, .account-number`). Their text is replaced by `*` at the same length, their input values are masked, and their images, canvases, videos and iframes render as placeholders.
 - **`blockSelector`** — a CSS selector for elements to block entirely; they render as a placeholder in playback.
 - **`maskTextEmails`** (default `true`) — masks email addresses in all page text at the same length; `@` and the dots stay, so the replay still reads as an address.
@@ -261,10 +262,11 @@ addresses in page text are masked. Tune redaction with these options:
 
 CSS text is never altered, script and `<noscript>` text is never sent readable,
 and HTML comments, `<meta>` content and link targets (`href` on HTML elements
-other than `<link>`, such as `mailto:` and magic-link anchors) are not
+other than stylesheet and font `<link>`s, such as `mailto:` and magic-link
+anchors) are not recorded. Nothing inside a blocked or private iframe is
 recorded. A selector the browser can't parse is never passed to the recorder:
-an invalid mask selector masks all page text, and an invalid block selector is
-ignored; both log a console warning.
+an invalid mask selector makes the whole page private, and an invalid block
+selector is ignored; both log a console warning.
 
 ### Mask a specific input or element
 
