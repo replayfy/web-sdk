@@ -848,6 +848,16 @@ const withPrivacy = (p = {}) => {
   const r = remoteCfg();
   return { ...r, privacy: { ...r.privacy, ...p } };
 };
+/** The privacy rules the server sends for a workspace that changed nothing:
+ *  a first visit records under them until its own arrive. */
+const DEFAULT_RULES = {
+  maskSelectors: ["[data-private]", ".sensitive"],
+  blockSelectors: [".no-replay"],
+  maskInputTypes: ["password"],
+  redactUrlPatterns: ["token=", "api_key="],
+  blockCreditCardText: true,
+  allowedQueryParams: ["utm_source", "utm_medium", "utm_campaign"],
+};
 /** A remote config that answers `ms` after the SDK asks for it. */
 const later = (value, ms) => () => new Promise((r) => setTimeout(() => r(value), ms));
 const rr = () => globalThis.__rrweb;
@@ -991,7 +1001,7 @@ test("maskTextEmails:false keeps ordinary emails but still wipes private text", 
   await ctrl.stop();
 });
 
-test("late dashboard rules that add masking restart the recorder; the same rules arriving late don't", async () => {
+test("late dashboard rules that add masking restart the recorder; the defaults arriving late don't", async () => {
   const forced = await start({ remote: later(withPrivacy({ maskAllInputs: true }), 400), config: { maskAllInputs: false } });
   await sleep(100);
   assert.equal(rr().installs, 2, "restarted for the force");
@@ -1006,7 +1016,8 @@ test("late dashboard rules that add masking restart the recorder; the same rules
   assert.deepEqual(seen, [".new, .rr-mask"]);
   await region.ctrl.stop();
 
-  const same = await start({ remote: later(withPrivacy({ maskAllInputs: false }), 400) });
+  // A first visit records under the server's defaults until its rules arrive.
+  const same = await start({ remote: later(withPrivacy({ maskAllInputs: false, ...DEFAULT_RULES }), 400) });
   await sleep(100);
   assert.equal(rr().installs, 1, "nothing changed: no restart");
   assert.ok(masksAll(rr().opts));
@@ -1098,4 +1109,237 @@ test("before rrweb starts, click labels already use the cached dashboard selecto
   assert.equal(labels.labelFor("Pay Jane", fakeEl(seen, { priv: true })), "*** ****");
   assert.deepEqual(seen, [".rpf-mask, .sensitive, .rr-mask"]);
   await ctrl.stop();
+});
+
+// ── Privacy hold: nothing leaves before the workspace's rules are known ─────
+
+/** initReplay without waiting for anything (start() waits out the race).
+ *  `at(ms)` sleeps until `ms` after init. */
+async function boot({ remote, config = {}, storage, local, href } = {}) {
+  const b = installBrowser({ storage, local, href });
+  if (remote !== undefined) globalThis.__remoteConfig = typeof remote === "function" ? remote : () => remote;
+  const f = makeFetch();
+  const { initReplay } = await load("initReplay.ts", { stub: true });
+  const t0 = Date.now();
+  const ctrl = initReplay({ apiKey: "k", apiHost: "https://api.test", flushIntervalMs: 1e9, sessionInactivityMs: 0, fetchImpl: f, ...config });
+  return { b, f, ctrl, at: (ms) => sleep(Math.max(0, t0 + ms - Date.now())) };
+}
+const { redactUrlForStorage: redactUrl } = await load("utils.ts");
+const RAW_URL = "https://cdn.test/x.js?sessref=s1&ok=1";
+/** What the page does: a DOM change tagged `tag`, a heatmap click (its label
+ *  is page text), a rage click, a request and a resource load whose URL
+ *  carries `sessref=s1`, as the real captures would record them now. */
+function act(tag) {
+  rr().emit({ type: 3, timestamp: Date.now(), data: { source: 0, tag } });
+  globalThis.__emitClick({ kind: "click", selector: "button.pay", label: `Pay Jane ${tag}`, nx: 1, ny: 1, uiId: "u" });
+  globalThis.__emitClick({ kind: "rage_click", x: 1, y: 1, selector: "button.pay", count: 3 });
+  const { cfg, getUrlPolicy, emit } = globalThis.__netCapture;
+  emit({ requestId: tag, transport: "fetch", method: "GET", url: redactUrl(RAW_URL, { patterns: cfg.redactUrls, ...getUrlPolicy() }), startedAt: Date.now() });
+  globalThis.__perfEmit({ kind: "perf", metric: "resource", value: 5, ts: Date.now(), detail: { name: globalThis.__perfOpts.redactUrl(RAW_URL) } });
+}
+const isReplay = (e) => e.type === "full_snapshot" || e.type === "incremental_snapshot";
+const tagged = (events, tag) => events.some((e) => e.data?.rrwebEvent?.data?.tag === tag);
+const clickLabels = (events) => events.filter((e) => e.type === "custom" && e.data.kind === "click").map((e) => e.data.label);
+/** Which recorder install took each full snapshot sent. */
+const fullInstalls = (events) => events.filter((e) => e.type === "full_snapshot").map((e) => e.data.rrwebEvent.data.install);
+/** The batch's replay stream starts at a full snapshot (rrweb's Meta event
+ *  may come first): no diff without its base. */
+const snapshotLed = (envelope) => {
+  const t = envelope.events.filter(isReplay).map((e) => e.data.rrwebEvent.type);
+  const k = t.indexOf(2);
+  return k >= 0 && t.slice(0, k).every((x) => x === 4);
+};
+const maskSeen = () => {
+  const seen = [];
+  rr().opts.maskTextFn("x", fakeEl(seen));
+  return seen;
+};
+
+test("privacy hold: a first visit whose config loses the race uploads nothing before it, under the server's default rules", async () => {
+  const { b, f, ctrl, at } = await boot({ remote: later(withPrivacy(DEFAULT_RULES), 900), config: { maskTextSelector: ".rpf-mask" } });
+  // Click labels already use the defaults before rrweb starts.
+  const seen0 = [];
+  globalThis.__clickMasker().labelFor("x", fakeEl(seen0));
+  assert.deepEqual(seen0, [".rpf-mask, [data-private], .sensitive, .rr-mask"]);
+  await at(450);
+  assert.equal(rr().installs, 1, "rrweb started at the race's timeout");
+  assert.deepEqual(maskSeen(), [".rpf-mask, [data-private], .sensitive, .rr-mask"]);
+  assert.ok(rr().opts.blockSelector.startsWith(".no-replay, "), rr().opts.blockSelector);
+  act("p");
+  b.hide(); // a tab switch during the hold sends nothing either
+  b.show();
+  await ctrl.flush();
+  await at(800);
+  assert.equal(f.calls.length, 0, "held until the config arrives");
+  await at(1000);
+  assert.ok(f.calls.length >= 1, "released when it arrived");
+  // The same rules as the provisional ones: nothing dropped, no restart.
+  assert.equal(rr().installs, 1);
+  assert.ok(snapshotLed(f.calls[0].envelope));
+  const sent = all(f);
+  assert.deepEqual(fullInstalls(sent), [1]);
+  assert.ok(tagged(sent, "p"), "the DOM change recorded during the hold");
+  assert.deepEqual(clickLabels(sent), ["Pay Jane p"]);
+  await ctrl.stop();
+});
+
+test("privacy hold: rules stricter than the provisional ones drop what was recorded under them; the replay starts at a fresh snapshot under the workspace's rules", async () => {
+  const remote = withPrivacy({ maskSelectors: [".custom-secret"], redactUrlPatterns: ["sessref="] });
+  const { f, ctrl, at } = await boot({ remote: later(remote, 700) });
+  await at(450);
+  assert.equal(rr().installs, 1);
+  act("p");
+  assert.equal(f.calls.length, 0);
+  await at(800);
+  assert.equal(rr().installs, 2, "restarted under the workspace's rules");
+  assert.deepEqual(maskSeen(), [".custom-secret, .rr-mask"]);
+  assert.ok(f.calls.length >= 1);
+  const first = f.calls[0].envelope;
+  assert.ok(snapshotLed(first), "the first batch starts at a full snapshot");
+  assert.deepEqual(fullInstalls(first.events), [2], "taken by the restarted recorder");
+  const sent = all(f);
+  assert.deepEqual(fullInstalls(sent), [2], "the provisional snapshot is never sent");
+  assert.ok(!tagged(sent, "p"), "nor the DOM change recorded under the provisional rules");
+  assert.deepEqual(clickLabels(sent), [], "nor its click label");
+  assert.ok(sent.some((e) => e.type === "custom" && e.data.kind === "rage_click"), "a rage click (no page text) is kept");
+  assert.ok(types(first).includes("session_start") && types(first).includes("viewport"));
+  // URLs recorded before the config get its patterns.
+  const net = sent.find((e) => e.type === "network");
+  assert.ok(net && !net.data.url.includes("s1") && net.data.url.includes("ok=1"), net?.data.url);
+  const res = sent.find((e) => e.type === "performance" && e.data.metric === "resource");
+  assert.ok(res && !res.data.detail.name.includes("s1"), res?.data.detail.name);
+  await ctrl.stop();
+});
+
+test("privacy hold: no config (a 404) releases it, with the server's defaults kept as the page's rules", async () => {
+  const { f, ctrl, at } = await boot({ remote: later(null, 700) });
+  await at(450);
+  act("p");
+  assert.equal(f.calls.length, 0);
+  await at(800);
+  assert.ok(f.calls.length >= 1, "released when the config failed");
+  assert.equal(rr().installs, 1, "no restart");
+  assert.ok(rr().opts.blockSelector.startsWith(".no-replay, "), rr().opts.blockSelector);
+  assert.ok(snapshotLed(f.calls[0].envelope));
+  assert.ok(tagged(all(f), "p"));
+  await ctrl.stop();
+});
+
+test("privacy hold: stop() before the rules are known sends nothing recorded under the provisional ones", async () => {
+  const { f, ctrl, at } = await boot({ remote: later(withPrivacy({ maskSelectors: [".custom-secret"] }), 700) });
+  await at(450);
+  act("p");
+  await ctrl.stop();
+  await at(800);
+  assert.equal(f.calls.length, 0);
+  assert.equal(rr().installs, 1, "the late config doesn't restart the recorder");
+});
+
+test("privacy hold: a config that doesn't answer is waited for 4 s; when it comes later, what is not sent yet still gets its rules", async () => {
+  const { f, ctrl, at } = await boot({ remote: later(withPrivacy({ maskSelectors: [".custom-secret"] }), 4400) });
+  await at(3800);
+  assert.equal(f.calls.length, 0, "held");
+  await at(4100);
+  assert.ok(f.calls.length >= 1, "released at the cap");
+  assert.ok(snapshotLed(f.calls[0].envelope));
+  assert.deepEqual(fullInstalls(all(f)), [1], "under the defaults");
+  act("late"); // buffered, not sent yet
+  await at(4550);
+  assert.equal(rr().installs, 2, "the late config restarts the recorder");
+  const sent = all(f);
+  assert.ok(!tagged(sent, "late"), "the unsent DOM change recorded under the defaults is dropped");
+  assert.deepEqual(clickLabels(sent), []);
+  assert.deepEqual(fullInstalls(sent), [1, 2], "a fresh base under the workspace's rules follows");
+  await ctrl.stop();
+});
+
+test("privacy hold: a page closed before its rules are known sends no DOM event; the rest goes to the next page load", async () => {
+  const storage = new Map();
+  const conf = { sessionInactivityMs: 60_000 };
+  const rules = withPrivacy({ maskSelectors: [".custom-secret"] });
+  const p1 = await boot({ storage, config: conf, remote: later(rules, 3000), href: "https://app.test/landing?utm_source=google" });
+  await p1.at(450);
+  act("p");
+  p1.b.pagehide(false);
+  p1.b.hide(); // the browser fires visibilitychange right after pagehide
+  await sleep(20);
+  assert.equal(p1.f.calls.length, 0, "nothing sent on the way out");
+  const outbox = readOutbox(storage);
+  const held = outbox.batches.flatMap((x) => x.events);
+  assert.ok(held.some((e) => e.type === "session_start"), "the landing page's session start is handed on");
+  for (const e of held) {
+    assert.ok(!isReplay(e) && e.type !== "network", e.type);
+    assert.ok(!(e.type === "custom" && e.data.kind === "click"), "no click label");
+    assert.ok(!(e.type === "performance" && e.data.metric === "resource"), "no resource URL");
+    assert.equal(e.data?.title, undefined, "no page title");
+  }
+  assert.ok(outbox.batches.every((x) => !x.page.title));
+  await p1.ctrl.stop();
+  const seg1 = outbox.batches[0].segmentId;
+  const p2 = await start({ storage, config: conf, remote: rules, href: "https://app.test/home" });
+  const fromP1 = p2.f.calls.map((c) => c.envelope).filter((e) => e.segmentId === seg1);
+  assert.ok(fromP1.length >= 1, "page 1's events went out with page 2");
+  assert.match(fromP1[0].page.url, /\/landing\?utm_source=google/);
+  const sent = fromP1.flatMap((e) => e.events);
+  assert.ok(types({ events: sent }).includes("session_start"));
+  assert.ok(!sent.some(isReplay) && clickLabels(sent).length === 0);
+  assert.ok(p2.f.calls.some((c) => c.envelope.segmentId !== seg1 && snapshotLed(c.envelope)), "page 2's own replay");
+  await p2.ctrl.stop();
+});
+
+test("privacy hold: remembered rules record the first snapshot and wait for the config; it releases them as recorded unless it hides more", async () => {
+  const local = new Map();
+  const rules = withPrivacy({ maskSelectors: [".acct"] });
+  const p1 = await start({ local, remote: rules });
+  await p1.ctrl.stop();
+
+  const same = await boot({ local, remote: later(rules, 800) });
+  await same.at(450);
+  assert.equal(rr().installs, 1);
+  assert.deepEqual(maskSeen(), [".acct, .rr-mask"], "the remembered rules");
+  assert.equal(same.f.calls.length, 0, "held until the config confirms them");
+  await same.at(900);
+  assert.equal(rr().installs, 1, "the same rules: no restart");
+  assert.deepEqual(fullInstalls(all(same.f)), [1], "the snapshot taken under the remembered rules goes out");
+  await same.ctrl.stop();
+
+  // The workspace added a selector since: what was recorded without it goes.
+  const added = await boot({ local, remote: later(withPrivacy({ maskSelectors: [".acct", ".new"] }), 800) });
+  await added.at(900);
+  assert.equal(rr().installs, 2);
+  assert.deepEqual(fullInstalls(all(added.f)), [2]);
+  await added.ctrl.stop();
+
+  // It removed them all: what was recorded hides more, and is kept.
+  const removed = await boot({ local, remote: later(withPrivacy({ maskSelectors: [] }), 800) });
+  await removed.at(450);
+  act("p");
+  await removed.at(900);
+  assert.equal(rr().installs, 2, "restarted with the lighter rules");
+  const sent = all(removed.f);
+  assert.deepEqual(fullInstalls(sent), [1, 2]);
+  assert.ok(tagged(sent, "p") && clickLabels(sent).length === 1);
+  await removed.ctrl.stop();
+});
+
+test("privacy hold: a config that wins the race (or fails at once) adds no wait", async () => {
+  const fast = await boot({ remote: withPrivacy({ maskSelectors: [".custom-secret"] }) });
+  await fast.at(60);
+  assert.ok(fast.f.calls.length >= 1 && snapshotLed(fast.f.calls[0].envelope), "the first batch went right away");
+  await fast.ctrl.stop();
+
+  const failed = await boot({ remote: null });
+  await failed.at(60);
+  assert.ok(failed.f.calls.length >= 1 && snapshotLed(failed.f.calls[0].envelope));
+  await failed.ctrl.stop();
+
+  // A click before the config (phase 1) was labelled under the defaults: the
+  // workspace's rules hide more, so the label goes; nothing else waits.
+  const early = await boot({ remote: later(withPrivacy({ maskSelectors: [".custom-secret"] }), 100) });
+  globalThis.__emitClick({ kind: "click", selector: "b", label: "early", nx: 1, ny: 1, uiId: "u" });
+  await early.at(180);
+  assert.ok(early.f.calls.length >= 1, "sent as soon as the config arrived");
+  assert.equal(rr().installs, 1, "rrweb started once, under the workspace's rules");
+  assert.deepEqual(clickLabels(all(early.f)), []);
+  await early.ctrl.stop();
 });

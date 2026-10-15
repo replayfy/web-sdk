@@ -61,7 +61,7 @@ replaces.
   emails masked otherwise. A `<select>` is no longer labelled with the option
   the user chose, and a field's label no longer includes the content of a
   `<textarea>` or `<select>` inside it. Clicks before the replay starts already
-  use the workspace's last-seen mask selectors.
+  use the workspace's last-seen mask selectors, or the server's defaults.
 - **URL redaction patterns hide the value, everywhere in the URL.** A
   workspace pattern such as `token=` replaced only its first match and only
   the text `token=` itself, so the value after it was still stored. Every
@@ -82,6 +82,19 @@ replaces.
 - **The page title is masked like page text.** `session_start`, navigation
   events and every batch sent `document.title` as is, so an address in the
   title (`Inbox – jane.doe@example.com`) was recorded in full.
+- **The first page view waits for the workspace's privacy rules.** When the
+  dashboard settings were slower than the 300 ms start-up race on a first
+  visit (no rules remembered yet), the replay's first snapshot was uploaded
+  with text inside the workspace's mask selectors (`[data-private]`,
+  `.sensitive`, or custom ones) readable, with the click labels and request
+  URLs recorded before the settings arrived. Also in 0.1.19. Until the
+  settings arrive, a page now records under the server's defaults (or the
+  remembered rules) and uploads nothing, for up to 4 s. If the workspace's
+  rules hide more, what was recorded is dropped and the replay starts at a
+  fresh snapshot taken under them; request and resource URLs and page titles
+  recorded meanwhile get the workspace's rules. A page closed before the
+  settings arrive sends no replay. Without settings (offline, an error) the
+  defaults stay.
 
 ### Changed
 
@@ -110,11 +123,12 @@ replaces.
   `<link>`s (`mailto:` and magic-link anchors replay without their target;
   canonical, alternate and icon links lose theirs). Script and `<noscript>`
   text, including SVG `<script>`, is replaced by `*`.
-- **Late dashboard settings.** The last dashboard privacy settings are kept in
-  `localStorage` per ingest host and key, and a page whose settings are slower
-  than the 300 ms start-up race records its first snapshot with them (they can
-  only add masking). Settings that change mid-page still restart the recorder
-  with a fresh snapshot.
+- **Late dashboard settings.** The last dashboard privacy settings, URL rules
+  included, are kept in `localStorage` per ingest host and key, and a page
+  whose settings are slower than the 300 ms start-up race records its first
+  snapshot with them. They may be out of date, so that page uploads nothing
+  until its settings confirm them (see Fixed). Settings that change mid-page
+  still restart the recorder with a fresh snapshot.
 - **rrweb is pinned to exactly `2.0.0-alpha.20`.** The `^2.0.0-alpha.18` range
   let npm consumers resolve other versions the masking was not checked
   against.

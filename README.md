@@ -311,8 +311,13 @@ Privacy settings are combined, so the dashboard can only add masking:
   masking your code asked for.
 - The dashboard's mask and block selectors apply together with
   `maskTextSelector` / `blockSelector`; neither replaces the other.
-- The last dashboard privacy settings are remembered in the browser, so a page
-  whose settings arrive late still records its first snapshot with them.
+- A page uploads nothing until the dashboard's privacy settings have arrived,
+  for up to 4 seconds. Recording starts at once, under the last settings seen
+  in this browser or, on a first visit, the dashboard's defaults
+  (`[data-private]` and `.sensitive` masked, `.no-replay` blocked). If the
+  settings that arrive hide more, what was recorded before them is discarded
+  and the replay starts from a fresh snapshot. A page closed during that wait
+  sends no replay. When the settings can't be fetched, the defaults apply.
 
 ## Links
 
