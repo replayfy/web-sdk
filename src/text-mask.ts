@@ -333,7 +333,80 @@ export function createTextMasker(opts: TextMaskerOptions): TextMasker {
     return out;
   };
 
-  const maskTextFn = (text: string, el: Element | null): string => {
+  // rrweb serializes a snapshot or a mutation batch synchronously and asks
+  // maskTextFn about every text node in it, so text under the same ancestors
+  // asks the same question again and again: one closest() walk per text node
+  // made a full snapshot of a deep page cost up to half again as much. During
+  // such a pass the answers are kept per element, for every element on the
+  // walk, so each element is matched once. The DOM can't change during the
+  // pass; the answers are dropped when rrweb emits the pass's event (see
+  // postProcess) and at the end of the task at the latest. Only rrweb's
+  // text path uses them.
+  let textMemo: WeakMap<Element, boolean> | null = null;
+  const dropTextMemo = () => {
+    textMemo = null;
+  };
+  const privateForText = (el: Element): boolean => {
+    if (invalid) return true;
+    if (typeof el.matches !== "function" || typeof WeakMap !== "function") return isPrivate(el);
+    try {
+      if (!textMemo) {
+        textMemo = new WeakMap();
+        if (typeof queueMicrotask === "function") queueMicrotask(dropTextMemo);
+        else void Promise.resolve().then(dropTextMemo);
+      }
+      const memo = textMemo;
+      // The same walk as inPrivateRegion, one element at a time.
+      const path: Element[] = [];
+      let cur: Element = el;
+      let hops = 0;
+      let result = false;
+      for (;;) {
+        const known = memo.get(cur);
+        if (known !== undefined) {
+          result = known;
+          break;
+        }
+        path.push(cur);
+        if (cur.matches(selector)) {
+          result = true;
+          break;
+        }
+        const parent: Element | null = cur.parentElement;
+        if (parent) {
+          cur = parent;
+          continue;
+        }
+        // The top of this tree: on to a shadow root's host, or to a
+        // same-origin frame's element, never past the recording root
+        // document; past 64 of these hops, private (fail closed).
+        const root: Node | null = typeof cur.getRootNode === "function" ? cur.getRootNode() : null;
+        let next: Element | null = null;
+        if (root && root.nodeType === 11 && (root as ShadowRoot).host) {
+          next = (root as ShadowRoot).host;
+        } else if (cur.ownerDocument !== rootDoc) {
+          try {
+            next = (cur.ownerDocument?.defaultView?.frameElement as Element | null) ?? null;
+          } catch {
+            next = null; // cross-origin parent
+          }
+        }
+        if (!next) break;
+        hops += 1;
+        if (hops >= 64) {
+          result = true;
+          break;
+        }
+        cur = next;
+      }
+      for (const e of path) memo.set(e, result);
+      return result;
+    } catch {
+      return true;
+    }
+  };
+
+  const maskText = (text: string, el: Element | null, inPass: boolean): string => {
     try {
       if (!text || !/\S/.test(text)) return text;
       const tag = el ? lower(el.localName) : "";
@@ -344,12 +417,13 @@ export function createTextMasker(opts: TextMaskerOptions): TextMasker {
       // A textarea's text is its default value: masked like the value.
       if (tag === "textarea" && el) return maskInputFn(text, el);
       if (invalid) return wipeText(text);
-      if (el && isPrivate(el)) return wipeText(text);
+      if (el && (inPass ? privateForText(el) : isPrivate(el))) return wipeText(text);
       return scrub(text);
     } catch {
       return wipeText(text);
     }
   };
+  const maskTextFn = (text: string, el: Element | null): string => maskText(text, el, true);
 
   const isPassword = (el: DomLike): boolean =>
     lower(el.type) === "password" ||
@@ -399,7 +473,7 @@ export function createTextMasker(opts: TextMaskerOptions): TextMasker {
     try {
       if (!title) return title;
       const el = rootDoc && typeof rootDoc.querySelector === "function" ? rootDoc.querySelector("title") : null;
-      return maskTextFn(title, el);
+      return maskText(title, el, false);
     } catch {
       return wipeText(title);
     }
@@ -490,6 +564,8 @@ export function createTextMasker(opts: TextMaskerOptions): TextMasker {
   };
 
   const postProcess = (ev: unknown, mirror: unknown): boolean => {
+    // rrweb emits once its pass is done: the next pass starts afresh.
+    dropTextMemo();
     const e = ev as RrEvent | null;
     if (!e || !e.data) return true;
     const m = mirror as { getNode?: (id: number) => unknown } | null | undefined;

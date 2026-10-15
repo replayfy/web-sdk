@@ -252,6 +252,95 @@ test("inPrivateRegion fails closed past 64 hops and stops at a cross-origin fram
   assert.equal(inPrivateRegion(el({ root: otherDoc, ownerDocument: otherDoc }), ".x", ROOT), false);
 });
 
+// ── maskTextFn during an rrweb pass: answers kept per element ───────────────
+
+/** A fake DOM element with matches/parentElement; `cls` decides matches(). */
+function node(tag, parent, { cls = "", spy, root, ownerDocument = ROOT } = {}) {
+  const n = {
+    localName: tag,
+    tagName: tag.toUpperCase(),
+    namespaceURI: "http://www.w3.org/1999/xhtml",
+    ownerDocument,
+    parentElement: parent ?? null,
+    cls,
+    matches(sel) {
+      spy?.(n);
+      return sel.split(", ").some((s) => s === `.${n.cls}`);
+    },
+    closest(sel) {
+      for (let c = n; c; c = c.parentElement) if (c.matches(sel)) return c;
+      return null;
+    },
+    getRootNode: () => root ?? (parent ? parent.getRootNode() : ROOT),
+    getAttribute: () => null,
+    hasAttribute: () => false,
+    querySelector: () => null,
+  };
+  return n;
+}
+
+test("maskTextFn in a pass: each element is matched once, and the answers end with the pass", async () => {
+  const matched = [];
+  const spy = (n) => matched.push(n);
+  const m = masker({ maskSelectors: [".private"] });
+  const html = node("html", null, { spy });
+  const body = node("body", html, { spy });
+  const wrap = node("div", body, { spy });
+  const a = node("span", wrap, { spy });
+  const b = node("span", wrap, { spy });
+  assert.equal(m.maskTextFn("mail bob@x.io", a), "mail ***@*.**");
+  assert.equal(m.maskTextFn("other text", b), "other text");
+  // a, wrap, body, html, then only b: the shared ancestors were not matched again.
+  assert.deepEqual(matched.map((n) => n.localName), ["span", "div", "body", "html", "span"]);
+
+  // A private ancestor wipes every text under it, from the cache too.
+  wrap.cls = "private";
+  // Same pass: the answer is kept (the DOM can't change during an rrweb pass).
+  assert.equal(m.maskTextFn("still kept", a), "still kept");
+  // rrweb emits the pass's event: the next pass looks again.
+  m.postProcess({ type: 3, data: { source: 0 } }, null);
+  assert.equal(m.maskTextFn("now private", a), "*** *******");
+  assert.equal(m.maskTextFn("sibling", b), "*******");
+  // The end of the task drops them too.
+  wrap.cls = "";
+  await Promise.resolve();
+  assert.equal(m.maskTextFn("public again", a), "public again");
+  // Page titles and click labels never use the pass's answers.
+  wrap.cls = "private";
+  assert.equal(m.labelFor("label", a), "*****");
+});
+
+test("maskTextFn in a pass: shadow hosts and frame elements carry in; the root document stops the walk", () => {
+  const m = masker({ maskSelectors: [".private"] });
+  const host = node("x-card", node("body", null), { cls: "private" });
+  const shadowRoot = { nodeType: 11, host };
+  const inShadow = node("p", null, { root: shadowRoot });
+  assert.equal(m.maskTextFn("in shadow", inShadow), "** ******");
+
+  const frameEl = node("iframe", node("body", null), { cls: "private" });
+  const frameDoc = { nodeType: 9, defaultView: { frameElement: frameEl } };
+  const inFrame = node("p", null, { root: frameDoc, ownerDocument: frameDoc });
+  assert.equal(m.maskTextFn("in frame", inFrame), "** *****");
+
+  // The recording root's own top: no further walk (a parent page is never visited).
+  const parentPage = node("iframe", null, { cls: "private" });
+  const rootDoc = { nodeType: 9, defaultView: { frameElement: parentPage } };
+  const m2 = masker({ maskSelectors: [".private"], rootDoc });
+  assert.equal(m2.maskTextFn("top", node("p", null, { root: rootDoc, ownerDocument: rootDoc })), "top");
+
+  // A cross-origin parent: not private. A hop loop: private (fail closed).
+  const xo = { nodeType: 9, defaultView: {} };
+  Object.defineProperty(xo.defaultView, "frameElement", { get() { throw new Error("cross-origin"); } });
+  assert.equal(masker({ maskSelectors: [".private"] }).maskTextFn("x", node("p", null, { root: xo, ownerDocument: xo })), "x");
+  const loop = node("x-loop", null);
+  loop.getRootNode = () => ({ nodeType: 11, host: loop });
+  assert.equal(masker({ maskSelectors: [".private"] }).maskTextFn("loop", loop), "****");
+  // matches() throwing: wiped.
+  const bad = node("p", null);
+  bad.matches = () => { throw new Error("x"); };
+  assert.equal(masker({ maskSelectors: [".private"] }).maskTextFn("bad", bad), "***");
+});
+
 // ── maskInputFn ─────────────────────────────────────────────────────────────
 
 const input = (type, extra = {}) => el({ tag: "input", type, attrs: { type, ...(extra.attrs ?? {}) }, ...extra });
