@@ -65,3 +65,34 @@ test("URL redaction: key-only patterns hide every value, bad patterns are skippe
     console.warn = realWarn;
   }
 });
+
+// A resource timing names the request URL the network capture redacts.
+test("resource timings: the URL is redacted before it is recorded", async () => {
+  const observers = [];
+  class FakePO {
+    constructor(cb) { this.cb = cb; }
+    observe(o) { this.type = o.type; observers.push(this); }
+    disconnect() {}
+  }
+  FakePO.supportedEntryTypes = ["resource"];
+  const saved = { window: globalThis.window, document: globalThis.document, PO: globalThis.PerformanceObserver };
+  globalThis.window = { setTimeout: () => 0, setInterval: () => 0, clearInterval() {}, addEventListener() {} };
+  globalThis.document = { readyState: "loading", visibilityState: "visible", addEventListener() {} };
+  globalThis.PerformanceObserver = FakePO;
+  try {
+    const { createPerformanceCapture } = await load("signals.ts");
+    const out = [];
+    const stop = createPerformanceCapture((d) => out.push(d), { apiHost: "https://api.test", redactUrl: (u) => u.replace(/sessref=[^&]*/, "sessref=[REDACTED]") });
+    const entry = (name) => ({ name, duration: 5, startTime: 1, initiatorType: "img", responseStart: 2, requestStart: 1, domainLookupEnd: 0, domainLookupStart: 0, connectEnd: 0, connectStart: 0, responseEnd: 3, transferSize: 1, encodedBodySize: 1, decodedBodySize: 1 });
+    const res = observers.find((o) => o.type === "resource");
+    res.cb({ getEntries: () => [entry("https://cdn.test/a.png?sessref=s1&x=1")] });
+    assert.equal(out[0].detail.name, "https://cdn.test/a.png?sessref=[REDACTED]&x=1");
+    const out2 = [];
+    createPerformanceCapture((d) => out2.push(d), { apiHost: "https://api.test" });
+    observers[observers.length - 1].cb({ getEntries: () => [entry("https://cdn.test/a.png?token=t1&x=1")] });
+    assert.ok(!out2[0].detail.name.includes("t1"), out2[0].detail.name);
+    stop();
+  } finally {
+    globalThis.window = saved.window; globalThis.document = saved.document; globalThis.PerformanceObserver = saved.PO;
+  }
+});

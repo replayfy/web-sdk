@@ -30,8 +30,16 @@ const STUBS = {
     export const addCustomEvent = () => {};`,
   "./signals": `
     const noop = () => () => {};
-    export const createConsoleCapture = noop, createNetworkCapture = noop,
-      createPerformanceCapture = noop, createViewportCapture = noop;
+    export const createConsoleCapture = noop, createViewportCapture = noop;
+    // The URL redaction the real captures apply per request / per resource.
+    export const createNetworkCapture = (cfg, cb, getUrlPolicy) => {
+      globalThis.__netCapture = { cfg, getUrlPolicy };
+      return () => {};
+    };
+    export const createPerformanceCapture = (cb, opts) => {
+      globalThis.__perfOpts = opts;
+      return () => {};
+    };
     // The masker getters the real captures read per click / per navigation.
     export const createRageDeadClickCapture = (cb, getMasker) => {
       globalThis.__clickMasker = getMasker;

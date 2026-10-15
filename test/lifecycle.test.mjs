@@ -1059,6 +1059,29 @@ test("the page title is masked like the replay's <title> text wherever it is sen
   await ctrl.stop();
 });
 
+test("URL redaction: the workspace's patterns reach request and resource URLs, with the app's; the replay's page URL is scrubbed", async () => {
+  const base = remoteCfg();
+  const remote = { ...base, privacy: { ...base.privacy, redactUrlPatterns: ["sessref="] } };
+  const { f, ctrl } = await start({ remote, config: { redactUrls: [/hostkey=[^&]*/] } });
+  const { redactUrlForStorage } = await load("utils.ts");
+  const url = "https://cdn.test/a.png?token=t1&sessref=s1&hostkey=h1&x=1";
+  // What the network capture records: its install-time patterns, then the
+  // live policy over them (signals.ts urlPolicy). It is installed before the
+  // dashboard config arrives.
+  const { cfg, getUrlPolicy } = globalThis.__netCapture;
+  const request = redactUrlForStorage(url, { patterns: cfg.redactUrls, ...getUrlPolicy() });
+  const resource = globalThis.__perfOpts.redactUrl(url);
+  for (const out of [request, resource]) {
+    assert.ok(!/t1|s1|h1/.test(out), out);
+    assert.ok(out.includes("x=1"), out);
+  }
+  // rrweb's Meta event carries the page URL (installBrowser: ?token=secret).
+  const metas = all(f).filter((e) => e.data && e.data.rrwebEvent && e.data.rrwebEvent.type === 4);
+  assert.ok(metas.length >= 1);
+  for (const m of metas) assert.ok(!m.data.rrwebEvent.data.href.includes("secret"), m.data.rrwebEvent.data.href);
+  await ctrl.stop();
+});
+
 test("before rrweb starts, click labels already use the cached dashboard selectors", async () => {
   const local = new Map();
   const rules = withPrivacy({ maskSelectors: [".sensitive"] });

@@ -69,6 +69,16 @@ replaces.
   to the next `&` or `#`. A pattern that is not a valid regular expression is
   skipped with a console warning; before, it stopped every dashboard privacy
   setting from applying on the page.
+- **The workspace's URL patterns now apply.** The network capture is set up
+  before the dashboard config arrives and kept only the app's `redactUrls`,
+  so the workspace's patterns never reached a request URL. They now apply
+  live, together with the app's (both, neither replaces the other).
+- **Resource timings are redacted like request URLs.** Performance events
+  named each loaded resource by its full URL, so a token the network capture
+  hid (built-in keys such as `token=`, or a pattern) was still stored there.
+- **The replay's page URL is scrubbed.** rrweb's meta event carried the page
+  URL as is (`?token=…`); it now gets the built-in key scrub every other
+  stored page URL gets.
 - **The page title is masked like page text.** `session_start`, navigation
   events and every batch sent `document.title` as is, so an address in the
   title (`Inbox – jane.doe@example.com`) was recorded in full.

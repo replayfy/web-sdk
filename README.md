@@ -255,7 +255,7 @@ masked. Tune redaction with these options:
 - **`blockSelector`** — a CSS selector for elements to block entirely; they render as a placeholder in playback.
 - **`maskTextEmails`** (default `true`) — masks email addresses in all page text at the same length; `@` and the dots stay, so the replay still reads as an address.
 - **`maskTextNumbers`** (default `false`) — turns every digit in page text into `0`.
-- **`redactUrls`** — string/`RegExp` patterns stripped from captured URLs, so tokens and ids never leave the page.
+- **`redactUrls`** — string/`RegExp` patterns stripped from captured network request and resource URLs, so tokens and ids never leave the page. Combined with the workspace's URL patterns (both apply). Page URLs always get the built-in sensitive-key scrub (`token`, `code`, `password`…).
 - **`captureHeaders`** (default `false`) — headers are only captured when explicitly enabled.
 - **`redactHeaderNames`** — additional header names whose values are masked, on top of the always-on built-in deny-list.
 - **`maxBodyBytes`** — caps how much of a request/response body is ever captured.

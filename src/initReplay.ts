@@ -290,6 +290,12 @@ export function initReplay(config: WebReplayConfig): ReplayController {
   // would have no base).
   let lastRrwebActivityAt = Date.now();
   const emitSnapshot = (rrwebEvent: eventWithTime) => {
+    // rrweb's Meta event carries the page URL: scrub it like every other
+    // stored page URL (session_start, page context, navigation).
+    if (rrwebEvent.type === 4) {
+      const meta = rrwebEvent.data as { href?: unknown };
+      if (typeof meta.href === "string") meta.href = redactUrlForStorage(meta.href);
+    }
     // Privacy edits rrweb has no hook for (shadow-root text, href/meta, input
     // values, private media, blocked iframes, select state), while its mirror
     // still matches the page. An event with nothing left to record is dropped.
@@ -568,9 +574,17 @@ export function initReplay(config: WebReplayConfig): ReplayController {
     strip: boolean;
     allowed: string[];
     blockCC: boolean;
+    /** Host and workspace redaction patterns (union). Absent until the
+     *  recorder is installed: the capture then uses the host's own. */
+    patterns?: Array<string | RegExp>;
   } = { strip: false, allowed: [], blockCC: false };
   // Read live per-request by createNetworkCapture via the getUrlPolicy closure,
   // so a remote-config privacy update applies without re-installing the capture.
+  // The network capture is installed once, in phase 1, with the host's
+  // patterns only: the workspace's reach it through this policy alone.
+  // Resource timings name the same request URLs, so they get the same policy.
+  const networkUrlPolicy = () => ({ patterns: config.redactUrls, ...urlRedactionPolicy });
+  const redactNetworkUrl = (url: string) => redactUrlForStorage(url, networkUrlPolicy());
 
   // Sampling overrides — populated when /v1/sdk/config arrives. Referenced
   // inside error + identify handlers so they can flip a dropped session
@@ -666,6 +680,7 @@ export function initReplay(config: WebReplayConfig): ReplayController {
             apiHost: config.apiHost,
             captureResourceTimings: config.captureResourceTimings,
             resourceMinDurationMs: config.resourceMinDurationMs,
+            redactUrl: redactNetworkUrl,
           },
         ),
       );
@@ -856,6 +871,8 @@ export function initReplay(config: WebReplayConfig): ReplayController {
       strip: !!effective.stripQueryParams,
       allowed: effective.allowedQueryParams ?? [],
       blockCC: !!effective.blockCreditCardText,
+      // Both apply: the dashboard's patterns never replace the app's.
+      patterns: [...(config.redactUrls ?? []), ...(effective.redactUrls ?? [])],
     };
     syncCapture("console", effective.console, () =>
       createConsoleCapture((d: ConsoleEventData) =>
@@ -919,6 +936,7 @@ export function initReplay(config: WebReplayConfig): ReplayController {
           apiHost: config.apiHost,
           captureResourceTimings: config.captureResourceTimings,
           resourceMinDurationMs: config.resourceMinDurationMs,
+          redactUrl: redactNetworkUrl,
         },
       ),
     );

@@ -555,6 +555,10 @@ export interface PerfCaptureOptions {
   apiHost?: string;
   captureResourceTimings?: boolean;
   resourceMinDurationMs?: number;
+  /** Redacts a resource or script URL before it is recorded. initReplay
+   *  passes the policy network request URLs get, since a resource timing
+   *  carries the same request URL. Default: the built-in sensitive query keys. */
+  redactUrl?: (url: string) => string;
 }
 
 /** One script's attribution inside a Long Animation Frame entry. The
@@ -660,6 +664,16 @@ export function createPerformanceCapture(
    * Defensive observer creator. Browsers throw if a type is unknown
    * (Firefox lacks `longtask` for example), so we wrap it.
    */
+  // A resource timing names the request URL that the network capture
+  // redacts: recorded raw, it would carry the tokens that capture hides.
+  const redactUrl = (url: string): string => {
+    try {
+      return options.redactUrl ? options.redactUrl(url) : redactUrlForStorage(url);
+    } catch {
+      return redactUrlForStorage(url);
+    }
+  };
+
   const safeObserve = (
     type: string,
     cb: (list: PerformanceObserverEntryList) => void,
@@ -703,7 +717,7 @@ export function createPerformanceCapture(
               top && typeof top.duration === "number"
                 ? Math.round(top.duration)
                 : undefined,
-            scriptSource: top?.sourceURL || undefined,
+            scriptSource: top?.sourceURL ? redactUrl(top.sourceURL) : undefined,
             scriptFunction: top?.sourceFunctionName || undefined,
             scriptInvoker: top?.invoker || undefined,
           },
@@ -806,7 +820,7 @@ export function createPerformanceCapture(
           unit: "ms",
           ts: Math.round(entry.startTime + performance.timeOrigin),
           detail: {
-            name: url.slice(0, 512),
+            name: redactUrl(url).slice(0, 512),
             initiatorType: entry.initiatorType,
             ttfb: Math.round(
               Math.max(0, entry.responseStart - entry.requestStart),
@@ -1139,6 +1153,8 @@ export function createNetworkCapture(
     strip?: boolean;
     allowed?: string[];
     blockCC?: boolean;
+    /** Host and workspace patterns; replaces the install-time host list. */
+    patterns?: Array<string | RegExp>;
   },
 ): StopHandle {
   const originalFetch = (config.fetchImpl ?? window.fetch).bind(window);
